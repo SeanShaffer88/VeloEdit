@@ -71,6 +71,7 @@ use crate::hexview;
 use crate::line_index::LineIndex;
 use crate::mmap_win::MmapFile;
 use crate::piece_table::PieceTable;
+use crate::save::SaveOptions;
 use crate::search::{self, SearchOptions};
 use crate::settings::Settings;
 use crate::theme::{Theme, ACCENT_PRESETS};
@@ -87,6 +88,10 @@ const CMD_EXIT: usize = 1004;
 const CMD_SAVE_SELECTION: usize = 1005;
 const CMD_SPLIT_FILE: usize = 1006;
 const CMD_EXPLORER_MENU: usize = 1007;
+const CMD_CHANGE_RELOAD: usize = 1008;
+const CMD_CHANGE_IGNORE: usize = 1009;
+// File Hashes dialog (roadmap item 37).
+const CMD_FILE_HASHES: usize = 1010;
 const CMD_UNDO: usize = 1011;
 const CMD_REDO: usize = 1012;
 const CMD_CUT: usize = 1013;
@@ -103,6 +108,11 @@ const CMD_MODE_TOGGLE: usize = 1025;
 const CMD_FONT_BIGGER: usize = 1023;
 const CMD_FONT_SMALLER: usize = 1024;
 const CMD_VIEW_RULER: usize = 1026;
+// Data inspector panel toggle (roadmap item 15).
+const CMD_INSPECTOR: usize = 1027;
+// Relative offsets (roadmap item 16).
+const CMD_REL_OFFSETS: usize = 1028;
+const CMD_SET_OFFSET_BASE: usize = 1029;
 const CMD_GUIDE: usize = 1031;
 const CMD_ABOUT: usize = 1032;
 const CMD_FIND_NEXT: usize = 1041;
@@ -115,6 +125,18 @@ const CMD_THEME_BASE: usize = 3000; // + theme index (20 themes)
 const CMD_ACCENT_BASE: usize = 3100; // 0 = theme default, 1..=11 presets, then Custom…
 const CMD_ACCENT_CUSTOM: usize = CMD_ACCENT_BASE + 1 + ACCENT_PRESETS.len();
 const CMD_RECENT_BASE: usize = 3200; // + recent index (max 8)
+                                     // View ▸ Hex Columns radio group (roadmap item 13): indices into
+                                     // HEX_COLS_MENU in order — 8, 16, 24, 32, 64, Fit to Window.
+const CMD_HEXCOLS_BASE: usize = 3300;
+const HEX_COLS_MENU: [u32; 6] = [8, 16, 24, 32, 64, 0];
+// View ▸ Hex Grouping radio group (roadmap item 14): group sizes
+// 1, 2, 4, 8; plus the big-endian display toggle.
+const CMD_HEXGROUP_BASE: usize = 3320;
+const CMD_HEX_ENDIAN: usize = 3330;
+// File ▸ Save Options radio groups (roadmap items 31/32): line
+// endings Keep / LF / CRLF, then BOM Keep / Add / Remove.
+const CMD_SAVE_EOL_BASE: usize = 3340;
+const CMD_SAVE_BOM_BASE: usize = 3360;
 
 const ID_FIND_EDIT: usize = 2001;
 const ID_REPLACE_EDIT: usize = 2002;
@@ -123,20 +145,35 @@ const ID_FIND_COUNT: usize = 2003;
 const TIMER_BLINK: usize = 1;
 const TIMER_TICK: usize = 2;
 
-/// Recovery snapshots are only written for documents up to this size;
-/// larger documents rely on the atomic save alone (documented in the
-/// README and QUALITY.md).
+/// Recovery *content snapshots* are only written for documents with
+/// no backing file, and only up to this size. Documents backed by a
+/// file use the delta recovery (`data/recovery2.bin`, roadmap item
+/// 7) at any size instead — it stores the edit log plus the original
+/// file's fingerprint, never a copy of the contents.
 const RECOVERY_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Documents larger than this populate a plain find's match list on
+/// a background worker (roadmap items 10 + 24) instead of scanning
+/// synchronously on the UI thread; the worker walks the document in
+/// windows of this size too.
+const BG_FIND_THRESHOLD: u64 = 4 * 1024 * 1024;
+const BG_FIND_WINDOW: u64 = 4 * 1024 * 1024;
 
 // Layout constants (in DIPs; scaled to physical pixels for child windows).
 const TOOLBAR_H: f32 = 30.0;
 const FINDBAR_H: f32 = 34.0;
+/// Height of the external-change notice bar (roadmap item 34) when
+/// it is showing, directly under the toolbar.
+const CHANGEBAR_H: f32 = 30.0;
 const STATUS_H: f32 = 22.0;
 const TEXT_PAD: f32 = 6.0;
 /// Accent strip along the very top of the client area (design mockup).
 const STRIP_H: f32 = 2.0;
 /// Width of the custom-drawn scrollbar track at the editor's right edge.
 const SCROLLBAR_W: f32 = 10.0;
+/// Width of the data inspector panel (roadmap item 15) while it is
+/// docked open on the editor's right side.
+const INSPECTOR_W: f32 = 280.0;
 /// Smallest scrollbar thumb height, so huge files keep a grabbable thumb.
 const SCROLL_MIN_THUMB: f32 = 24.0;
 
@@ -259,6 +296,34 @@ fn scrollbar_first_row(track_h: f32, total_rows: u64, visible_rows: u64, thumb_y
     (frac * (total_rows - visible_rows) as f32).round() as u64
 }
 
+/// The scrollbar-track rows (whole DIPs from the track top) that
+/// get a tick for the given sorted offsets (roadmap item 24): each
+/// offset maps to a row by its fraction of the document —
+/// `(offset * rows) / doc_len` computed in u128, the same 64-bit
+/// ratio maths the scrollbar thumb uses — and offsets landing on a
+/// row already in the list collapse into it. Pure, so the
+/// bucketing is unit-tested; the draw pass turns rows into 1-DIP
+/// lines.
+fn tick_rows(offsets: &[u64], doc_len: u64, rows: u64) -> Vec<u64> {
+    let mut out: Vec<u64> = Vec::new();
+    if offsets.is_empty() || doc_len == 0 || rows == 0 {
+        return out;
+    }
+    // Bound the walk on pathological match counts: past a few
+    // thousand offsets every row is spoken for anyway, so
+    // stride-sample the rest.
+    let stride = (offsets.len() as u64 / 8192).max(1) as usize;
+    let mut i = 0;
+    while i < offsets.len() {
+        let row = (offsets[i] as u128 * rows as u128 / doc_len as u128) as u64;
+        if out.last() != Some(&row) {
+            out.push(row);
+        }
+        i += stride;
+    }
+    out
+}
+
 /// Theme colour as a GDI COLORREF (0x00BBGGRR) for window chrome.
 fn colorref(c: crate::theme::Rgba) -> COLORREF {
     (c.r as u32) | ((c.g as u32) << 8) | ((c.b as u32) << 16)
@@ -277,16 +342,26 @@ at a file's raw bytes.\r\n\
 \r\n\
 THE TWO MODES\r\n\
 Text mode is for reading and typing, like a plain notepad. Hex mode\r\n\
-shows the raw bytes: each row shows 16 bytes as numbers plus the same\r\n\
+shows the raw bytes: each row shows bytes as numbers plus the same\r\n\
 bytes as characters on the right. Press F6 (or View ▸ Hex/Text) to\r\n\
 switch. Typing a hex digit (0-9, A-F) in hex mode changes the byte\r\n\
 under the caret.\r\n\
+Hex rows can show 8, 16, 24, 32 or 64 bytes, or fit themselves to\r\n\
+the window (View ▸ Hex Columns). View ▸ Hex Grouping displays the\r\n\
+bytes in pairs, fours or eights; Big-Endian Groups shows each group\r\n\
+reversed, the way a stored number reads. None of this changes the\r\n\
+file — it is only how the bytes are shown. View ▸ Relative Offsets\r\n\
+counts the row addresses from a place you choose instead of from\r\n\
+the start of the file: switch it on to count from the caret, or use\r\n\
+Set Offset Base at Caret to move the starting point.\r\n\
 \r\n\
 KEYS\r\n\
 Ctrl+O open · Ctrl+S save · Ctrl+Z undo · Ctrl+Y redo\r\n\
 Ctrl+X / Ctrl+C / Ctrl+V cut, copy, paste · Ctrl+A select all\r\n\
 Ctrl+F find · Ctrl+H find and replace · F6 switch text/hex\r\n\
 F1 this guide · Esc closes the find bar\r\n\
+Ctrl+F2 sets or clears a bookmark at the caret\r\n\
+F2 / Shift+F2 jump to the next / previous bookmark\r\n\
 Ctrl+mouse wheel makes the text bigger or smaller\r\n\
 Arrows, Home, End, Page Up and Page Down move the caret; hold Shift\r\n\
 to select while you move. You can also drop a file onto the window\r\n\
@@ -296,9 +371,22 @@ SAVING IS SAFE\r\n\
 Saving writes the new content to a temporary file first, checks it,\r\n\
 and only then swaps it into place, so a crash or power cut cannot\r\n\
 leave a half-written file. Undo history is cleared when you save.\r\n\
-For files up to 16 MB, VeloEdit also keeps a recovery snapshot next\r\n\
-to the program while you edit, and offers it back if the program\r\n\
-closes unexpectedly. Larger files rely on the safe save alone.\r\n\
+While you edit a document that lives in a file, VeloEdit also\r\n\
+records your edits next to the program — just the edits, plus a\r\n\
+fingerprint of the original file, never a copy of the whole\r\n\
+file — and offers them back if the program closes unexpectedly.\r\n\
+Files of any size are covered this way. An untitled document\r\n\
+instead keeps a snapshot of its contents, up to 16 MB.\r\n\
+If another program changes the file you are editing, a bar\r\n\
+appears under the toolbar when you come back to the window:\r\n\
+Reload opens the file from disk (you are asked about your own\r\n\
+unsaved changes first), Ignore keeps editing your copy. The\r\n\
+notice returns if the file changes again.\r\n\
+File ▸ Save Options can convert line endings (to LF or to CRLF)\r\n\
+and add or remove the byte-order mark at the start of a text file,\r\n\
+every time you save. While a conversion is switched on, the status\r\n\
+bar shows it (for example → CRLF or +BOM), so you can see what the\r\n\
+next save will do before you save.\r\n\
 \r\n\
 FINDING MORE\r\n\
 Tick \"In selection\" on the find bar to search and replace only\r\n\
@@ -306,12 +394,25 @@ inside the part of the document you selected first. In hex mode\r\n\
 you can also search for byte patterns with wildcards, like\r\n\
 4A ?? FF 00 2B — a ? stands for any nibble, so 4? finds 40 to 4F.\r\n\
 Patterns are for finding only; replace does not use them.\r\n\
+On files over 4 MB the match count fills in as the search works\r\n\
+through the file — the bar reads Counting\u{2026} until it is done,\r\n\
+and Find Next already works over the matches found so far.\r\n\
+Matches show as small ticks in the scrollbar, and so do\r\n\
+bookmarks: Ctrl+F2 marks the caret's place in a file (or clears\r\n\
+the mark), F2 and Shift+F2 hop between marks, and a marked line\r\n\
+carries a small square in the gutter. Marks are kept per file\r\n\
+in the data folder and dropped when the file changes.\r\n\
 The Edit menu can sort the lines in a selection, or remove\r\n\
 duplicate lines from it. File \u{25B8} Split File Copy\u{2026} writes a\r\n\
 large file out as numbered parts (part001, part002, \u{2026}) so it\r\n\
 can be moved in pieces. File \u{25B8} Explorer Menu Item adds an\r\n\
 \"Open in VeloEdit\" entry to the right-click menu in Explorer;\r\n\
 it is off until you turn it on, and turning it off removes it.\r\n\
+View ▸ Data Inspector opens a panel that reads the 16 bytes at\r\n\
+the caret as numbers, text, a GUID, and dates — handy for picking\r\n\
+apart headers and other binary formats. File ▸ File Hashes… works\r\n\
+out the MD5, SHA-1 and SHA-256 checksums of the file on disk, and\r\n\
+checks any checksum you paste in against them.\r\n\
 \r\n\
 THEMES\r\n\
 View ▸ Theme offers 20 built-in colour themes; View ▸ Accent recolours\r\n\
@@ -617,6 +718,21 @@ struct MenuPreview {
     accent: Option<String>,
 }
 
+/// Shared state for the background find-all worker (roadmap items
+/// 10 + 24). The worker owns a snapshot of the piece table and walks
+/// it window by window, appending each window's matches here under
+/// a short lock; the UI thread snapshots the vector on its 200 ms
+/// tick. Both generations are re-checked on every touch: a new find
+/// bumps `find_gen`, any edit bumps the document generation, and a
+/// worker that finds its tags no longer current simply stops —
+/// the same epoch discipline as the line-index thread.
+struct FindProgress {
+    find_gen: u64,
+    doc_gen: u64,
+    matches: Vec<u64>,
+    done: bool,
+}
+
 struct App {
     hwnd: HWND,
     editor: Editor,
@@ -657,6 +773,65 @@ struct App {
     /// scope forces a re-run instead of an advance.
     last_scope_range: Option<(u64, u64)>,
     last_find_kind: FindKind,
+    /// The mapping the current document was opened with, retained so
+    /// background workers can snapshot the piece table over the same
+    /// bytes. Refreshed after every save (a save remaps the editor
+    /// over the file it just wrote); `None` for documents with no
+    /// mapped backing (untitled, recovery-built).
+    doc_mmap: Option<Arc<MmapFile>>,
+    /// Background find-all (roadmap items 10 + 24): the worker's
+    /// shared progress slot, and the UI thread's mirror of it. While
+    /// `bg_active` is set, the display match list, the count label
+    /// and Find Next / Previous run over `bg_matches`, not the
+    /// editor's own (synchronous) list.
+    find_slot: Arc<Mutex<Option<FindProgress>>>,
+    /// Bumped on every new find and every document change, so a
+    /// stale worker's results are never picked up.
+    find_gen: u64,
+    bg_active: bool,
+    bg_matches: Vec<u64>,
+    bg_done: bool,
+    /// Index into `bg_matches` of the selected match, if any.
+    bg_current: Option<usize>,
+    /// Byte length of the background find's needle (the selected
+    /// match's range and the highlight wash need it).
+    bg_needle_len: u64,
+    /// One-shot: the next plain find runs synchronously even on a
+    /// large document. Replace sets this — it needs the editor's
+    /// complete match state, so it cancels the background find and
+    /// re-runs the find the ordinary way.
+    find_sync_once: bool,
+    /// Bookmarks (roadmap item 20): the persisted store, loaded at
+    /// startup, and the current document's session list.
+    bookmark_store: crate::bookmarks::BookmarkStore,
+    bookmarks: crate::bookmarks::BookmarkList,
+    /// The current file's stamp as it was when the document was
+    /// opened — the bookmark store's staleness guard keys on it, so
+    /// it is deliberately not refreshed by saves (a saved file has
+    /// new bytes; the store drops records whose stamp no longer
+    /// matches when the file is next opened).
+    doc_stamp: Option<crate::bookmarks::FileStamp>,
+    /// The current file's stamp at open / after the last save — the
+    /// external-change check's baseline (roadmap item 34).
+    file_stamp: Option<crate::bookmarks::FileStamp>,
+    /// The external-change notice bar (roadmap item 34) and the
+    /// stamps it has already been shown / dismissed for, so it never
+    /// nags twice about the same on-disk state.
+    change_label: HWND,
+    change_reload_btn: HWND,
+    change_ignore_btn: HWND,
+    change_visible: bool,
+    change_shown_for: Option<crate::bookmarks::FileStamp>,
+    change_ignored_for: Option<crate::bookmarks::FileStamp>,
+    /// Delta recovery (roadmap item 7): the original file's
+    /// fingerprint is computed on a background thread at open (it
+    /// streams the whole file — far too slow for the open path of a
+    /// huge file) and delivered through this slot, tagged with
+    /// `doc_epoch`; `doc_fingerprint` is the picked-up value the
+    /// recovery writer captures against.
+    fingerprint_slot: Arc<Mutex<Option<(u64, crate::recovery::FileFingerprint)>>>,
+    doc_epoch: u64,
+    doc_fingerprint: Option<crate::recovery::FileFingerprint>,
     status: HWND,
     status_right: HWND,
     /// Line-ending style detected at open ("LF" or "CRLF").
@@ -670,6 +845,18 @@ struct App {
     recent_menu: HMENU,
     theme_menu: HMENU,
     accent_menu: HMENU,
+    /// The View ▸ Hex Columns / Hex Grouping submenu handles and
+    /// the File ▸ Save Options submenu handle (roadmap items 13,
+    /// 14, 31, 32), kept for the check-mark sync.
+    hex_cols_menu: HMENU,
+    hex_group_menu: HMENU,
+    save_options_menu: HMENU,
+    /// Relative offsets (roadmap item 16): session-only state —
+    /// whether the hex address column shows offsets from
+    /// `rel_base`, and the base itself (defaults to the caret when
+    /// the mode is switched on).
+    rel_offsets: bool,
+    rel_base: u64,
     find_visible: bool,
     has_focus: bool,
     caret_on: bool,
@@ -717,6 +904,12 @@ impl App {
         self.doc_generation += 1;
         self.last_edit = Some(Instant::now());
         self.hex_nibble = None;
+        // An edit invalidates a background find exactly like the
+        // editor's own match list (which the editor clears itself):
+        // drop the mirrored matches — and their scrollbar ticks —
+        // and bump the generation so the worker's late results are
+        // never picked up.
+        cancel_bg_find(self);
     }
 }
 
@@ -979,6 +1172,12 @@ struct Layout {
     editor_bottom: f32,
     width: f32,
     gutter_w: f32,
+    /// Right edge of the editor area: the client width minus the
+    /// inspector panel while it is open (roadmap item 15). Mouse
+    /// maths, the scrollbar, and the content columns all bound to
+    /// this; the chrome (accent strip, row washes, status bar) uses
+    /// the full `width`.
+    editor_right: f32,
 }
 
 fn compute_layout(app: &mut App) -> Layout {
@@ -987,7 +1186,10 @@ fn compute_layout(app: &mut App) -> Layout {
     unsafe { GetClientRect(app.hwnd, &mut client) };
     let width = app.dip(client.right - client.left);
     let height = app.dip(client.bottom - client.top);
-    let top = STRIP_H + TOOLBAR_H + if app.find_visible { FINDBAR_H } else { 0.0 };
+    let top = STRIP_H
+        + TOOLBAR_H
+        + if app.change_visible { CHANGEBAR_H } else { 0.0 }
+        + if app.find_visible { FINDBAR_H } else { 0.0 };
     let gutter_w = match app.editor.mode() {
         EditorMode::Text => {
             let digits = app.editor.line_count().max(1).to_string().len() as f32;
@@ -995,11 +1197,45 @@ fn compute_layout(app: &mut App) -> Layout {
         }
         EditorMode::Hex => 18.0 * app.char_w + TEXT_PAD,
     };
+    let editor_right = if app.settings.inspector_open {
+        (width - INSPECTOR_W).max(gutter_w + TEXT_PAD + SCROLLBAR_W + 40.0)
+    } else {
+        width
+    };
     Layout {
         editor_top: top,
         editor_bottom: (height - STATUS_H).max(top),
         width,
         gutter_w,
+        editor_right,
+    }
+}
+
+/// The fit-to-window hex width for the current window (roadmap
+/// item 13): the character cells available to the hex area,
+/// counted in cells (the monospace grid makes this exact).
+fn fit_hex_width(app: &mut App) -> u64 {
+    let layout = compute_layout(app);
+    let avail = ((layout.editor_right - SCROLLBAR_W - layout.gutter_w - TEXT_PAD)
+        / app.char_w.max(1.0))
+    .floor()
+    .max(0.0) as usize;
+    hexview::fit_bytes_per_row(avail, app.settings.hex_group as usize)
+}
+
+/// Push the settings-described hex layout into the editor
+/// (roadmap items 13/14), resolving fit-to-window against the
+/// current window size. Called on startup, on resize, on document
+/// open, and whenever a hex layout menu choice changes.
+fn sync_hex_layout(app: &mut App) {
+    let fit = if app.settings.hex_cols == crate::settings::HEX_COLS_FIT {
+        fit_hex_width(app)
+    } else {
+        0
+    };
+    let layout = app.settings.hex_layout(fit);
+    if layout != app.editor.hex_layout() {
+        app.editor.set_hex_layout(layout);
     }
 }
 
@@ -1053,9 +1289,35 @@ fn layout_children(app: &mut App) {
             );
         }
     }
+    // External-change bar (roadmap item 34): directly under the
+    // toolbar when showing — the label, then Reload / Ignore.
+    if app.change_visible {
+        let y = app.px(STRIP_H) + toolbar_h + app.px(3.0);
+        let h = app.px(CHANGEBAR_H) - app.px(6.0);
+        let mut cx = app.px(4.0);
+        let label = app.change_label;
+        let reload = app.change_reload_btn;
+        let ignore = app.change_ignore_btn;
+        let place = |app: &App, hwnd: HWND, cx: &mut i32, w_dip: f32| {
+            let w = app.px(w_dip);
+            // SAFETY: our child window.
+            unsafe { MoveWindow(hwnd, *cx, y, w, h, 1) };
+            *cx += w + app.px(4.0);
+        };
+        place(app, label, &mut cx, 260.0);
+        place(app, reload, &mut cx, 74.0);
+        place(app, ignore, &mut cx, 74.0);
+    }
     // Find bar (second row when visible).
     if app.find_visible {
-        let y = app.px(STRIP_H) + toolbar_h + app.px(3.0);
+        let y = app.px(STRIP_H)
+            + toolbar_h
+            + if app.change_visible {
+                app.px(CHANGEBAR_H)
+            } else {
+                0
+            }
+            + app.px(3.0);
         let h = app.px(FINDBAR_H) - app.px(6.0);
         let mut fx = app.px(4.0);
         let place = |app: &App, hwnd: HWND, fx: &mut i32, w_dip: f32| {
@@ -1097,8 +1359,15 @@ fn layout_children(app: &mut App) {
     }
     // Status strip along the bottom: position text on the left, the
     // document facts (encoding · line endings · size) on the right.
+    // An armed save conversion (roadmap items 31/32) widens the
+    // right control so the "· → CRLF · +BOM" suffix is not clipped.
     let status_h = app.px(STATUS_H);
-    let right_w = app.px(340.0).min(cw);
+    let armed = !save_armed_suffix(
+        app.settings.save_eol_choice(),
+        app.settings.save_bom_choice(),
+    )
+    .is_empty();
+    let right_w = app.px(if armed { 480.0 } else { 340.0 }).min(cw);
     // SAFETY: our child windows.
     unsafe {
         MoveWindow(
@@ -1202,6 +1471,11 @@ fn refresh_status(app: &mut App) {
     if st.dirty {
         left.push_str(" \u{00B7} Unsaved changes");
     }
+    if app.rel_offsets {
+        // Relative offsets (roadmap item 16): the hex address
+        // column is counting from this base.
+        left.push_str(&format!(" \u{00B7} Offsets from base 0x{:X}", app.rel_base));
+    }
     let wide = wstr(&left);
     // SAFETY: our status control plus a NUL-terminated string.
     unsafe { SetWindowTextW(app.status, wide.as_ptr()) };
@@ -1215,6 +1489,12 @@ fn refresh_status(app: &mut App) {
     if !st.encoding_confident {
         right.push_str(" (detected, not certain)");
     }
+    // Armed save conversions (roadmap items 31/32) are visible
+    // here before anything is saved.
+    right.push_str(save_armed_suffix(
+        app.settings.save_eol_choice(),
+        app.settings.save_bom_choice(),
+    ));
     let wide = wstr(&right);
     // SAFETY: our status control plus a NUL-terminated string.
     unsafe { SetWindowTextW(app.status_right, wide.as_ptr()) };
@@ -1226,7 +1506,10 @@ fn scroll_metrics(app: &mut App) -> (u64, u64, u64) {
     let (total, first) = match app.editor.mode() {
         EditorMode::Text => (app.editor.line_count(), app.editor.first_line()),
         EditorMode::Hex => (
-            hexview::row_count(app.editor.total_len()),
+            hexview::row_count_w(
+                app.editor.total_len(),
+                app.editor.hex_layout().bytes_per_row,
+            ),
             app.editor.first_row(),
         ),
     };
@@ -1257,6 +1540,39 @@ fn fill_rect(fill: RtFillRect, target: *mut c_void, rect: D2dRectF, brush: *mut 
         // SAFETY: `fill` is ID2D1RenderTarget::FillRectangle (slot 17)
         // resolved from the live target; the rect is a plain value.
         unsafe { fill(target, &rect, brush) };
+    }
+}
+
+/// Draw the scrollbar ticks for one offset set (roadmap item 24):
+/// one 1-DIP line per [`tick_rows`] row, inset a DIP from the
+/// track's edges so the thumb stays readable over them.
+#[allow(clippy::too_many_arguments)]
+fn draw_offset_ticks(
+    fill: RtFillRect,
+    target: *mut c_void,
+    track_left: f32,
+    track_right: f32,
+    top: f32,
+    track_h: f32,
+    offsets: &[u64],
+    doc_len: u64,
+    brush: *mut c_void,
+) {
+    if track_h < 1.0 {
+        return;
+    }
+    for row in tick_rows(offsets, doc_len, track_h as u64) {
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: track_left + 1.0,
+                top: top + row as f32,
+                right: track_right - 1.0,
+                bottom: top + row as f32 + 1.0,
+            },
+            brush,
+        );
     }
 }
 
@@ -1320,6 +1636,74 @@ fn col_of_byte(
     crate::editor::decode_lossy(&bytes, enc).chars().count() as f32
 }
 
+/// Format a float reading for the inspector panel: `NaN` and the
+/// infinities get their plain names; magnitudes outside
+/// 1e-4..1e15 use exponent form so a value always fits the panel.
+fn fmt_f64(v: f64) -> String {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v.is_infinite() {
+        if v > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        }
+    } else if v != 0.0 && !(1e-4..1e15).contains(&v.abs()) {
+        format!("{v:e}")
+    } else {
+        format!("{v}")
+    }
+}
+
+/// The inspector panel's label/value rows for one report
+/// (roadmap item 15). Integers carry both byte orders where the
+/// type has them; a reading the slice was too short for shows the
+/// no-reading marker, exactly as the core formats it.
+fn inspector_rows(report: &crate::inspector::InspectorReport, caret: u64) -> Vec<(String, String)> {
+    fn int<T: std::fmt::Display>(v: Option<T>) -> String {
+        v.map(|x| x.to_string())
+            .unwrap_or_else(|| "\u{2014}".to_string())
+    }
+    fn flt(v: Option<f64>) -> String {
+        v.map(fmt_f64).unwrap_or_else(|| "\u{2014}".to_string())
+    }
+    vec![
+        ("Offset".into(), format!("{caret} (0x{caret:X})")),
+        ("Hex".into(), report.hex.clone()),
+        ("Binary".into(), report.binary.clone()),
+        ("Int8".into(), int(report.i8)),
+        ("UInt8".into(), int(report.u8)),
+        ("Int16 LE".into(), int(report.i16_le)),
+        ("Int16 BE".into(), int(report.i16_be)),
+        ("UInt16 LE".into(), int(report.u16_le)),
+        ("UInt16 BE".into(), int(report.u16_be)),
+        ("Int32 LE".into(), int(report.i32_le)),
+        ("Int32 BE".into(), int(report.i32_be)),
+        ("UInt32 LE".into(), int(report.u32_le)),
+        ("UInt32 BE".into(), int(report.u32_be)),
+        ("Float32 LE".into(), flt(report.f32_le.map(|v| v as f64))),
+        ("Float32 BE".into(), flt(report.f32_be.map(|v| v as f64))),
+        ("Int64 LE".into(), int(report.i64_le)),
+        ("Int64 BE".into(), int(report.i64_be)),
+        ("UInt64 LE".into(), int(report.u64_le)),
+        ("UInt64 BE".into(), int(report.u64_be)),
+        ("Float64 LE".into(), flt(report.f64_le)),
+        ("Float64 BE".into(), flt(report.f64_be)),
+        ("Unix s (u32)".into(), report.unix_seconds_u32.clone()),
+        ("Unix s (u64)".into(), report.unix_seconds_u64.clone()),
+        ("Unix ms (u64)".into(), report.unix_millis_u64.clone()),
+        (
+            "GUID".into(),
+            report
+                .guid
+                .clone()
+                .unwrap_or_else(|| "\u{2014}".to_string()),
+        ),
+        ("FILETIME".into(), report.filetime_u64.clone()),
+        ("Text".into(), report.utf8_preview.clone()),
+    ]
+}
+
 fn render(app: &mut App) {
     ensure_format(app);
     ensure_target(app);
@@ -1330,11 +1714,18 @@ fn render(app: &mut App) {
     let visible =
         (((layout.editor_bottom - layout.editor_top) / app.line_h.max(1.0)).ceil() as usize).max(1);
     let selection = app.editor.selection_range();
-    let current_match = app.editor.current_match();
+    let current_match = display_current_match(app);
     // Every match start (all matches share the needle's byte length),
-    // plus the numbers the custom scrollbar is drawn from.
-    let all_matches: Vec<u64> = app.editor.matches().to_vec();
-    let match_len = current_match.map(|(s, e)| e - s).unwrap_or(0);
+    // plus the numbers the custom scrollbar is drawn from. While a
+    // background find owns the display these come from its mirror,
+    // not the editor's own list (see display_matches).
+    let all_matches: Vec<u64> = display_matches(app).to_vec();
+    let match_len = current_match
+        .map(|(s, e)| e - s)
+        .unwrap_or(if app.bg_active { app.bg_needle_len } else { 0 });
+    // Bookmark offsets (sorted) for the gutter markers and the
+    // scrollbar ticks.
+    let bookmark_offsets: Vec<u64> = app.bookmarks.iter().map(|b| b.offset).collect();
     let (sb_total, sb_first, sb_page) = scroll_metrics(app);
     let (caret_line, caret_col) = app.editor.line_col_of(app.editor.caret());
     let caret = app.editor.caret();
@@ -1412,7 +1803,7 @@ fn render(app: &mut App) {
                 let row_rect = D2dRectF {
                     left: 0.0,
                     top: y,
-                    right: width,
+                    right: layout.editor_right,
                     bottom: y + app.line_h,
                 };
                 if row.line_no == caret_line {
@@ -1452,7 +1843,7 @@ fn render(app: &mut App) {
                         let from = ss.max(row.start);
                         let c0 = col_of_byte(table, enc, row.start, from);
                         let x1 = if se > row.end {
-                            width
+                            layout.editor_right
                         } else {
                             layout.gutter_w
                                 + TEXT_PAD
@@ -1493,6 +1884,27 @@ fn render(app: &mut App) {
                     },
                     num_brush,
                 );
+                // Bookmark marker (roadmap item 20): a small accent
+                // square at the gutter's left edge on a line holding
+                // a bookmark (the numbers are right-aligned, so the
+                // left edge is free).
+                let bm_at = bookmark_offsets.partition_point(|&b| b < row.start);
+                if matches!(bookmark_offsets.get(bm_at), Some(&b) if b < row.end || b == row.start)
+                {
+                    let size = 6.0;
+                    let my = y + (app.line_h - size) / 2.0;
+                    fill_rect(
+                        fill,
+                        target,
+                        D2dRectF {
+                            left: 2.0,
+                            top: my,
+                            right: 2.0 + size,
+                            bottom: my + size,
+                        },
+                        brushes.accent,
+                    );
+                }
                 // The line's text.
                 draw_text(
                     draw,
@@ -1502,7 +1914,7 @@ fn render(app: &mut App) {
                     D2dRectF {
                         left: layout.gutter_w + TEXT_PAD,
                         top: y,
-                        right: width,
+                        right: layout.editor_right,
                         bottom: y + app.line_h,
                     },
                     brushes.text,
@@ -1525,8 +1937,15 @@ fn render(app: &mut App) {
             }
         }
         RowData::Hex(hex_rows) => {
+            // Column geometry follows the current hex layout
+            // (roadmap items 13/14): the ASCII column starts after
+            // the formatted hex text plus a two-cell gap.
+            let hex_layout = app.editor.hex_layout();
             let hex_x = layout.gutter_w + TEXT_PAD;
-            let ascii_x = hex_x + 51.0 * app.char_w;
+            let ascii_x = hex_x
+                + (hexview::hex_text_len(hex_layout.bytes_per_row as usize, &hex_layout) + 2)
+                    as f32
+                    * app.char_w;
             for (i, row) in hex_rows.iter().enumerate() {
                 let y = top + i as f32 * app.line_h;
                 if caret >= row.address && caret < row.address + row.len {
@@ -1536,7 +1955,7 @@ fn render(app: &mut App) {
                         D2dRectF {
                             left: 0.0,
                             top: y,
-                            right: width,
+                            right: layout.editor_right,
                             bottom: y + app.line_h,
                         },
                         brushes.current,
@@ -1548,8 +1967,12 @@ fn render(app: &mut App) {
                     let to = se.min(row.address + row.len);
                     let mut byte = from;
                     while byte < to {
-                        let idx = (byte - row.address) as f32;
-                        let cell = idx * 3.0 + if idx >= 8.0 { 1.0 } else { 0.0 };
+                        let idx = (byte - row.address) as usize;
+                        // The byte's hex cell sits where its digits
+                        // are displayed (grouping and big-endian
+                        // order move it; the ASCII cell never moves).
+                        let cell =
+                            hexview::byte_char_col(idx, row.len as usize, &hex_layout) as f32;
                         fill_rect(
                             fill,
                             target,
@@ -1565,9 +1988,9 @@ fn render(app: &mut App) {
                             fill,
                             target,
                             D2dRectF {
-                                left: ascii_x + idx * app.char_w,
+                                left: ascii_x + idx as f32 * app.char_w,
                                 top: y,
-                                right: ascii_x + (idx + 1.0) * app.char_w,
+                                right: ascii_x + (idx as f32 + 1.0) * app.char_w,
                                 bottom: y + app.line_h,
                             },
                             brushes.selection,
@@ -1575,7 +1998,39 @@ fn render(app: &mut App) {
                         byte += 1;
                     }
                 }
-                let address = format!("{:016X}", row.address);
+                // Bookmark marker (roadmap item 20): the same
+                // accent square as text mode, at the gutter's right
+                // edge here — the address text starts at the left.
+                let bm_at = bookmark_offsets.partition_point(|&b| b < row.address);
+                if matches!(bookmark_offsets.get(bm_at), Some(&b) if b < row.address + row.len) {
+                    let size = 6.0;
+                    let my = y + (app.line_h - size) / 2.0;
+                    fill_rect(
+                        fill,
+                        target,
+                        D2dRectF {
+                            left: layout.gutter_w - 2.0 - size,
+                            top: my,
+                            right: layout.gutter_w - 2.0,
+                            bottom: my + size,
+                        },
+                        brushes.accent,
+                    );
+                }
+                // The address column: absolute offsets, or — while
+                // relative offsets are on (roadmap item 16) — the
+                // signed distance from the base, in the same 16
+                // characters (a leading minus replaces one zero).
+                let address = if app.rel_offsets {
+                    let rel = row.address as i128 - app.rel_base as i128;
+                    if rel < 0 {
+                        format!("-{:015X}", -rel)
+                    } else {
+                        format!("{:016X}", rel)
+                    }
+                } else {
+                    format!("{:016X}", row.address)
+                };
                 // The caret row's address takes the accent colour,
                 // mirroring the current line number in text mode.
                 let address_brush = if caret >= row.address && caret < row.address + row.len {
@@ -1617,7 +2072,7 @@ fn render(app: &mut App) {
                     D2dRectF {
                         left: ascii_x,
                         top: y,
-                        right: width,
+                        right: layout.editor_right,
                         bottom: y + app.line_h,
                     },
                     brushes.text,
@@ -1629,9 +2084,10 @@ fn render(app: &mut App) {
                     && caret <= row.address + row.len
                 {
                     let idx =
-                        (caret.min(row.address + row.len.saturating_sub(1)) - row.address) as f32;
+                        (caret.min(row.address + row.len.saturating_sub(1)) - row.address) as usize;
                     if row.len > 0 {
-                        let cell = idx * 3.0 + if idx >= 8.0 { 1.0 } else { 0.0 };
+                        let cell =
+                            hexview::byte_char_col(idx, row.len as usize, &hex_layout) as f32;
                         let x0 = hex_x + cell * app.char_w;
                         let x1 = x0 + 2.0 * app.char_w;
                         let t = 1.5f32;
@@ -1677,7 +2133,7 @@ fn render(app: &mut App) {
     // scrollbar.
     if app.settings.ruler_column > 0 && matches!(rows, RowData::Text(_)) {
         let x = layout.gutter_w + TEXT_PAD + app.settings.ruler_column as f32 * app.char_w;
-        if x > layout.gutter_w && x < width - SCROLLBAR_W {
+        if x > layout.gutter_w && x < layout.editor_right - SCROLLBAR_W {
             fill_rect(
                 fill,
                 target,
@@ -1698,9 +2154,9 @@ fn render(app: &mut App) {
     if let Some((thumb_y, thumb_h)) = scrollbar_geometry(bottom - top, sb_total, sb_page, sb_first)
     {
         let track = D2dRectF {
-            left: width - SCROLLBAR_W,
+            left: layout.editor_right - SCROLLBAR_W,
             top,
-            right: width,
+            right: layout.editor_right,
             bottom,
         };
         fill_rect(fill, target, track, brushes.panel);
@@ -1714,6 +2170,117 @@ fn render(app: &mut App) {
             },
             brushes.accent,
         );
+        // Ticks (roadmap item 24): find matches in the accent,
+        // bookmarks in the text colour — one thin line per track
+        // row, bucketed by tick_rows.
+        draw_offset_ticks(
+            fill,
+            target,
+            track.left,
+            track.right,
+            top,
+            bottom - top,
+            &all_matches,
+            table.len(),
+            brushes.accent,
+        );
+        draw_offset_ticks(
+            fill,
+            target,
+            track.left,
+            track.right,
+            top,
+            bottom - top,
+            &bookmark_offsets,
+            table.len(),
+            brushes.text,
+        );
+    }
+
+    // The data inspector panel (roadmap item 15): docked on the
+    // right while open, drawn in the theme's panel colour with the
+    // same monospace format as the editor. The readings are taken
+    // from the 16 bytes at the caret on every paint, so caret moves
+    // and edits refresh it with no extra plumbing.
+    if app.settings.inspector_open {
+        let panel_left = layout.editor_right;
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: panel_left,
+                top,
+                right: width,
+                bottom,
+            },
+            brushes.panel,
+        );
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: panel_left,
+                top,
+                right: panel_left + 1.0,
+                bottom,
+            },
+            brushes.line,
+        );
+        let bytes = table.read(caret, (table.len() - caret).min(16));
+        let report = crate::inspector::inspect(&bytes);
+        let label_w = 92.0;
+        let value_x = panel_left + TEXT_PAD + label_w;
+        let value_right = width - TEXT_PAD;
+        // Characters that fit the value column; longer values wrap
+        // onto continuation lines.
+        let value_chars = (((value_right - value_x) / app.char_w.max(1.0)).floor() as usize).max(4);
+        let mut y = top + 4.0;
+        for (label, value) in inspector_rows(&report, caret) {
+            if y + app.line_h > bottom {
+                break;
+            }
+            draw_text(
+                draw,
+                target,
+                format,
+                &label,
+                D2dRectF {
+                    left: panel_left + TEXT_PAD,
+                    top: y,
+                    right: value_x - 4.0,
+                    bottom: y + app.line_h,
+                },
+                brushes.muted,
+            );
+            let chars: Vec<char> = value.chars().collect();
+            let mut lines = 0usize;
+            for chunk in chars.chunks(value_chars) {
+                if y + app.line_h > bottom {
+                    break;
+                }
+                let text: String = chunk.iter().collect();
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &text,
+                    D2dRectF {
+                        left: value_x,
+                        top: y,
+                        right: value_right,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.text,
+                );
+                y += app.line_h;
+                lines += 1;
+            }
+            if lines == 0 {
+                // An empty value (the hex row of an empty file)
+                // still takes its line.
+                y += app.line_h;
+            }
+        }
     }
 
     // SAFETY: pairs with the BeginDraw above; null tag pointers are
@@ -1736,6 +2303,11 @@ fn pos_to_offset(app: &mut App, x_px: i32, y_px: i32) -> u64 {
     if row_in_view < 0.0 {
         return app.editor.caret();
     }
+    if x > layout.editor_right {
+        // A press on the inspector panel (roadmap item 15) is not
+        // an editor click: keep the caret where it is.
+        return app.editor.caret();
+    }
     match app.editor.mode() {
         EditorMode::Text => {
             let count = app.editor.line_count();
@@ -1750,24 +2322,26 @@ fn pos_to_offset(app: &mut App, x_px: i32, y_px: i32) -> u64 {
                 .unwrap_or(app.editor.total_len())
         }
         EditorMode::Hex => {
-            let total_rows = hexview::row_count(app.editor.total_len());
+            let hex_layout = app.editor.hex_layout();
+            let width = hex_layout.bytes_per_row;
+            let total_rows = hexview::row_count_w(app.editor.total_len(), width);
             if total_rows == 0 {
                 return 0;
             }
             let row = (app.editor.first_row() + row_in_view as u64).min(total_rows - 1);
-            let row_start = hexview::row_offset(row);
-            let row_len = hexview::BYTES_PER_ROW.min(app.editor.total_len() - row_start);
+            let row_start = hexview::row_offset_w(row, width);
+            let row_len = width.min(app.editor.total_len() - row_start);
             let hex_x = layout.gutter_w + TEXT_PAD;
-            let ascii_x = hex_x + 51.0 * app.char_w;
+            let ascii_x = hex_x
+                + (hexview::hex_text_len(width as usize, &hex_layout) + 2) as f32 * app.char_w;
             let byte = if x >= ascii_x {
                 ((x - ascii_x) / app.char_w.max(1.0)).floor().max(0.0) as u64
             } else {
-                let cell = ((x - hex_x) / app.char_w.max(1.0)).floor().max(0.0) as u64;
-                if cell < 24 {
-                    cell / 3
-                } else {
-                    8 + (cell.saturating_sub(25)) / 3
-                }
+                // Hit-test through the same display maths the
+                // renderer uses, so grouping and big-endian order
+                // select the byte actually under the pointer.
+                let col = ((x - hex_x) / app.char_w.max(1.0)).floor().max(0.0) as usize;
+                hexview::byte_at_char_col(col, row_len as usize, &hex_layout) as u64
             };
             row_start + byte.min(row_len)
         }
@@ -1995,6 +2569,404 @@ fn spawn_index_thread(app: &App, mmap: Arc<MmapFile>) {
     });
 }
 
+/// Fingerprint the original file on a background thread (roadmap
+/// item 7): the fingerprint streams the whole file's SHA-256, which
+/// is far too slow to do on the open path of a huge file. Delivery
+/// is through the slot, tagged with the document epoch — the same
+/// pattern as [`spawn_index_thread`]; the tick picks it up.
+fn spawn_fingerprint_thread(app: &App, path: &Path) {
+    let slot = app.fingerprint_slot.clone();
+    let epoch = app.doc_epoch;
+    if let Ok(mut guard) = slot.lock() {
+        *guard = None;
+    }
+    let path = path.to_path_buf();
+    std::thread::spawn(move || {
+        if let Ok(fp) = crate::recovery::fingerprint_file(&path) {
+            if let Ok(mut guard) = slot.lock() {
+                *guard = Some((epoch, fp));
+            }
+        }
+    });
+}
+
+/// Mirror the current document's bookmarks out of the persisted
+/// store into the session list. The store itself applies the
+/// staleness guard: a record whose stamp no longer matches is
+/// dropped and the session list comes back empty.
+fn load_session_bookmarks(app: &mut App) {
+    app.bookmarks.clear();
+    let Some(path) = app.editor.path().map(|p| p.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let Some(stamp) = app.doc_stamp else {
+        return;
+    };
+    let entries: Vec<(u64, String)> = app
+        .bookmark_store
+        .bookmarks(&path, stamp)
+        .iter()
+        .map(|b| (b.offset, b.name.clone()))
+        .collect();
+    for (offset, name) in entries {
+        app.bookmarks.toggle(offset, &name);
+    }
+}
+
+/// Set up the per-document tracking for the document now in the
+/// editor: bookmark guard stamp + session bookmarks, the
+/// external-change baseline, the delta-recovery fingerprint, and a
+/// reset of the find / change-notice state that belonged to the
+/// previous document. Called by [`open_document`] and once at
+/// startup for the initial document.
+fn begin_document_tracking(app: &mut App) {
+    app.doc_epoch += 1;
+    cancel_bg_find(app);
+    app.change_visible = false;
+    app.change_shown_for = None;
+    app.change_ignored_for = None;
+    for hwnd in [
+        app.change_label,
+        app.change_reload_btn,
+        app.change_ignore_btn,
+    ] {
+        if !hwnd.is_null() {
+            // SAFETY: our child windows (or null before creation).
+            unsafe { ShowWindow(hwnd, SW_HIDE) };
+        }
+    }
+    match app.editor.path().map(|p| p.to_path_buf()) {
+        Some(path) => {
+            let stamp = crate::bookmarks::stamp_path(&path).ok();
+            app.doc_stamp = stamp;
+            app.file_stamp = stamp;
+            load_session_bookmarks(app);
+            app.doc_fingerprint = None;
+            spawn_fingerprint_thread(app, &path);
+        }
+        None => {
+            app.doc_stamp = None;
+            app.file_stamp = None;
+            app.bookmarks.clear();
+            app.doc_fingerprint = None;
+            app.doc_mmap = None;
+        }
+    }
+}
+
+/// Refresh the tracking after a successful save: the file on disk
+/// now holds exactly the document, so the external-change baseline
+/// moves to the saved file's stamp, our retained mapping is
+/// re-opened over it (the editor remapped itself the same way), and
+/// a fresh fingerprint is computed for future recovery captures.
+/// With `adopted_new_path` (Save As) the bookmark guard stamp and
+/// session list move to the new path as well.
+fn after_save_tracking(app: &mut App, adopted_new_path: bool) {
+    app.doc_epoch += 1;
+    if app.change_visible {
+        set_change_bar_visible(app, false);
+    }
+    app.change_shown_for = None;
+    app.change_ignored_for = None;
+    let Some(path) = app.editor.path().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    app.file_stamp = crate::bookmarks::stamp_path(&path).ok();
+    app.doc_mmap = MmapFile::open(&path).ok().map(Arc::new);
+    if adopted_new_path {
+        app.doc_stamp = app.file_stamp;
+        load_session_bookmarks(app);
+    }
+    app.doc_fingerprint = None;
+    spawn_fingerprint_thread(app, &path);
+}
+
+/// Ctrl+F2 (roadmap item 20): toggle a bookmark at the caret,
+/// persist the store immediately, and mirror the result into the
+/// session list. Bookmarks belong to files, so an untitled document
+/// is a quiet no-op.
+fn toggle_bookmark(app: &mut App) {
+    let Some(path) = app.editor.path().map(|p| p.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let Some(stamp) = app.doc_stamp else {
+        return;
+    };
+    let caret = app.editor.caret();
+    let (line, _) = app.editor.line_col_of(caret);
+    let name = format!("Line {}", line + 1);
+    app.bookmark_store.toggle(&path, stamp, caret, &name);
+    let _ = app
+        .bookmark_store
+        .save_to(&crate::bookmarks::bookmarks_path());
+    load_session_bookmarks(app);
+    invalidate(app);
+}
+
+/// F2 / Shift+F2 (roadmap item 20): jump to the next / previous
+/// bookmark from the caret, wrapping around the document.
+fn jump_bookmark(app: &mut App, forward: bool) {
+    let caret = app.editor.caret();
+    let target = if forward {
+        app.bookmarks.next_after(caret)
+    } else {
+        app.bookmarks.prev_before(caret)
+    };
+    if let Some(offset) = target {
+        app.editor.move_caret_to(offset, false);
+        after_caret_move(app);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background find-all (roadmap items 10 + 24)
+// ---------------------------------------------------------------------------
+
+/// Cancel the background find, if one owns the match display: bump
+/// the generation so the worker's late results are dropped, and
+/// clear the mirrored matches (and their scrollbar ticks).
+fn cancel_bg_find(app: &mut App) {
+    if !app.bg_active {
+        return;
+    }
+    app.find_gen += 1;
+    app.bg_active = false;
+    app.bg_matches.clear();
+    app.bg_current = None;
+    app.bg_done = false;
+    if let Ok(mut guard) = app.find_slot.lock() {
+        *guard = None;
+    }
+}
+
+/// An owned snapshot of the editor's piece table for the find
+/// worker: the same pieces and append buffer over the same backing,
+/// so the worker scans exactly the document the user committed the
+/// find on, whatever the UI thread does next. Memory-backed
+/// documents (untitled, recovery-built) are materialised whole —
+/// they already live in memory by construction.
+fn snapshot_table(app: &App) -> PieceTable {
+    let table = app.editor.table();
+    if let Some(mmap) = &app.doc_mmap {
+        let mut snap = PieceTable::from_mapped(mmap.clone());
+        snap.original_file_size = table.original_file_size;
+        snap.append_buffer = table.append_buffer.clone();
+        snap.pieces = table.pieces.clone();
+        snap.total_length = table.total_length;
+        snap.rebuild_weights();
+        snap
+    } else {
+        PieceTable::from_original(table.read(0, table.len()))
+    }
+}
+
+/// Start the background find for `text` (plain whole-document find
+/// on a document over [`BG_FIND_THRESHOLD`]). Returns false when the
+/// needle cannot be encoded — the caller then runs the ordinary
+/// synchronous find, which reports the same error the same way.
+fn start_bg_find(app: &mut App, text: &str) -> bool {
+    let needle = match encoding::encode_needle(text, app.editor.encoding()) {
+        Ok(needle) => needle,
+        Err(_) => return false,
+    };
+    let snapshot = snapshot_table(app);
+    let len = snapshot.len();
+    let options = SearchOptions::default();
+    // The editor filters UTF-16 matches to code-unit-aligned
+    // offsets; the worker applies the same filter so the two paths
+    // never disagree.
+    let utf16_bom = match app.editor.encoding() {
+        encoding::TextEncoding::Utf16Le | encoding::TextEncoding::Utf16Be => {
+            Some(app.editor.detection().bom_len as u64)
+        }
+        _ => None,
+    };
+    app.find_gen += 1;
+    let find_gen = app.find_gen;
+    let doc_gen = app.doc_generation;
+    let slot = app.find_slot.clone();
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(FindProgress {
+            find_gen,
+            doc_gen,
+            matches: Vec::new(),
+            done: false,
+        });
+    }
+    app.bg_active = true;
+    app.bg_matches.clear();
+    app.bg_current = None;
+    app.bg_done = false;
+    app.bg_needle_len = needle.len() as u64;
+    std::thread::spawn(move || {
+        let mut start = 0u64;
+        loop {
+            let end = (start + BG_FIND_WINDOW).min(len);
+            let mut found = search::find_in_window(&snapshot, &needle, &options, start, end);
+            if let Some(bom) = utf16_bom {
+                found.retain(|&m| m >= bom && (m - bom) % 2 == 0);
+            }
+            let last = end >= len;
+            if let Ok(mut guard) = slot.lock() {
+                match guard.as_mut() {
+                    Some(progress)
+                        if progress.find_gen == find_gen && progress.doc_gen == doc_gen =>
+                    {
+                        progress.matches.extend(found);
+                        progress.done = last;
+                    }
+                    // Superseded or cancelled: stop quietly.
+                    _ => return,
+                }
+            }
+            if last {
+                return;
+            }
+            start = end;
+        }
+    });
+    true
+}
+
+/// Select the background find's match at `idx`: the selection is
+/// placed with the editor's ordinary caret moves (anchor at the
+/// match start, caret at its end — the same shape the editor's own
+/// match selection produces).
+fn select_bg_match(app: &mut App, idx: usize) {
+    let Some(&start) = app.bg_matches.get(idx) else {
+        return;
+    };
+    app.bg_current = Some(idx);
+    app.editor.move_caret_to(start, false);
+    app.editor.move_caret_to(start + app.bg_needle_len, true);
+}
+
+/// Find Next / Previous over the matches known so far while a
+/// background find is populating (or once it has finished): cycle
+/// from the selected match, or enter at the first match at or after
+/// the caret when none is selected yet.
+fn bg_advance(app: &mut App, advance: i32) {
+    if app.bg_matches.is_empty() {
+        return;
+    }
+    let len = app.bg_matches.len();
+    let idx = match app.bg_current {
+        Some(i) if advance > 0 => (i + 1) % len,
+        Some(i) if advance < 0 => (i + len - 1) % len,
+        _ => {
+            let caret = app.editor.caret();
+            if advance < 0 {
+                app.bg_matches
+                    .iter()
+                    .rposition(|&m| m < caret)
+                    .unwrap_or(len - 1)
+            } else {
+                app.bg_matches.iter().position(|&m| m >= caret).unwrap_or(0)
+            }
+        }
+    };
+    select_bg_match(app, idx);
+}
+
+/// The find count label while a background find owns the display:
+/// "Counting…" until the final window lands, then the ordinary
+/// position / no-matches forms over the completed list.
+fn refresh_bg_find_label(app: &App) {
+    if !app.bg_done {
+        set_find_label(app, "Counting\u{2026}");
+    } else if app.bg_matches.is_empty() {
+        set_find_label(app, "No matches");
+    } else {
+        set_find_label(
+            app,
+            &format!(
+                "{} of {}",
+                app.bg_current.map(|i| i + 1).unwrap_or(0),
+                app.bg_matches.len()
+            ),
+        );
+    }
+}
+
+/// The match list the window displays right now: the background
+/// find's mirror while it owns the display, the editor's own list
+/// otherwise.
+fn display_matches(app: &App) -> &[u64] {
+    if app.bg_active {
+        &app.bg_matches
+    } else {
+        app.editor.matches()
+    }
+}
+
+/// The currently selected match's byte range, from whichever find
+/// owns the display.
+fn display_current_match(app: &App) -> Option<(u64, u64)> {
+    if app.bg_active {
+        let idx = app.bg_current?;
+        let start = *app.bg_matches.get(idx)?;
+        Some((start, start + app.bg_needle_len))
+    } else {
+        app.editor.current_match()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External-change notice (roadmap item 34)
+// ---------------------------------------------------------------------------
+
+/// Show or hide the notice bar, repositioning the rows below it.
+fn set_change_bar_visible(app: &mut App, visible: bool) {
+    if app.change_visible == visible {
+        return;
+    }
+    app.change_visible = visible;
+    let show = if visible { SW_SHOW } else { SW_HIDE };
+    for hwnd in [
+        app.change_label,
+        app.change_reload_btn,
+        app.change_ignore_btn,
+    ] {
+        if !hwnd.is_null() {
+            // SAFETY: our child windows.
+            unsafe { ShowWindow(hwnd, show) };
+        }
+    }
+    layout_children(app);
+    invalidate(app);
+}
+
+/// Re-stat the open file and show the notice bar when its stamp no
+/// longer matches the one at open / last save. Called when the
+/// window gains focus (WM_ACTIVATE) and immediately before a save.
+/// The bar is non-modal: it never blocks the save or the editing,
+/// and it never appears twice for the same on-disk state.
+fn check_external_change(app: &mut App) {
+    let Some(path) = app.editor.path().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    let Some(base) = app.file_stamp else {
+        return;
+    };
+    let Ok(now) = crate::bookmarks::stamp_path(&path) else {
+        return;
+    };
+    if now == base {
+        // The file is at the state we know: a showing bar no longer
+        // applies (it may have been changed back).
+        if app.change_visible {
+            app.change_shown_for = None;
+            set_change_bar_visible(app, false);
+        }
+        return;
+    }
+    if app.change_shown_for == Some(now) || app.change_ignored_for == Some(now) {
+        return;
+    }
+    app.change_shown_for = Some(now);
+    set_change_bar_visible(app, true);
+}
+
 /// Open `path` in the window: memory-mapped, encoding detected, index
 /// building in the background. Errors are reported, never fatal.
 fn open_document(app: &mut App, path: &Path) {
@@ -2030,12 +3002,17 @@ fn open_document(app: &mut App, path: &Path) {
         app.settings.undo_limit,
         app.settings.undo_byte_budget_mb * 1024 * 1024,
     );
+    // The persisted hex layout (roadmap items 13/14) applies to the
+    // fresh editor too.
+    sync_hex_layout(app);
     app.doc_generation = 0;
     app.open_generation = 0;
     app.last_edit = None;
     app.hex_nibble = None;
+    app.doc_mmap = Some(mmap.clone());
     spawn_index_thread(app, mmap);
     delete_recovery_files();
+    begin_document_tracking(app);
     let path_string = path.to_string_lossy().into_owned();
     app.settings.add_recent(&path_string);
     save_settings(app);
@@ -2069,14 +3046,53 @@ fn prompt_save_if_dirty(app: &mut App) -> bool {
 
 /// Save over the current file (or Save As when there is none).
 /// Returns success.
+/// The save options the window currently has chosen (roadmap
+/// items 31/32): the document's own encoding plus the line-ending
+/// and BOM handling from File ▸ Save Options. Every window save
+/// routes through these, so an armed conversion applies to Save
+/// and Save As alike.
+fn gui_save_options(app: &App) -> SaveOptions {
+    SaveOptions {
+        encoding: app.editor.encoding(),
+        eol: app.settings.save_eol_choice(),
+        bom: app.settings.save_bom_choice(),
+        ..SaveOptions::default()
+    }
+}
+
+/// The status-bar suffix announcing an armed save conversion:
+/// `""` when both choices are Keep, otherwise the parts that will
+/// change the bytes on the next save (`" · → CRLF"`, `" · → LF"`,
+/// `" · +BOM"`, `" · −BOM"`, in that order, joined).
+fn save_armed_suffix(eol: crate::save::EolChoice, bom: crate::save::BomChoice) -> &'static str {
+    use crate::save::{BomChoice, EolChoice};
+    match (eol, bom) {
+        (EolChoice::Keep, BomChoice::Keep) => "",
+        (EolChoice::Lf, BomChoice::Keep) => " \u{00B7} \u{2192} LF",
+        (EolChoice::Crlf, BomChoice::Keep) => " \u{00B7} \u{2192} CRLF",
+        (EolChoice::Keep, BomChoice::Add) => " \u{00B7} +BOM",
+        (EolChoice::Keep, BomChoice::Remove) => " \u{00B7} \u{2212}BOM",
+        (EolChoice::Lf, BomChoice::Add) => " \u{00B7} \u{2192} LF \u{00B7} +BOM",
+        (EolChoice::Lf, BomChoice::Remove) => " \u{00B7} \u{2192} LF \u{00B7} \u{2212}BOM",
+        (EolChoice::Crlf, BomChoice::Add) => " \u{00B7} \u{2192} CRLF \u{00B7} +BOM",
+        (EolChoice::Crlf, BomChoice::Remove) => " \u{00B7} \u{2192} CRLF \u{00B7} \u{2212}BOM",
+    }
+}
+
 fn do_save(app: &mut App) -> bool {
     if app.editor.path().is_none() {
         return do_save_as(app);
     }
-    match app.editor.save() {
+    // Roadmap item 34: surface an external change before we
+    // overwrite the file. The notice is non-modal — the save still
+    // proceeds; the bar simply stays visible until the save lands
+    // (after_save_tracking then retires it).
+    check_external_change(app);
+    match app.editor.save_with_options(&gui_save_options(app)) {
         Ok(_) => {
             delete_recovery_files();
             app.last_edit = None;
+            after_save_tracking(app, false);
             refresh_title(app);
             refresh_status(app);
             true
@@ -2103,10 +3119,14 @@ fn do_save_as(app: &mut App) -> bool {
     let Some(path) = file_dialog(app, true, Some(&initial)) else {
         return false;
     };
-    match app.editor.save_as(&path) {
+    match app
+        .editor
+        .save_as_with_options(&path, &gui_save_options(app))
+    {
         Ok(_) => {
             delete_recovery_files();
             app.last_edit = None;
+            after_save_tracking(app, true);
             let path_string = path.to_string_lossy().into_owned();
             app.settings.add_recent(&path_string);
             save_settings(app);
@@ -2461,6 +3481,374 @@ fn do_split_file(app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
+// File Hashes dialog (roadmap item 37): a small modal window in the
+// Split dialog's pattern. A worker thread streams the file ON DISK
+// through the hash core (the file can be huge — nothing is loaded
+// into memory) and delivers the three digests through a slot the
+// dialog polls on a timer. The compare box checks pasted text
+// against whichever digest it equals.
+// ---------------------------------------------------------------------------
+
+const HASH_CLASS: &str = "VeloEditHash";
+const ID_HASH_COMPARE: usize = 5204;
+const ID_HASH_CLOSE: usize = 5206;
+const TIMER_HASH: usize = 7;
+/// EN_CHANGE, the edit-control change notification.
+const EN_CHANGE: usize = 0x0300;
+
+struct HashDialogState {
+    /// The main window's App (UI thread only; the dialog is modal).
+    app: *mut App,
+    /// The worker's result slot; `None` while hashing runs.
+    slot: Arc<Mutex<Option<crate::hash::FileHashes>>>,
+    /// First line: what is being hashed (and, for a dirty document,
+    /// that it is the file on disk, not the edited bytes).
+    note: String,
+    /// Second line: the file's path.
+    file_label: String,
+    done: bool,
+    compare: HWND,
+    verdict: HWND,
+    /// The three digest value controls, MD5 / SHA-1 / SHA-256.
+    values: [HWND; 3],
+}
+
+/// The compare verdict for the dialog: what `input` (the compare
+/// box's text, trimmed) means against the computed digests — empty
+/// while the box is empty, a "which hash matched" line on a match
+/// (compared case-insensitively), "No match" otherwise, and a
+/// still-working note while the worker runs.
+fn hash_verdict(input: &str, hashes: Option<&crate::hash::FileHashes>) -> String {
+    let pasted = input.trim().to_lowercase();
+    if pasted.is_empty() {
+        return String::new();
+    }
+    let Some(h) = hashes else {
+        return "Still hashing\u{2026}".to_string();
+    };
+    if pasted == h.sha256 {
+        "Matches SHA-256".to_string()
+    } else if pasted == h.sha1 {
+        "Matches SHA-1".to_string()
+    } else if pasted == h.md5 {
+        "Matches MD5".to_string()
+    } else {
+        "No match".to_string()
+    }
+}
+
+/// Refresh the dialog's verdict line from the compare box.
+fn update_hash_verdict(state: &HashDialogState) {
+    // SAFETY: our dialog's compare edit.
+    let text = unsafe { window_text(state.compare) };
+    let hashes = state.slot.lock().ok().and_then(|g| g.clone());
+    let verdict = hash_verdict(&text, hashes.as_ref());
+    let wide = wstr(&verdict);
+    // SAFETY: our verdict static; the string outlives the call.
+    unsafe { SetWindowTextW(state.verdict, wide.as_ptr()) };
+}
+
+unsafe extern "system" fn hash_dialog_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CREATE {
+        // SAFETY: lparam is the CREATESTRUCTW from CreateWindowExW,
+        // whose lpCreateParams is the caller's HashDialogState.
+        let create = unsafe { &*(lparam as *const CREATESTRUCTW) };
+        let state_ptr = create.lpCreateParams as *mut HashDialogState;
+        // SAFETY: storing the state pointer for the dialog's life.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
+        // SAFETY: the state outlives the dialog (it lives in the
+        // caller's stack frame, which waits in the modal loop).
+        let state = unsafe { &mut *state_ptr };
+        // SAFETY: the App is alive and exclusively ours on this thread.
+        let app = unsafe { &*state.app };
+        let scale = app.scale();
+        let px = |dip: f32| (dip * scale).round() as i32;
+        // Children are created against the main window by the helper
+        // and reparented to the dialog, exactly like the Split
+        // dialog's.
+        let place = |hwnd_child: HWND, x: f32, y: f32, w: f32, h: f32| {
+            // SAFETY: `hwnd_child` is a fresh child window of ours.
+            unsafe {
+                SetParent(hwnd_child, hwnd);
+                MoveWindow(hwnd_child, px(x), px(y), px(w), px(h), 1);
+            }
+        };
+        let note = create_child(
+            app,
+            "Static",
+            &state.note.clone(),
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+        );
+        place(note, 12.0, 10.0, 536.0, 20.0);
+        let file = create_child(
+            app,
+            "Static",
+            &state.file_label.clone(),
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+        );
+        place(file, 12.0, 32.0, 536.0, 20.0);
+        let labels = ["MD5", "SHA-1", "SHA-256"];
+        for (i, label) in labels.iter().enumerate() {
+            let y = 62.0 + i as f32 * 28.0;
+            let lab = create_child(app, "Static", label, WS_CHILD | WS_VISIBLE, 0, 0);
+            place(lab, 12.0, y, 70.0, 22.0);
+            let val = create_child(
+                app,
+                "Static",
+                "Computing\u{2026}",
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+            );
+            place(val, 88.0, y, 460.0, 22.0);
+            state.values[i] = val;
+        }
+        let cmp_label = create_child(app, "Static", "Compare:", WS_CHILD | WS_VISIBLE, 0, 0);
+        place(cmp_label, 12.0, 152.0, 56.0, 22.0);
+        let edit_style = WS_CHILD | WS_VISIBLE | 0x80; // ES_AUTOHSCROLL
+        let compare = create_child(
+            app,
+            "Edit",
+            "",
+            edit_style,
+            WS_EX_CLIENTEDGE,
+            ID_HASH_COMPARE,
+        );
+        place(compare, 74.0, 150.0, 474.0, 24.0);
+        state.compare = compare;
+        let verdict = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE, 0, 0);
+        place(verdict, 12.0, 182.0, 536.0, 22.0);
+        state.verdict = verdict;
+        let button_style = WS_CHILD | WS_VISIBLE | 0xB; // BS_OWNERDRAW, like the Split dialog
+        let close = create_child(app, "Button", "Close", button_style, 0, ID_HASH_CLOSE);
+        place(close, 468.0, 212.0, 80.0, 26.0);
+        // SAFETY: the poll timer on our dialog; a null TIMERPROC
+        // means WM_TIMER messages.
+        unsafe { SetTimer(hwnd, TIMER_HASH, 100, None) };
+        return 0;
+    }
+    // SAFETY: the state pointer was stored at WM_CREATE; messages
+    // before it (or after the dialog is gone) get default handling.
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut HashDialogState;
+    if state_ptr.is_null() {
+        // SAFETY: default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    // SAFETY: the state outlives the dialog (see WM_CREATE).
+    let state = unsafe { &mut *state_ptr };
+    match msg {
+        WM_TIMER if wparam == TIMER_HASH => {
+            if !state.done {
+                let hashes = state.slot.lock().ok().and_then(|g| g.clone());
+                if let Some(h) = hashes {
+                    state.done = true;
+                    // SAFETY: our dialog's timer and value statics.
+                    unsafe { KillTimer(hwnd, TIMER_HASH) };
+                    for (control, digest) in state.values.iter().zip([
+                        h.md5.as_str(),
+                        h.sha1.as_str(),
+                        h.sha256.as_str(),
+                    ]) {
+                        let wide = wstr(digest);
+                        // SAFETY: as above; the string outlives the call.
+                        unsafe { SetWindowTextW(*control, wide.as_ptr()) };
+                    }
+                    update_hash_verdict(state);
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = wparam & 0xFFFF;
+            let code = (wparam >> 16) & 0xFFFF;
+            if id == ID_HASH_CLOSE {
+                // SAFETY: our dialog window.
+                unsafe { DestroyWindow(hwnd) };
+            } else if id == ID_HASH_COMPARE && code == EN_CHANGE {
+                update_hash_verdict(state);
+            }
+            0
+        }
+        WM_CLOSE => {
+            // SAFETY: our dialog window; closing is the only exit.
+            unsafe { DestroyWindow(hwnd) };
+            0
+        }
+        WM_DESTROY => {
+            // SAFETY: our dialog's timer.
+            unsafe { KillTimer(hwnd, TIMER_HASH) };
+            0
+        }
+        // The Close button is owner-drawn, drawn exactly like the
+        // Split dialog's buttons (theme panel frame, theme text).
+        WM_DRAWITEM => {
+            // SAFETY: lparam is a DRAWITEMSTRUCT for our button.
+            let dis = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
+            // SAFETY: the App is alive (modal dialog, UI thread).
+            let app = unsafe { &*state.app };
+            let mut rect = dis.rcItem;
+            // SAFETY: GDI drawing on the button's own DC, colours
+            // from the active theme.
+            unsafe {
+                FillRect(dis.hDC, &rect, app.panel_brush);
+                FrameRect(dis.hDC, &rect, app.line_brush);
+                SetBkMode(dis.hDC, TRANSPARENT as i32);
+                SetTextColor(dis.hDC, colorref(app.theme.text));
+                let text = window_text(dis.hwndItem);
+                let mut wide: Vec<u16> = text.encode_utf16().collect();
+                if !wide.is_empty() {
+                    DrawTextW(
+                        dis.hDC,
+                        wide.as_mut_ptr(),
+                        wide.len() as i32,
+                        &mut rect,
+                        0x1 | 0x4 | 0x20,
+                    );
+                }
+            }
+            1
+        }
+        // SAFETY: default handling for everything else.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Show the File Hashes dialog modally over a hashing worker that
+/// is already running into `slot`.
+fn show_hash_dialog(
+    app: &mut App,
+    note: String,
+    file_label: String,
+    slot: Arc<Mutex<Option<crate::hash::FileHashes>>>,
+) {
+    let mut state = HashDialogState {
+        app: app as *mut App,
+        slot,
+        note,
+        file_label,
+        done: false,
+        compare: std::ptr::null_mut(),
+        verdict: std::ptr::null_mut(),
+        values: [std::ptr::null_mut(); 3],
+    };
+    let class = wstr(HASH_CLASS);
+    let title = wstr("File Hashes");
+    // SAFETY: the hash class is registered in run_gui; the state
+    // travels in lpCreateParams and lives in this stack frame until
+    // the dialog is destroyed (the modal loop below).
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            app.px(584.0),
+            app.px(286.0),
+            app.hwnd,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            &mut state as *mut HashDialogState as *const c_void,
+        )
+    };
+    if hwnd.is_null() {
+        return;
+    }
+    // SAFETY: modal behaviour — the main window is disabled while
+    // the dialog is up and re-enabled as soon as it is destroyed.
+    unsafe {
+        EnableWindow(app.hwnd, 0);
+        ShowWindow(hwnd, SW_SHOW);
+    }
+    loop {
+        // SAFETY: MSG is a plain C struct; GetMessageW fills it.
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; 0 = WM_QUIT, -1 = error — either ends
+        // the modal wait (a quit is re-posted so the app still exits).
+        let result = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+        if result <= 0 {
+            // SAFETY: preserve the quit for the main loop.
+            unsafe { PostQuitMessage(0) };
+            break;
+        }
+        // SAFETY: standard message pumping.
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        // SAFETY: a plain liveness query on our dialog.
+        if unsafe { IsWindow(hwnd) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: restore the main window and give it the focus back.
+    unsafe {
+        EnableWindow(app.hwnd, 1);
+        SetFocus(app.hwnd);
+    }
+}
+
+/// File ▸ File Hashes… (roadmap item 37): stream the file on disk
+/// through MD5, SHA-1, and SHA-256 on a worker thread — the file
+/// can be huge, so the read side is a seek-and-read closure and
+/// nothing is loaded into memory. With unsaved changes the dialog
+/// says plainly that it is hashing the file on disk.
+fn do_file_hashes(app: &mut App) {
+    let Some(path) = app.editor.path().map(|p| p.to_path_buf()) else {
+        message_box(
+            app.hwnd,
+            "Save the document to a file first, then hash it.",
+            "VeloEdit",
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    };
+    let slot: Arc<Mutex<Option<crate::hash::FileHashes>>> = Arc::new(Mutex::new(None));
+    let worker_slot = slot.clone();
+    let worker_path = path.clone();
+    std::thread::spawn(move || {
+        let hashes = (|| {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&worker_path).ok()?;
+            let total = file.metadata().ok()?.len();
+            Some(crate::hash::hash_byte_source(total, |offset, buf| {
+                if file.seek(SeekFrom::Start(offset)).is_err() {
+                    return 0;
+                }
+                file.read(buf).unwrap_or(0)
+            }))
+        })();
+        // A file that could not be read at all still completes the
+        // dialog — with the digests of an empty input — rather than
+        // leaving it on "Computing…" forever. (The menu item is
+        // only enabled for documents that have a file, and the file
+        // was there at open; this is the vanished-since case.)
+        let hashes = hashes.unwrap_or_else(|| crate::hash::hash_bytes(&[]));
+        if let Ok(mut guard) = worker_slot.lock() {
+            *guard = Some(hashes);
+        }
+    });
+    let note = if app.editor.is_dirty() {
+        "The document has unsaved changes \u{2014} hashing the file on disk:"
+    } else {
+        "Hashes of the file on disk:"
+    }
+    .to_string();
+    let file_label = path.display().to_string();
+    show_hash_dialog(app, note, file_label, slot);
+}
+
+// ---------------------------------------------------------------------------
 // Find bar
 // ---------------------------------------------------------------------------
 
@@ -2560,6 +3948,7 @@ fn find_from_bar(app: &mut App, advance: i32) {
     // SAFETY: our edit controls.
     let text = unsafe { window_text(app.find_edit) };
     if text.is_empty() {
+        cancel_bg_find(app);
         set_find_label(app, "");
         app.last_find_text.clear();
         app.last_find_kind = FindKind::Plain;
@@ -2567,8 +3956,21 @@ fn find_from_bar(app: &mut App, advance: i32) {
         return;
     }
     let kind = find_kind_for(app, &text);
-    let rerun =
-        text != app.last_find_text || kind != app.last_find_kind || app.editor.matches().is_empty();
+    // A background find owns the display only while the committed
+    // find is the plain whole-document find for this text. Any other
+    // kind — or a one-shot synchronous request from Replace, which
+    // needs the editor's complete match state — cancels it.
+    let sync_once = std::mem::take(&mut app.find_sync_once);
+    if kind != FindKind::Plain || sync_once {
+        cancel_bg_find(app);
+    }
+    let rerun = if kind == FindKind::Plain && app.bg_active {
+        // The editor's own list stays empty while the background
+        // find owns the display; only a text or kind change re-runs.
+        text != app.last_find_text || kind != app.last_find_kind
+    } else {
+        text != app.last_find_text || kind != app.last_find_kind || app.editor.matches().is_empty()
+    };
     match kind {
         FindKind::Masked => {
             let pattern = masked_pattern_for(app, &text).expect("kind checked above");
@@ -2614,12 +4016,32 @@ fn find_from_bar(app: &mut App, advance: i32) {
             }
         }
         FindKind::Plain => {
-            if rerun {
-                match app.editor.set_find(&text, SearchOptions::default()) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        set_find_label(app, &format!("{err}"));
-                        return;
+            if app.bg_active && !rerun {
+                // The background find for this exact text is
+                // populating (or done): navigation runs over the
+                // matches known so far.
+                if advance != 0 {
+                    bg_advance(app, advance);
+                }
+            } else if rerun {
+                cancel_bg_find(app);
+                if !sync_once
+                    && app.editor.total_len() > BG_FIND_THRESHOLD
+                    && start_bg_find(app, &text)
+                {
+                    // Population started; the first selection lands
+                    // with the first results (tick), and an explicit
+                    // advance applies to whatever is known by now.
+                    if advance != 0 {
+                        bg_advance(app, advance);
+                    }
+                } else {
+                    match app.editor.set_find(&text, SearchOptions::default()) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            set_find_label(app, &format!("{err}"));
+                            return;
+                        }
                     }
                 }
             } else if advance > 0 {
@@ -2631,19 +4053,23 @@ fn find_from_bar(app: &mut App, advance: i32) {
     }
     app.last_find_text = text;
     app.last_find_kind = kind;
-    let count = app.editor.matches().len();
-    let label = if count == 0 {
-        "No matches".to_string()
+    if kind == FindKind::Plain && app.bg_active {
+        refresh_bg_find_label(app);
     } else {
-        format!(
-            "{} of {}",
-            app.editor.match_index().map(|i| i + 1).unwrap_or(0),
-            count
-        )
-    };
-    let wide = wstr(&label);
-    // SAFETY: our static control.
-    unsafe { SetWindowTextW(app.find_count, wide.as_ptr()) };
+        let count = app.editor.matches().len();
+        let label = if count == 0 {
+            "No matches".to_string()
+        } else {
+            format!(
+                "{} of {}",
+                app.editor.match_index().map(|i| i + 1).unwrap_or(0),
+                count
+            )
+        };
+        let wide = wstr(&label);
+        // SAFETY: our static control.
+        unsafe { SetWindowTextW(app.find_count, wide.as_ptr()) };
+    }
     let page = page_rows(app);
     app.editor.ensure_caret_visible(page);
     refresh_status(app);
@@ -2667,7 +4093,15 @@ fn do_replace(app: &mut App, all: bool) {
         );
         return;
     }
-    // Make sure the needle is current before replacing.
+    // Make sure the needle is current before replacing. A
+    // background find (roadmap item 10) holds its matches outside
+    // the editor, but replace works on the editor's own match
+    // state — so the find below is flagged to re-run synchronously
+    // and completely first (find_from_bar cancels the background
+    // find when it sees the flag).
+    if app.bg_active {
+        app.find_sync_once = true;
+    }
     find_from_bar(app, 0);
     let result = if all && app.find_in_selection {
         // Scoped replace-all (roadmap item 11): one undo entry, only
@@ -2893,9 +4327,18 @@ fn rebuild_recent_menu(app: &App) {
 }
 
 // ---------------------------------------------------------------------------
-// Recovery (never lose the user's work): a debounced snapshot of the
-// edited document in data/recovery.bin + data/recovery.json, written
-// only for documents up to RECOVERY_MAX_BYTES.
+// Recovery (never lose the user's work), in two forms:
+//
+// * Delta recovery (roadmap item 7) for documents backed by a file:
+//   data/recovery2.bin holds the piece-table state — the edit log —
+//   plus the original file's fingerprint (src/recovery.rs). Any
+//   document size; the file itself is never copied.
+// * A content snapshot for documents with no backing file:
+//   data/recovery.bin + data/recovery.json, capped at
+//   RECOVERY_MAX_BYTES as before.
+//
+// Both are written debounced (1 s after the last edit) and deleted
+// on a successful save, a clean exit, and a fresh open.
 // ---------------------------------------------------------------------------
 
 fn recovery_paths() -> (PathBuf, PathBuf) {
@@ -2903,13 +4346,53 @@ fn recovery_paths() -> (PathBuf, PathBuf) {
     (dir.join("recovery.bin"), dir.join("recovery.json"))
 }
 
+fn recovery2_path() -> PathBuf {
+    crate::settings::data_dir().join("recovery2.bin")
+}
+
 fn delete_recovery_files() {
     let (bin, json) = recovery_paths();
     let _ = std::fs::remove_file(bin);
     let _ = std::fs::remove_file(json);
+    let _ = std::fs::remove_file(recovery2_path());
 }
 
-fn write_recovery(app: &App) {
+/// Write whichever recovery form fits the current document.
+/// Returns false when the delta form applies but the original
+/// file's fingerprint has not arrived yet — the caller (the tick)
+/// then keeps the debounce open and retries shortly.
+fn write_recovery(app: &App) -> bool {
+    if app.editor.path().is_some() && app.doc_mmap.is_some() {
+        match &app.doc_fingerprint {
+            Some(fingerprint) => {
+                let path = app.editor.path().expect("checked above");
+                let state = crate::recovery::capture(
+                    app.editor.table(),
+                    path,
+                    fingerprint,
+                    app.editor.caret(),
+                    app.editor.encoding(),
+                );
+                let dir = crate::settings::data_dir();
+                let _ = std::fs::create_dir_all(&dir);
+                if std::fs::write(recovery2_path(), state.to_bytes()).is_ok() {
+                    // The delta record supersedes any snapshot of
+                    // the same document.
+                    let (bin, json) = recovery_paths();
+                    let _ = std::fs::remove_file(bin);
+                    let _ = std::fs::remove_file(json);
+                }
+                true
+            }
+            None => false,
+        }
+    } else {
+        write_snapshot_recovery(app);
+        true
+    }
+}
+
+fn write_snapshot_recovery(app: &App) {
     if app.editor.total_len() > RECOVERY_MAX_BYTES {
         return;
     }
@@ -2975,10 +4458,93 @@ fn json_string_value(json: &str, key: &str) -> Option<String> {
     }
 }
 
-/// Startup recovery check: if a snapshot exists and the file on disk
-/// does not match it, ask whether to open the recovered copy. Returns
-/// the editor to start with, or `None` for the normal startup path.
-fn recovery_startup_editor() -> Option<Editor> {
+/// Startup recovery check: the delta record first (roadmap item
+/// 7), then the content snapshot. Returns the editor to start with
+/// — plus, for a delta recovery, the original file's fingerprint,
+/// so the tracking setup can adopt it instead of recomputing it —
+/// or `None` for the normal startup path.
+fn recovery_startup_editor() -> Option<(Editor, Option<crate::recovery::FileFingerprint>)> {
+    if let Some(handled) = delta_recovery_startup() {
+        return handled;
+    }
+    snapshot_recovery_startup().map(|editor| (editor, None))
+}
+
+/// The delta half of the startup check. The outer `Option` says
+/// whether a delta record existed and was dealt with; the inner
+/// one is the startup result in [`recovery_startup_editor`]'s
+/// shape (`None` = start blank).
+fn delta_recovery_startup() -> Option<Option<(Editor, Option<crate::recovery::FileFingerprint>)>> {
+    let path2 = recovery2_path();
+    let bytes = std::fs::read(&path2).ok()?;
+    let state = match crate::recovery::RecoveryState::from_bytes(&bytes) {
+        Ok(state) => state,
+        Err(_) => {
+            // A corrupt record can never be rebuilt; drop it and
+            // let the snapshot check run.
+            let _ = std::fs::remove_file(&path2);
+            return None;
+        }
+    };
+    let table = match state.rebuild() {
+        Ok(table) => table,
+        Err(crate::recovery::RecoveryError::OriginalChanged(_)) => {
+            // The file moved on without these edits: say so plainly,
+            // drop the recovery, and start normally.
+            delete_recovery_files();
+            message_box(
+                std::ptr::null_mut(),
+                &format!(
+                    "VeloEdit found unsaved changes from last time, but the file they belong to \u{2014} {} \u{2014} has changed since they were recorded, so the changes were not restored.",
+                    state.original_path
+                ),
+                "VeloEdit",
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return Some(None);
+        }
+        Err(_) => {
+            // The original is gone or unreadable: nothing to rebuild
+            // against. Drop the record and let the snapshot check run.
+            let _ = std::fs::remove_file(&path2);
+            return None;
+        }
+    };
+    let answer = message_box(
+        std::ptr::null_mut(),
+        &format!(
+            "VeloEdit closed unexpectedly last time.\n\nRecover the unsaved changes to {}?",
+            state.original_path
+        ),
+        "VeloEdit",
+        MB_YESNO | MB_ICONQUESTION,
+    );
+    if answer != IDYES {
+        delete_recovery_files();
+        return Some(None);
+    }
+    let path = PathBuf::from(&state.original_path);
+    let sample = table.read(0, table.len().min(64 * 1024));
+    let mut detection = encoding::detect(&sample);
+    // The capture recorded the document's encoding; the sample
+    // detection only contributes the BOM length.
+    detection.encoding = state.encoding;
+    let mut editor = Editor::from_table(table, detection, Some(path), false);
+    editor.mark_dirty();
+    editor.move_caret_to(state.caret, false);
+    let fingerprint = crate::recovery::FileFingerprint {
+        size: state.original_size,
+        mtime_nanos: state.original_mtime_nanos,
+        sha256: state.original_sha256,
+    };
+    Some(Some((editor, Some(fingerprint))))
+}
+
+/// The snapshot half of the startup check: if a snapshot exists and
+/// the file on disk does not match it, ask whether to open the
+/// recovered copy. Returns the editor to start with, or `None` for
+/// the normal startup path.
+fn snapshot_recovery_startup() -> Option<Editor> {
     let (bin, json) = recovery_paths();
     let meta = std::fs::read_to_string(&json).ok()?;
     let bytes = std::fs::read(&bin).ok()?;
@@ -3264,6 +4830,28 @@ fn create_children(app: &mut App) {
     // = 0x2).
     app.status = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE, 0, 0);
     app.status_right = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE | 0x2, 0, 0);
+
+    // External-change notice bar (roadmap item 34): created hidden,
+    // shown by check_external_change. The label is a static (themed
+    // via WM_CTLCOLORSTATIC like the find bar's), the buttons are
+    // owner-drawn in the toolbar family.
+    app.change_label = create_child(app, "Static", "This file changed on disk.", WS_CHILD, 0, 0);
+    app.change_reload_btn =
+        create_child(app, "Button", "Reload", button_style, 0, CMD_CHANGE_RELOAD);
+    app.change_ignore_btn =
+        create_child(app, "Button", "Ignore", button_style, 0, CMD_CHANGE_IGNORE);
+    add_tooltip(
+        tooltip,
+        app.hwnd,
+        app.change_reload_btn,
+        "Throw away this copy and open the file from disk (you are asked about unsaved changes first)",
+    );
+    add_tooltip(
+        tooltip,
+        app.hwnd,
+        app.change_ignore_btn,
+        "Keep editing this copy; the notice returns if the file changes again",
+    );
 }
 
 fn menu_item(menu: HMENU, id: usize, text: &str) {
@@ -3296,6 +4884,43 @@ fn build_menus(app: &mut App) {
         menu_item(file, CMD_SAVE_AS, "Save As\u{2026}");
         menu_item(file, CMD_SAVE_SELECTION, "Save Selection to File\u{2026}");
         menu_item(file, CMD_SPLIT_FILE, "Split File Copy\u{2026}");
+        menu_item(file, CMD_FILE_HASHES, "File Hashes\u{2026}");
+        // Save Options (roadmap items 31/32): two radio groups —
+        // what happens to line endings and to the byte-order mark
+        // on every save. The choices persist in settings.
+        app.save_options_menu = CreatePopupMenu();
+        menu_item(
+            app.save_options_menu,
+            CMD_SAVE_EOL_BASE,
+            "Keep Line Endings",
+        );
+        menu_item(
+            app.save_options_menu,
+            CMD_SAVE_EOL_BASE + 1,
+            "Convert to LF",
+        );
+        menu_item(
+            app.save_options_menu,
+            CMD_SAVE_EOL_BASE + 2,
+            "Convert to CRLF",
+        );
+        menu_sep(app.save_options_menu);
+        menu_item(
+            app.save_options_menu,
+            CMD_SAVE_BOM_BASE,
+            "Keep Byte-Order Mark",
+        );
+        menu_item(
+            app.save_options_menu,
+            CMD_SAVE_BOM_BASE + 1,
+            "Add Byte-Order Mark",
+        );
+        menu_item(
+            app.save_options_menu,
+            CMD_SAVE_BOM_BASE + 2,
+            "Remove Byte-Order Mark",
+        );
+        menu_popup(file, app.save_options_menu, "Save Options");
         app.recent_menu = CreatePopupMenu();
         menu_popup(file, app.recent_menu, "Recent");
         menu_sep(file);
@@ -3331,6 +4956,8 @@ fn build_menus(app: &mut App) {
         menu_item(view, CMD_MODE_TEXT, "Text Mode");
         menu_item(view, CMD_MODE_HEX, "Hex Mode\tF6");
         menu_sep(view);
+        menu_item(view, CMD_INSPECTOR, "Data Inspector");
+        menu_sep(view);
         app.theme_menu = CreatePopupMenu();
         for (i, name) in crate::theme::names().iter().enumerate() {
             menu_item(app.theme_menu, CMD_THEME_BASE + i, name);
@@ -3349,6 +4976,44 @@ fn build_menus(app: &mut App) {
         menu_item(view, CMD_FONT_SMALLER, "Font Size \u{2212}\tCtrl+-");
         menu_sep(view);
         menu_item(view, CMD_VIEW_RULER, "Column Ruler");
+        menu_sep(view);
+        // Hex layout (roadmap items 13/14): the row width and the
+        // grouping are display choices for hex mode; text mode
+        // never sees them.
+        app.hex_cols_menu = CreatePopupMenu();
+        for (i, label) in [
+            "8 Columns",
+            "16 Columns",
+            "24 Columns",
+            "32 Columns",
+            "64 Columns",
+            "Fit to Window",
+        ]
+        .iter()
+        .enumerate()
+        {
+            menu_item(app.hex_cols_menu, CMD_HEXCOLS_BASE + i, label);
+        }
+        menu_popup(view, app.hex_cols_menu, "Hex Columns");
+        app.hex_group_menu = CreatePopupMenu();
+        for (i, label) in [
+            "Bytes (No Grouping)",
+            "Words (2 Bytes)",
+            "Dwords (4 Bytes)",
+            "Qwords (8 Bytes)",
+        ]
+        .iter()
+        .enumerate()
+        {
+            menu_item(app.hex_group_menu, CMD_HEXGROUP_BASE + i, label);
+        }
+        menu_sep(app.hex_group_menu);
+        menu_item(app.hex_group_menu, CMD_HEX_ENDIAN, "Big-Endian Groups");
+        menu_popup(view, app.hex_group_menu, "Hex Grouping");
+        menu_sep(view);
+        // Relative offsets (roadmap item 16): session-only.
+        menu_item(view, CMD_REL_OFFSETS, "Relative Offsets");
+        menu_item(view, CMD_SET_OFFSET_BASE, "Set Offset Base at Caret");
 
         let help = CreatePopupMenu();
         menu_item(help, CMD_GUIDE, "Built-in Guide\tF1");
@@ -3429,6 +5094,87 @@ fn refresh_menu_checks(app: &App) {
                     } else {
                         0
                     },
+            );
+        }
+        // Data inspector (roadmap item 15): checked while open.
+        CheckMenuItem(
+            app.view_menu,
+            CMD_INSPECTOR as u32,
+            MF_BYCOMMAND
+                | if app.settings.inspector_open {
+                    MF_CHECKED
+                } else {
+                    0
+                },
+        );
+        // Hex layout radios (roadmap items 13/14).
+        if !app.hex_cols_menu.is_null() {
+            let idx = HEX_COLS_MENU
+                .iter()
+                .position(|&c| c == app.settings.hex_cols)
+                .unwrap_or(1);
+            CheckMenuRadioItem(
+                app.hex_cols_menu,
+                CMD_HEXCOLS_BASE as u32,
+                (CMD_HEXCOLS_BASE + HEX_COLS_MENU.len() - 1) as u32,
+                (CMD_HEXCOLS_BASE + idx) as u32,
+                MF_BYCOMMAND,
+            );
+        }
+        if !app.hex_group_menu.is_null() {
+            let gidx = [1u32, 2, 4, 8]
+                .iter()
+                .position(|&g| g == app.settings.hex_group)
+                .unwrap_or(0);
+            CheckMenuRadioItem(
+                app.hex_group_menu,
+                CMD_HEXGROUP_BASE as u32,
+                (CMD_HEXGROUP_BASE + 3) as u32,
+                (CMD_HEXGROUP_BASE + gidx) as u32,
+                MF_BYCOMMAND,
+            );
+            CheckMenuItem(
+                app.hex_group_menu,
+                CMD_HEX_ENDIAN as u32,
+                MF_BYCOMMAND
+                    | if app.settings.hex_endian {
+                        MF_CHECKED
+                    } else {
+                        0
+                    },
+            );
+        }
+        // Relative offsets (roadmap item 16): checked while on.
+        CheckMenuItem(
+            app.view_menu,
+            CMD_REL_OFFSETS as u32,
+            MF_BYCOMMAND | if app.rel_offsets { MF_CHECKED } else { 0 },
+        );
+        // Save Options radios (roadmap items 31/32).
+        if !app.save_options_menu.is_null() {
+            let eol_idx = match app.settings.save_eol_choice() {
+                crate::save::EolChoice::Lf => 1,
+                crate::save::EolChoice::Crlf => 2,
+                crate::save::EolChoice::Keep => 0,
+            };
+            CheckMenuRadioItem(
+                app.save_options_menu,
+                CMD_SAVE_EOL_BASE as u32,
+                (CMD_SAVE_EOL_BASE + 2) as u32,
+                (CMD_SAVE_EOL_BASE + eol_idx) as u32,
+                MF_BYCOMMAND,
+            );
+            let bom_idx = match app.settings.save_bom_choice() {
+                crate::save::BomChoice::Add => 1,
+                crate::save::BomChoice::Remove => 2,
+                crate::save::BomChoice::Keep => 0,
+            };
+            CheckMenuRadioItem(
+                app.save_options_menu,
+                CMD_SAVE_BOM_BASE as u32,
+                (CMD_SAVE_BOM_BASE + 2) as u32,
+                (CMD_SAVE_BOM_BASE + bom_idx) as u32,
+                MF_BYCOMMAND,
             );
         }
     }
@@ -3676,6 +5422,9 @@ fn on_command(app: &mut App, id: usize) {
         CMD_SPLIT_FILE => {
             do_split_file(app);
         }
+        CMD_FILE_HASHES => {
+            do_file_hashes(app);
+        }
         CMD_EXPLORER_MENU => {
             // Toggle the opt-in Explorer item (roadmap item 38): the
             // registry state is the truth, the check mark follows it.
@@ -3688,6 +5437,25 @@ fn on_command(app: &mut App, id: usize) {
                 message_box(app.hwnd, &message, "VeloEdit", MB_OK | MB_ICONERROR);
             }
             refresh_menu_checks(app);
+        }
+        CMD_CHANGE_RELOAD => {
+            // Roadmap item 34: re-open the file from disk. Unsaved
+            // edits go through the ordinary dirty-document prompt;
+            // cancelling it keeps the bar (and the edits). A reload
+            // re-runs the whole per-document setup, exactly like a
+            // fresh open of the path.
+            if let Some(path) = app.editor.path().map(|p| p.to_path_buf()) {
+                if prompt_save_if_dirty(app) {
+                    open_document(app, &path);
+                }
+            }
+        }
+        CMD_CHANGE_IGNORE => {
+            // Roadmap item 34: dismiss the notice for this on-disk
+            // state; a further change (a different stamp) shows the
+            // bar again.
+            app.change_ignored_for = app.change_shown_for.take();
+            set_change_bar_visible(app, false);
         }
         CMD_EXIT => {
             // SAFETY: posting our own close message.
@@ -3838,6 +5606,85 @@ fn on_command(app: &mut App, id: usize) {
             refresh_menu_checks(app);
             invalidate(app);
         }
+        CMD_INSPECTOR => {
+            // Data inspector panel (roadmap item 15): docked right;
+            // the editor area shrinks by the panel's width in
+            // compute_layout, and the hex fit width follows.
+            app.settings.inspector_open = !app.settings.inspector_open;
+            save_settings(app);
+            refresh_menu_checks(app);
+            sync_hex_layout(app);
+            layout_children(app);
+            invalidate(app);
+        }
+        CMD_REL_OFFSETS => {
+            // Relative offsets (roadmap item 16): switching on
+            // starts counting from the caret.
+            app.rel_offsets = !app.rel_offsets;
+            if app.rel_offsets {
+                app.rel_base = app.editor.caret();
+            }
+            refresh_menu_checks(app);
+            refresh_status(app);
+            invalidate(app);
+        }
+        CMD_SET_OFFSET_BASE => {
+            app.rel_base = app.editor.caret();
+            if !app.rel_offsets {
+                app.rel_offsets = true;
+                refresh_menu_checks(app);
+            }
+            refresh_status(app);
+            invalidate(app);
+        }
+        _ if (CMD_HEXCOLS_BASE..CMD_HEXCOLS_BASE + HEX_COLS_MENU.len()).contains(&id) => {
+            // Hex Columns (roadmap item 13): 0 is fit-to-window.
+            app.settings.hex_cols = HEX_COLS_MENU[id - CMD_HEXCOLS_BASE];
+            save_settings(app);
+            sync_hex_layout(app);
+            refresh_menu_checks(app);
+            invalidate(app);
+        }
+        _ if (CMD_HEXGROUP_BASE..CMD_HEXGROUP_BASE + 4).contains(&id) => {
+            // Hex Grouping (roadmap item 14).
+            app.settings.hex_group = [1, 2, 4, 8][id - CMD_HEXGROUP_BASE];
+            save_settings(app);
+            sync_hex_layout(app);
+            refresh_menu_checks(app);
+            invalidate(app);
+        }
+        CMD_HEX_ENDIAN => {
+            app.settings.hex_endian = !app.settings.hex_endian;
+            save_settings(app);
+            sync_hex_layout(app);
+            refresh_menu_checks(app);
+            invalidate(app);
+        }
+        _ if (CMD_SAVE_EOL_BASE..CMD_SAVE_EOL_BASE + 3).contains(&id) => {
+            // Save Options ▸ Line Endings (roadmap item 31): the
+            // status bar announces the armed conversion at once.
+            app.settings.save_eol = match id - CMD_SAVE_EOL_BASE {
+                1 => crate::settings::SAVE_EOL_LF.to_string(),
+                2 => crate::settings::SAVE_EOL_CRLF.to_string(),
+                _ => crate::settings::SAVE_EOL_KEEP.to_string(),
+            };
+            save_settings(app);
+            refresh_menu_checks(app);
+            layout_children(app);
+            refresh_status(app);
+        }
+        _ if (CMD_SAVE_BOM_BASE..CMD_SAVE_BOM_BASE + 3).contains(&id) => {
+            // Save Options ▸ Byte-Order Mark (roadmap item 32).
+            app.settings.save_bom = match id - CMD_SAVE_BOM_BASE {
+                1 => crate::settings::SAVE_BOM_ADD.to_string(),
+                2 => crate::settings::SAVE_BOM_REMOVE.to_string(),
+                _ => crate::settings::SAVE_BOM_KEEP.to_string(),
+            };
+            save_settings(app);
+            refresh_menu_checks(app);
+            layout_children(app);
+            refresh_status(app);
+        }
         CMD_GUIDE => show_help(app),
         CMD_ABOUT => {
             message_box(
@@ -3949,6 +5796,17 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
         0x70 => {
             // VK_F1
             show_help(app);
+            return true;
+        }
+        0x71 => {
+            // VK_F2: Ctrl toggles a bookmark at the caret; Shift
+            // jumps to the previous bookmark, plain F2 to the next
+            // (roadmap item 20).
+            if ctrl {
+                toggle_bookmark(app);
+            } else {
+                jump_bookmark(app, !shift);
+            }
             return true;
         }
         0x72 => {
@@ -4127,7 +5985,11 @@ fn scrollbar_hit(app: &mut App, x_px: i32, y_px: i32) -> Option<ScrollHit> {
     let layout = compute_layout(app);
     let x = app.dip(x_px);
     let y = app.dip(y_px);
-    if x < layout.width - SCROLLBAR_W || y < layout.editor_top || y >= layout.editor_bottom {
+    if x < layout.editor_right - SCROLLBAR_W
+        || x >= layout.editor_right
+        || y < layout.editor_top
+        || y >= layout.editor_bottom
+    {
         return None;
     }
     let (total, first, visible) = scroll_metrics(app);
@@ -4216,6 +6078,9 @@ unsafe extern "system" fn wnd_proc(
         app.dpi = if dpi == 0 { 96 } else { dpi };
         create_children(app);
         build_menus(app);
+        // The persisted hex layout (roadmap items 13/14) applies
+        // from the first paint.
+        sync_hex_layout(app);
         // SAFETY: accept file drops on our own window.
         unsafe { DragAcceptFiles(hwnd, 1) };
         // SAFETY: timers on our window; a null TIMERPROC means WM_TIMER.
@@ -4291,6 +6156,9 @@ unsafe extern "system" fn wnd_proc(
                     release_target(app);
                 }
             }
+            // Fit-to-window hex columns follow the new size
+            // (roadmap item 13).
+            sync_hex_layout(app);
             layout_children(app);
             0
         }
@@ -4386,6 +6254,10 @@ unsafe extern "system" fn wnd_proc(
                     set(file_menu, CMD_SAVE, can_edit);
                     set(file_menu, CMD_SAVE_SELECTION, has_selection);
                     set(file_menu, CMD_SPLIT_FILE, app.editor.path().is_some());
+                    // File Hashes (roadmap item 37) hashes the file
+                    // on disk, so a document with no file has
+                    // nothing to hash.
+                    set(file_menu, CMD_FILE_HASHES, app.editor.path().is_some());
                     set(edit_menu, CMD_UNDO, app.editor.can_undo());
                     set(edit_menu, CMD_SORT_LINES, can_edit && has_selection);
                     set(edit_menu, CMD_DEDUP_LINES, can_edit && has_selection);
@@ -4448,17 +6320,87 @@ unsafe extern "system" fn wnd_proc(
                         app.editor.goto_line(line);
                         after_caret_move(app);
                     }
-                    // Recovery: one second after the last edit, snapshot.
-                    if let Some(when) = app.last_edit {
-                        if when.elapsed() >= std::time::Duration::from_secs(1) {
-                            if app.editor.is_dirty() {
-                                write_recovery(app);
+                    // Pick up the original file's fingerprint for
+                    // the delta recovery (roadmap item 7).
+                    if app.doc_fingerprint.is_none() {
+                        let ready = match app.fingerprint_slot.try_lock() {
+                            Ok(mut guard) => guard.take(),
+                            Err(_) => None,
+                        };
+                        if let Some((epoch, fingerprint)) = ready {
+                            if epoch == app.doc_epoch {
+                                app.doc_fingerprint = Some(fingerprint);
                             }
+                        }
+                    }
+                    // Pick up background find-all progress (roadmap
+                    // items 10 + 24): mirror the worker's matches,
+                    // select the first one at or after the caret as
+                    // soon as any are known (the synchronous find
+                    // selects at commit; here the selection lands
+                    // with the first results), and keep the count
+                    // label honest.
+                    if app.bg_active {
+                        let snapshot = match app.find_slot.try_lock() {
+                            Ok(guard) => guard.as_ref().and_then(|progress| {
+                                if progress.find_gen == app.find_gen
+                                    && progress.doc_gen == app.doc_generation
+                                {
+                                    Some((progress.matches.clone(), progress.done))
+                                } else {
+                                    None
+                                }
+                            }),
+                            Err(_) => None,
+                        };
+                        if let Some((matches, done)) = snapshot {
+                            let changed =
+                                matches.len() != app.bg_matches.len() || (done && !app.bg_done);
+                            if changed {
+                                app.bg_matches = matches;
+                                app.bg_done = done;
+                                if app.bg_current.is_none() && !app.bg_matches.is_empty() {
+                                    let caret = app.editor.caret();
+                                    let idx = app
+                                        .bg_matches
+                                        .iter()
+                                        .position(|&m| m >= caret)
+                                        .unwrap_or(0);
+                                    select_bg_match(app, idx);
+                                    let page = page_rows(app);
+                                    app.editor.ensure_caret_visible(page);
+                                    refresh_status(app);
+                                }
+                                if app.find_visible {
+                                    refresh_bg_find_label(app);
+                                }
+                                invalidate(app);
+                            }
+                        }
+                    }
+                    // Recovery: one second after the last edit,
+                    // write the record. A delta write that must wait
+                    // for the fingerprint keeps the debounce open
+                    // and retries on a later tick.
+                    if let Some(when) = app.last_edit {
+                        if when.elapsed() >= std::time::Duration::from_secs(1)
+                            && (!app.editor.is_dirty() || write_recovery(app))
+                        {
                             app.last_edit = None;
                         }
                     }
                 }
                 _ => {}
+            }
+            0
+        }
+        WM_ACTIVATE => {
+            // Roadmap item 34: coming back to the window is the
+            // moment to notice the file changed under us. WA_INACTIVE
+            // is 0; plain activation (1) and click-activation (2)
+            // both run the (cheap, deduplicated) stamp check.
+            if (wparam & 0xFFFF) != 0 {
+                check_external_change(app);
             }
             0
         }
@@ -4610,7 +6552,7 @@ unsafe extern "system" fn wnd_proc(
                 let x = app.dip(pt.x);
                 if y >= layout.editor_top
                     && y < layout.editor_bottom
-                    && x < layout.width - SCROLLBAR_W
+                    && x < layout.editor_right - SCROLLBAR_W
                 {
                     // SAFETY: loading the shared I-beam cursor.
                     let cursor = unsafe { LoadCursorW(std::ptr::null_mut(), IDC_IBEAM) };
@@ -4718,9 +6660,12 @@ pub fn run_gui(options: &CliOptions) -> i32 {
     }
 
     // The startup document: an explicit file wins; then a recovery
-    // snapshot (skipped in read-only viewing); otherwise a blank page.
+    // record (skipped in read-only viewing); otherwise a blank page.
     let mut index_source: Option<Arc<MmapFile>> = None;
     let mut startup_eol = "LF";
+    // A delta recovery hands back the original file's fingerprint
+    // alongside the editor; the tracking setup below adopts it.
+    let mut recovered_fingerprint: Option<crate::recovery::FileFingerprint> = None;
     let mut editor = if let Some(file) = &options.file {
         let path = Path::new(file);
         match MmapFile::open(path) {
@@ -4753,7 +6698,13 @@ pub fn run_gui(options: &CliOptions) -> i32 {
             }
         }
     } else if !options.read_only {
-        recovery_startup_editor().unwrap_or_else(Editor::new_empty)
+        match recovery_startup_editor() {
+            Some((recovered, fingerprint)) => {
+                recovered_fingerprint = fingerprint;
+                recovered
+            }
+            None => Editor::new_empty(),
+        }
     } else {
         Editor::new_empty()
     };
@@ -4778,7 +6729,7 @@ pub fn run_gui(options: &CliOptions) -> i32 {
     let edit_brush = unsafe { CreateSolidBrush(colorref(theme.bg)) };
     let line_brush = unsafe { CreateSolidBrush(colorref(theme.line)) };
     let accent_brush = unsafe { CreateSolidBrush(colorref(theme.accent)) };
-    let app = App {
+    let mut app = App {
         hwnd: std::ptr::null_mut(),
         editor,
         settings,
@@ -4809,6 +6760,30 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         find_scope_range: None,
         last_scope_range: None,
         last_find_kind: FindKind::Plain,
+        doc_mmap: None,
+        find_slot: Arc::new(Mutex::new(None)),
+        find_gen: 0,
+        bg_active: false,
+        bg_matches: Vec::new(),
+        bg_done: false,
+        bg_current: None,
+        bg_needle_len: 0,
+        find_sync_once: false,
+        bookmark_store: crate::bookmarks::BookmarkStore::load_from(
+            &crate::bookmarks::bookmarks_path(),
+        ),
+        bookmarks: crate::bookmarks::BookmarkList::new(),
+        doc_stamp: None,
+        file_stamp: None,
+        change_label: std::ptr::null_mut(),
+        change_reload_btn: std::ptr::null_mut(),
+        change_ignore_btn: std::ptr::null_mut(),
+        change_visible: false,
+        change_shown_for: None,
+        change_ignored_for: None,
+        fingerprint_slot: Arc::new(Mutex::new(None)),
+        doc_epoch: 0,
+        doc_fingerprint: None,
         status: std::ptr::null_mut(),
         status_right: std::ptr::null_mut(),
         eol: startup_eol,
@@ -4819,6 +6794,11 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         recent_menu: std::ptr::null_mut(),
         theme_menu: std::ptr::null_mut(),
         accent_menu: std::ptr::null_mut(),
+        hex_cols_menu: std::ptr::null_mut(),
+        hex_group_menu: std::ptr::null_mut(),
+        save_options_menu: std::ptr::null_mut(),
+        rel_offsets: false,
+        rel_base: 0,
         find_visible: false,
         has_focus: false,
         caret_on: true,
@@ -4841,6 +6821,14 @@ pub fn run_gui(options: &CliOptions) -> i32 {
             None
         },
     };
+    // Per-document tracking for the startup document (bookmarks,
+    // external-change baseline, recovery fingerprint): the same
+    // setup open_document performs for every later open.
+    app.doc_mmap = index_source.clone();
+    begin_document_tracking(&mut app);
+    if let Some(fingerprint) = recovered_fingerprint {
+        app.doc_fingerprint = Some(fingerprint);
+    }
     if let Some(mmap) = index_source {
         spawn_index_thread(&app, mmap);
     }
@@ -4981,7 +6969,24 @@ fn register_classes(hinstance: HINSTANCE) -> bool {
         lpszClassName: split.as_ptr(),
     };
     // SAFETY: as above.
-    (unsafe { RegisterClassW(&split_class) }) != 0
+    if unsafe { RegisterClassW(&split_class) } == 0 {
+        return false;
+    }
+    let hash = wstr(HASH_CLASS);
+    let hash_class = WNDCLASSW {
+        style: 0x2 | 0x1,
+        lpfnWndProc: Some(hash_dialog_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: icon,
+        hCursor: cursor,
+        hbrBackground: std::ptr::null_mut(),
+        lpszMenuName: std::ptr::null(),
+        lpszClassName: hash.as_ptr(),
+    };
+    // SAFETY: as above.
+    (unsafe { RegisterClassW(&hash_class) }) != 0
 }
 
 /// The registry path of the Explorer context-menu item (roadmap
@@ -5207,6 +7212,25 @@ mod tests {
         assert_eq!(scrollbar_first_row(1000.0, 10, 25, 500.0), 0);
     }
 
+    /// Scrollbar ticks: offsets bucket by their fraction of the
+    /// document, runs landing on one row collapse into it, and
+    /// degenerate inputs produce no ticks.
+    #[test]
+    fn tick_rows_buckets_by_document_fraction() {
+        assert!(tick_rows(&[], 100, 10).is_empty());
+        assert!(tick_rows(&[0, 50], 0, 10).is_empty());
+        assert!(tick_rows(&[0, 50], 100, 0).is_empty());
+        // Fractions land on proportional rows; the last byte is on
+        // the last row.
+        assert_eq!(tick_rows(&[0, 25, 50, 99], 100, 10), vec![0, 2, 5, 9]);
+        // A dense run collapses to one tick per row.
+        let dense: Vec<u64> = (0..100).collect();
+        assert_eq!(tick_rows(&dense, 100, 4), vec![0, 1, 2, 3]);
+        // Huge offsets stay exact through the u128 maths.
+        let big = u64::MAX / 2;
+        assert_eq!(tick_rows(&[big], u64::MAX, 1000), vec![499]);
+    }
+
     /// The status bar's size format: exact bytes, one decimal above.
     #[test]
     fn human_size_formats_like_the_status_bar() {
@@ -5237,5 +7261,113 @@ mod tests {
             "\"D:\\My Apps\\VeloEdit.exe\" \"%1\"",
             "a path with spaces stays one quoted argument"
         );
+    }
+
+    /// The armed-save suffix (roadmap items 31/32): empty while
+    /// both choices are Keep, and every non-Keep combination names
+    /// exactly the conversion that will run on the next save.
+    #[test]
+    fn save_armed_suffix_names_the_pending_conversion() {
+        use crate::save::{BomChoice, EolChoice};
+        assert_eq!(save_armed_suffix(EolChoice::Keep, BomChoice::Keep), "");
+        assert_eq!(
+            save_armed_suffix(EolChoice::Lf, BomChoice::Keep),
+            " \u{00B7} \u{2192} LF"
+        );
+        assert_eq!(
+            save_armed_suffix(EolChoice::Crlf, BomChoice::Keep),
+            " \u{00B7} \u{2192} CRLF"
+        );
+        assert_eq!(
+            save_armed_suffix(EolChoice::Keep, BomChoice::Add),
+            " \u{00B7} +BOM"
+        );
+        assert_eq!(
+            save_armed_suffix(EolChoice::Keep, BomChoice::Remove),
+            " \u{00B7} \u{2212}BOM"
+        );
+        assert_eq!(
+            save_armed_suffix(EolChoice::Crlf, BomChoice::Remove),
+            " \u{00B7} \u{2192} CRLF \u{00B7} \u{2212}BOM"
+        );
+        assert_eq!(
+            save_armed_suffix(EolChoice::Lf, BomChoice::Add),
+            " \u{00B7} \u{2192} LF \u{00B7} +BOM"
+        );
+    }
+
+    /// The hash dialog's verdict (roadmap item 37): blank for an
+    /// empty box, patient while hashing, and it names the digest a
+    /// pasted value matches (case-insensitively, whitespace ignored)
+    /// or reports no match.
+    #[test]
+    fn hash_verdict_matches_each_digest() {
+        let h = crate::hash::hash_bytes(b"veloedit");
+        assert_eq!(hash_verdict("", Some(&h)), "");
+        assert_eq!(hash_verdict("   ", Some(&h)), "");
+        assert_eq!(hash_verdict(&h.md5, None), "Still hashing\u{2026}");
+        assert_eq!(
+            hash_verdict(&h.sha256.to_uppercase(), Some(&h)),
+            "Matches SHA-256"
+        );
+        assert_eq!(
+            hash_verdict(&format!("  {}  ", h.sha1), Some(&h)),
+            "Matches SHA-1"
+        );
+        assert_eq!(hash_verdict(&h.md5, Some(&h)), "Matches MD5");
+        assert_eq!(hash_verdict("deadbeef", Some(&h)), "No match");
+    }
+
+    /// The inspector panel's rows (roadmap item 15): one labelled
+    /// row per reading, in display order, with the no-reading
+    /// marker where the slice is too short.
+    #[test]
+    fn inspector_rows_cover_every_reading() {
+        let bytes: [u8; 16] = [
+            0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        let report = crate::inspector::inspect(&bytes);
+        let rows = inspector_rows(&report, 0x100);
+        let labels: Vec<&str> = rows.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Offset",
+                "Hex",
+                "Binary",
+                "Int8",
+                "UInt8",
+                "Int16 LE",
+                "Int16 BE",
+                "UInt16 LE",
+                "UInt16 BE",
+                "Int32 LE",
+                "Int32 BE",
+                "UInt32 LE",
+                "UInt32 BE",
+                "Float32 LE",
+                "Float32 BE",
+                "Int64 LE",
+                "Int64 BE",
+                "UInt64 LE",
+                "UInt64 BE",
+                "Float64 LE",
+                "Float64 BE",
+                "Unix s (u32)",
+                "Unix s (u64)",
+                "Unix ms (u64)",
+                "GUID",
+                "FILETIME",
+                "Text",
+            ]
+        );
+        assert_eq!(rows[0].1, "256 (0x100)");
+        assert_eq!(rows[24].1, "00112233-4455-6677-8899-AABBCCDDEEFF");
+        // A two-byte slice: the short readings become the marker.
+        let report = crate::inspector::inspect(&bytes[..2]);
+        let rows = inspector_rows(&report, 0);
+        assert_eq!(rows[9].1, "\u{2014}"); // Int32 LE
+        assert_eq!(rows[24].1, "\u{2014}"); // GUID
     }
 }
