@@ -177,6 +177,17 @@ pub fn capture(
                     bytes: table.append_buffer[start..end].to_vec(),
                 });
             }
+            // A zero run has no stored bytes; the record stores
+            // them as an Added piece holding the zeros themselves,
+            // so a rebuild reproduces the document byte for byte
+            // with no format change. (A very large run therefore
+            // inflates its recovery record — the run's bytes are
+            // the record's payload by design here.)
+            BufferSource::Zeroes => {
+                pieces.push(RecoveryPiece::Added {
+                    bytes: vec![0u8; piece.length as usize],
+                });
+            }
         }
     }
     RecoveryState {
