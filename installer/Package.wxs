@@ -19,8 +19,10 @@
   This file is built ONLY on a Windows machine (the release workflow does
   it; WiX cannot build an MSI on Linux). Exact build commands:
 
-    dotnet tool install (global) wix, version 4.x
-    wix extension add WixToolset.UI.wixext
+    dotnet tool install (global) wix, version 4.0.6
+    wix extension add WixToolset.UI.wixext/4.0.6
+    (the extension version must match the tool's major version,
+    or the build fails with WIX0144)
     wix build installer\Package.wxs -ext WixToolset.UI.wixext ^
         -d ExePath=target\x86_64-pc-windows-msvc\release\VeloEdit.exe ^
         -o VeloEdit-v1.0.0-x64-Setup.msi
