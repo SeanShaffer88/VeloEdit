@@ -68,6 +68,43 @@ GitHub runner's disk is not the place for a 100 GB save-copy). The
 §8 metrics in the table above keep their individual statuses —
 the harness is how the Windows numbers will be produced.
 
+## Staged open — the instant-open fix (2026-11-01, host proxies)
+
+Opening used to build the whole line index before the window
+could answer anything: the first line question ran the full-file
+scan on the spot. Measured on the owner's Windows 11 machine, a
+10 GB file took 23 seconds to open. The open path is now staged:
+open indexes only the first 4 MB (enough for the first screens),
+and a background thread finishes the index in 32 MB steps using
+the same parallel scanner, publishing snapshots the window picks
+up on its normal timer. Every position stays exact at every
+stage — lines past the frontier resolve by a forward scan from
+the last checkpoint — and the finished index is checkpoint-
+identical to the one-shot build.
+
+Measured here with the ignored release-mode bench tests
+(`cargo test --release --lib bench_ -- --ignored --nocapture`)
+over an in-memory 1,000,000,000-byte source of 10,000,000
+100-byte log lines (Linux host, release test build — host
+proxies only, **not** §8 Windows measurements):
+
+| Check | Result |
+| --- | --- |
+| One-shot full build (the old open path) | 3,112.4 ms (~321 MB/s) |
+| Head prefix only (first 4,194,304 bytes — all an open now waits for) | 4.89 ms |
+| Staged full build in 32 MB steps (background completion) | 2,045.9 ms |
+| Editor staged open, first line question answered | 32.81 ms (prefix count 41,944 lines, frontier 4,194,304 bytes) |
+
+The honest reading: what an open waits for fell from the full
+3.1-second scan to a 4 MB head build — the editor-level 32.81 ms
+includes opening the source and seeding that head region. A true
+before/after of the shipped binary cannot be re-measured here
+(the old code is gone); the one-shot build above is the old
+path's cost, run through the same scanner the old open used.
+All §8 metrics in the table above keep their status: the
+Windows open time for a real 100+ GB file remains **Unverified**
+until measured on Windows 11.
+
 ## Packaging artifact proofs (Slice 5, this machine)
 
 These prove the packaging scripts produce correctly shaped artifacts.
