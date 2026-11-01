@@ -71,6 +71,15 @@ pub struct LineCheckpoint {
     pub at_line_start: bool,
 }
 
+// Layout pin (architectural audit): the index holds one checkpoint per
+// `CHECKPOINT_INTERVAL` (64 KB) of source, so a complete index costs
+// exactly `source_len / 64 KB * 24` bytes — the figure the SPEC
+// section 8 memory budget implicitly spends on indexing. If a field
+// change grows this record, the build breaks here instead of silently
+// inflating the index for every large file.
+const _: () = assert!(std::mem::size_of::<LineCheckpoint>() == 24);
+const _: () = assert!(std::mem::align_of::<LineCheckpoint>() == 8);
+
 /// High bits of the bytes in `word` that equal `byte`, via SWAR:
 /// broadcast the byte, XOR, then flag every zero byte. The zero test
 /// per byte is `(x & 0x7F..) + 0x7F..) | x`: a byte's high bit ends up
@@ -121,6 +130,17 @@ pub struct LineIndexBuilder {
     offset: u64,
     /// The source ended earlier than promised (a read returned 0).
     stopped: bool,
+    /// Scratch reused across scan rounds (architectural audit):
+    /// `advance` works in rounds of up to eight 64 KB blocks, and used
+    /// to allocate the block buffers, the block list and the result
+    /// list fresh for every round — for a whole-file build that is
+    /// three allocations per 512 KB scanned, plus one per staged
+    /// `advance` call. The pool lives on the builder, so the same
+    /// buffers serve every round of every stage; at most eight 64 KB
+    /// buffers are ever held, the bound the module docs promise.
+    scratch_buffers: Vec<Vec<u8>>,
+    scratch_blocks: Vec<(u64, Vec<u8>)>,
+    scratch_results: Vec<(u64, Option<u8>)>,
 }
 
 impl LineIndexBuilder {
@@ -132,6 +152,9 @@ impl LineIndexBuilder {
             prev_byte: None,
             offset: 0,
             stopped: false,
+            scratch_buffers: Vec::new(),
+            scratch_blocks: Vec::new(),
+            scratch_results: Vec::new(),
         }
     }
 
@@ -175,11 +198,16 @@ impl LineIndexBuilder {
         // newline counts are computed in parallel, then assembled in
         // order. The checkpoint stream is exactly the serial one.
         while self.offset < self.total_len && !self.stopped && self.offset < limit {
-            let mut blocks: Vec<(u64, Vec<u8>)> = Vec::with_capacity(workers);
+            // Take the round's working lists out of the scratch pool;
+            // they go back at the end of the round (see below), so a
+            // build allocates them once, not once per round.
+            let mut blocks: Vec<(u64, Vec<u8>)> = std::mem::take(&mut self.scratch_blocks);
             let mut round_offset = self.offset;
             while blocks.len() < workers && round_offset < self.total_len {
                 let want = (CHECKPOINT_INTERVAL).min(self.total_len - round_offset) as usize;
-                let mut buffer = vec![0u8; want];
+                let mut buffer = self.scratch_buffers.pop().unwrap_or_default();
+                buffer.clear();
+                buffer.resize(want, 0);
                 let read = read_at(round_offset, &mut buffer);
                 buffer.truncate(read);
                 blocks.push((round_offset, buffer));
@@ -189,7 +217,9 @@ impl LineIndexBuilder {
                 round_offset += read as u64;
             }
             // Per-block results: (newline count, last byte).
-            let results: Vec<(u64, Option<u8>)> = if blocks.len() > 1 {
+            let mut results: Vec<(u64, Option<u8>)> = std::mem::take(&mut self.scratch_results);
+            results.clear();
+            if blocks.len() > 1 {
                 std::thread::scope(|scope| {
                     let handles: Vec<_> = blocks
                         .iter()
@@ -197,17 +227,19 @@ impl LineIndexBuilder {
                             scope.spawn(|| (count_newlines_in(data), data.last().copied()))
                         })
                         .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| h.join().expect("line-index worker panicked"))
-                        .collect()
-                })
+                    results.extend(
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().expect("line-index worker panicked")),
+                    );
+                });
             } else {
-                blocks
-                    .iter()
-                    .map(|(_, data)| (count_newlines_in(data), data.last().copied()))
-                    .collect()
-            };
+                results.extend(
+                    blocks
+                        .iter()
+                        .map(|(_, data)| (count_newlines_in(data), data.last().copied())),
+                );
+            }
             for ((block_offset, data), (count, last)) in blocks.iter().zip(results.iter()) {
                 self.checkpoints.push(LineCheckpoint {
                     byte_offset: *block_offset,
@@ -222,6 +254,13 @@ impl LineIndexBuilder {
                 self.prev_byte = *last;
                 self.offset = block_offset + data.len() as u64;
             }
+            // Recycle the round's buffers and lists into the pool.
+            for (_, buffer) in blocks.drain(..) {
+                self.scratch_buffers.push(buffer);
+            }
+            self.scratch_blocks = blocks;
+            results.clear();
+            self.scratch_results = results;
         }
         self.is_complete()
     }
@@ -279,7 +318,8 @@ impl LineIndex {
     /// fills the provided buffer with bytes starting at the given offset and
     /// returns how many bytes it wrote; it must return 0 only at the end of
     /// the source. The scan proceeds one checkpoint interval at a time, so
-    /// the live memory cost is one 64 KB buffer regardless of file size.
+    /// the live memory cost is the builder's reused pool of at most eight
+    /// 64 KB block buffers, regardless of file size.
     pub fn build(total_len: u64, read_at: impl FnMut(u64, &mut [u8]) -> usize) -> Self {
         let mut builder = LineIndexBuilder::new(total_len);
         builder.advance(u64::MAX, read_at);
