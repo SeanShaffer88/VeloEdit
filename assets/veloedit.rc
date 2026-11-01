@@ -1,0 +1,9 @@
+// VeloEdit program icon resource.
+//
+// Icon id 1 is the executable's default icon: Windows shows it for
+// VeloEdit.exe in Explorer, on the taskbar, and in Alt-Tab, and the
+// window-class registration in the GUI uses this same id for the
+// window's title-bar and taskbar icon. The build script (build.rs)
+// compiles this file from inside the assets folder, so the bare
+// filename below is correct.
+1 ICON "veloedit.ico"
