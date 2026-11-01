@@ -28,11 +28,11 @@ is the owner's call — and every Windows-runtime verification.
 | --- | --- | --- |
 | Architecture & foundation | 4 | Frozen module layout in `PROJECT_RULES.md`; original-bytes seam (`OriginalBuffer`) now carries the Windows mmap backing with no API change; the piece Vec carries a Fenwick weight index for O(log N) lookups (R2a) in place of the sketched B-tree, with the trade-off recorded in Known gaps |
 | Correctness (core operations) | 4 | Insert/delete/coalescence, multi-piece reads, undo/redo layout restoration, line checkpoints, hex/scroll math, diff counting, encoding detection/decode/encode, boundary-spanning search, single-undo replace-all, and the atomic save round trips (including both staged failure paths) are all covered by unit tests that exercise the real code paths |
-| Tests | 4 | 242 host unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1 + 16 roadmap R2a + 9 roadmap R2b + 37 roadmap R3a: Fenwick piece-index equivalence against a naive model over random edit scripts, 100k-piece lookups, coalescing, SWAR-vs-scalar and parallel-vs-serial line-index equivalence, SWAR search equivalence, scoped find/replace, masked search, line sort/dedup, scoped find navigation, masked find flow, the file splitter, CLI size parsing and split runs, hash known-answer vectors, inspector readings and civil-date conversion, bookmark store round trips and staleness, delta-recovery rebuilds and refusals, save EOL/BOM transforms, windowed find + 15 roadmap R3b-2: GUID, FILETIME and text-preview inspector readings, width-parameterised hex row maths, grouped and big-endian hex formatting and click hit-testing, fit-to-window widths, settings validation for the new hex/save keys, editor hex movement and formatting at row widths 8 and 32, save-with-options transforms), host gate fully green (see below); the Windows-only GUI suite adds layout/formatting/menu/theme-preview tests plus R3b-1's scrollbar-tick bucketing and R3b-2's inspector-rows, hash-verdict and armed-save-suffix tests, and runs in CI. Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
+| Tests | 4 | 249 host unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1 + 16 roadmap R2a + 9 roadmap R2b + 37 roadmap R3a: Fenwick piece-index equivalence against a naive model over random edit scripts, 100k-piece lookups, coalescing, SWAR-vs-scalar and parallel-vs-serial line-index equivalence, SWAR search equivalence, scoped find/replace, masked search, line sort/dedup, scoped find navigation, masked find flow, the file splitter, CLI size parsing and split runs, hash known-answer vectors, inspector readings and civil-date conversion, bookmark store round trips and staleness, delta-recovery rebuilds and refusals, save EOL/BOM transforms, windowed find + 15 roadmap R3b-2: GUID, FILETIME and text-preview inspector readings, width-parameterised hex row maths, grouped and big-endian hex formatting and click hit-testing, fit-to-window widths, settings validation for the new hex/save keys, editor hex movement and formatting at row widths 8 and 32, save-with-options transforms + 7 instant-open: the indexing percent/suffix helper, staged-build prefix and completion identity against the one-shot build, small-file head-build completeness, forward-resolver agreement within and beyond the indexed prefix, staged-open exactness with a head-only frontier, staged completion attach with a monotonic frontier, and edit-during-staged-build discard ending exact — plus 2 ignored 1 GB bench tests for staged open versus the one-shot build), host gate fully green (see below); the Windows-only GUI suite adds layout/formatting/menu/theme-preview tests plus R3b-1's scrollbar-tick bucketing, R3b-2's inspector-rows, hash-verdict and armed-save-suffix tests, and the polish pass's zoom-percentage and colour-blend tests, and runs in CI. Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
 | Reliability & data safety | 4 | Undo never touches the append buffer; deletes return their removed pieces; `--clean` is guarded to the adjacent `data/` folder and tested. The atomic save safety path (SPEC §5.1) is implemented and covered by host tests for the success, replace, empty, staging-failure and swap-failure cases, with the table provably unchanged after a failed save; its Windows runtime behaviour (real `ReplaceFileW` under a live mapping) is still Unverified — see Known gaps |
-| Performance (SPEC §8 budgets) | Unverified | Host proxies are now measured and recorded in `docs/BENCHMARKS.md` (200 MB diff median 330 ms, find 1073 ms, save-copy 466 ms, `--version` start proxy median 1.07 ms, all Linux host build) — evidence about the core only. Every §8 metric itself (cold start <50 ms, 100 GB open <100 ms, <15 MB idle / <35 MB active, <16 ms frame) is a Windows measurement and remains a target, not a result |
+| Performance (SPEC §8 budgets) | Unverified | Host proxies are now measured and recorded in `docs/BENCHMARKS.md` (200 MB diff median 330 ms, find 1073 ms, save-copy 466 ms, `--version` start proxy median 1.07 ms, all Linux host build; the instant-open slice adds the 1 GB staged-open proxies: one-shot index build 3,112 ms against a 4.89 ms head prefix, editor first line question 32.81 ms) — evidence about the core only. Every §8 metric itself (cold start <50 ms, 100 GB open <100 ms, <15 MB idle / <35 MB active, <16 ms frame) is a Windows measurement and remains a target, not a result |
 | Security & privacy | 4 | 100% offline, zero telemetry by construction (no network code at all); crate root is `#![deny(unsafe_code)]` with `unsafe` confined to `src/mmap_win.rs`, `src/gui_win.rs` and the Windows half of `src/save.rs`, every block carrying a `// SAFETY:` comment (PROJECT_RULES.md confinement rule); the only dependency crate is `windows-sys`, gated to `cfg(windows)` |
-| Accessibility & UI | Unverified | The UI now exists (built to the confirmed wireframes): standard menus with full keyboard access, tooltips on every toolbar/find-bar control, per-monitor DPI scaling, themes whose text/background contrast is unit-tested at WCAG AA ≥ 4.5. Runtime behaviour — rendering, focus, screen-reader surface — is Unverified until a real Windows run |
+| Accessibility & UI | Unverified | The UI now exists (built to the confirmed wireframes): standard menus with full keyboard access, tooltips on every toolbar/find-bar control, per-monitor DPI scaling, themes whose text/background contrast is unit-tested at WCAG AA ≥ 4.5. The polish pass adds a visible keyboard-focus frame on every owner-drawn button, toolbar glyph icons, a segmented Text / Hex control, and a status-bar zoom readout. Runtime behaviour — rendering, focus, screen-reader surface — is Unverified until a real Windows run |
 | Documentation | 4 | README follows the full checklist with honest status, `docs/PARITY.md` registry, `docs/SPEC.md` governing blueprint, this scorecard; screenshots are owed from a real Windows run of the UI |
 | Maintainability | 4 | No file mixes responsibilities; clippy runs with `-D warnings`; zero-dependency keeps the audit surface to one crate |
 
@@ -796,6 +796,185 @@ scored from real Windows evidence before any release.
     the previous row's start; the editor was right (the caret
     after End *is* the next row's start at that width) and the
     test was fixed, not the code.
+
+- 2026-11-01, find-bar restyle slice (owner feedback on a field
+  run: the find bar's buttons read as plain grey slabs beside the
+  toolbar's), run locally on the development host; NOT published:
+  - What the audit found first: the find-bar buttons and the
+    toolbar buttons were *already* one family — the same
+    `BS_OWNERDRAW` child buttons drawn by the same `WM_DRAWITEM`
+    pass (panel fill, editor-background fill while pressed, 1px
+    line-colour frame, centred theme-text label) — and every
+    find-bar control already had a tooltip. The visible divergence
+    was elsewhere: (1) the find bar row was 34 DIPs tall against
+    the toolbar's 30, so its controls came out 28 DIPs tall
+    against the toolbar buttons' 24 — literally bigger slabs;
+    (2) the bar's three statics (`Find:`, the match count,
+    `Replace:`) were painted with the opaque panel brush, so each
+    floated on the row as a small panel-coloured patch, and
+    static text draws at the top of its rectangle while the
+    buttons' labels are vertically centred, leaving the row
+    ragged; (3) the count wore the full text colour wedged
+    between the button groups at the standard 4-DIP gap; (4) the
+    "In selection" toggle showed its state only by swapping a
+    ☐/☑ glyph — it never took the accent border + accent text
+    the Text / Hex toggles get while on.
+  - What landed (`src/gui_win.rs` only): `FINDBAR_H` is now
+    30 DIPs, the toolbar row's height, so every find-bar control
+    is the toolbar buttons' 24 DIPs at the same +3 offset; the
+    three statics gained `SS_CENTERIMAGE` so their text is
+    vertically centred with the buttons, and `WM_CTLCOLORSTATIC`
+    now blends just the find-bar statics into the row background
+    (the status strip and change bar keep the panel treatment),
+    with the count in the muted colour; layout gives the count
+    an extra 4 DIPs on both sides (8 DIPs clear in all); the
+    close button is square at the shared height (24 DIPs wide);
+    the scope toggle's label is now "In selection", gaining a
+    "✓ " prefix while on, and the draw pass's accent state
+    covers it while `find_in_selection` holds. No find/replace
+    behaviour, settings, or version changed.
+  - `cargo fmt --all` + `cargo fmt --all --check` — clean
+    (exit 0)
+  - `cargo test` — **242 passed, 0 failed** on the host
+    (unchanged count: the slice touches Windows-only GUI code
+    and adds no host tests)
+  - `cargo clippy --all-targets -- -D warnings` (host) — clean
+    (exit 0)
+  - `cargo clippy --target x86_64-pc-windows-gnu --all-targets --
+    -D warnings` — clean (exit 0)
+  - `cargo check --target x86_64-pc-windows-msvc` — passed
+    (exit 0)
+  - `cargo build --release --target x86_64-pc-windows-gnu` —
+    passed (exit 0); `VeloEdit.exe` 916,480 bytes, SHA-256
+    `4c672b6a02d1ddedf6917dab1a508f1628f67bf91f1520dc29d7a43e335bc959`;
+    the binary was string-checked to prove it is the fresh
+    build (the "✓ In selection" label is present; both
+    ballot-box label strings are gone)
+  - Honest status: **the restyle is compile-verified only;
+    Windows runtime is Unverified** until the program runs on a
+    real Windows 11 machine and the owner judges the find bar
+    beside the toolbar there.
+
+- 2026-11-01, polish pass slice (owner-approved mockup: a
+  usability / UX / accessibility layer over R3 and the find-bar
+  restyle), run locally on the development host; NOT published:
+  - What landed (`src/gui_win.rs` only): the six toolbar buttons
+    draw small glyph icons (folder, floppy, curved arrows — a
+    nine-segment semicircle polyline, mirrored by arrowhead
+    placement — magnifier, opposed arrows) left of their labels,
+    icon and label centred as a group using the button DC's own
+    text measurement. The icons are GDI, not Direct2D: the
+    owner-draw pass is the GDI `WM_DRAWITEM` handler that draws
+    the labels, so the glyphs are one pen in the label colour
+    plus the hollow stock brush in that same pass. Every
+    owner-drawn button — toolbar, find bar, change bar, and the
+    Split / File Hashes dialog buttons, which have their own
+    draw handlers — now draws an accent frame inset 2 px inside
+    its border while it holds keyboard focus (`ODS_FOCUS`), the
+    first visible focus indicator these buttons have had; a
+    disabled button (`ODS_DISABLED`) labels in muted, though no
+    button is disabled today. The Text / Hex pair became one
+    segmented control: no gap, a single shared frame drawn as
+    edge strips with the divider drawn once (as the Text
+    segment's right edge), the active segment accent-filled
+    with a white label; the pair's combined footprint is
+    unchanged at 108 DIPs (each segment widened to 54). The
+    status bar's right cluster leads with the zoom percentage —
+    the settings default font size (14 pt) is 100%, via the new
+    pure `zoom_percent` helper, and the readout is live because
+    the font menu commands and Ctrl+mouse-wheel already route
+    through `refresh_status` — and its widths grew to fit
+    (392 / 528 DIPs) with 8 DIPs of clear space at both ends of
+    the strip. In the editor, the translucent current-line wash
+    became an opaque raised band (the background blended
+    halfway toward the panel colour, via the new pure
+    `blend_rgba` helper) spanning the text area only — not the
+    gutter — drawn before the match, selection and text in both
+    modes; gutter numbers and hex addresses off the caret row
+    moved from muted to muted blended halfway toward the text
+    colour. The theme struct gained no fields: both tones are
+    derived in the shell as two extra Direct2D brushes. The
+    built-in guide gained a short "Reading the window"
+    paragraph covering the icons, the focus outline and the
+    zoom readout.
+  - `cargo fmt --all` + `cargo fmt --all --check` — clean
+    (exit 0)
+  - `cargo test` — **242 passed, 0 failed** on the host
+    (unchanged count: the slice touches Windows-only GUI code;
+    its two new helper tests — zoom percentage, 50/50 colour
+    blend — are Windows-only and run in CI)
+  - `cargo clippy --all-targets -- -D warnings` (host) — clean
+    (exit 0)
+  - `cargo clippy --target x86_64-pc-windows-gnu --all-targets --
+    -D warnings` — clean (exit 0)
+  - `cargo check --target x86_64-pc-windows-msvc` — passed
+    (exit 0)
+  - `cargo build --release --target x86_64-pc-windows-gnu` —
+    passed (exit 0); `VeloEdit.exe` 922,624 bytes, SHA-256
+    `0c85ddb168847dd6c20461e0feb5e68b78f15a1d4cd1a436231e4dc19615904f`;
+    the binary was string-checked for the new guide text
+    ("READING THE WINDOW", "100% is the standard size") to
+    prove it is the fresh build
+  - Honest status: **every visual change in this slice is
+    compile-verified only; Windows runtime is Unverified**
+    until the program runs on a real Windows 11 machine and
+    the owner judges the polish there.
+- 2026-11-01, instant-open slice (follow-up to the owner's
+  field report: a 10 GB file took 23 seconds to open on
+  Windows 11), run locally on the development host:
+  - Diagnosis: a background index thread already existed,
+    but the first status, layout and paint calls ran
+    `ensure_index()`, which built the **whole** line index
+    synchronously on the UI thread — the background result
+    arrived later, redundant. The mapping, the encoding
+    sniff (first 64 KB only) and the recovery fingerprint
+    (already a background thread) were cleared.
+  - What changed: the editor seeds only the first 4 MB
+    (`INDEX_HEAD_BYTES`) at the first line question; a
+    resumable `LineIndexBuilder` in the core finishes the
+    scan in the shell on a background thread, publishing
+    snapshots every 32 MB through the existing epoch-tagged
+    slot, and the 200 ms tick attaches each in turn
+    (monotonic frontier). An edit bumps the document
+    generation and the in-flight build is discarded,
+    restarting from the next open/save baseline; a
+    superseded worker stops when it finds a newer epoch
+    already in the slot. While the index is partial,
+    positions stay exact (forward scan from the last
+    checkpoint), `line_count` reports the indexed prefix
+    only, the status bar appends "· Indexing NN%", the
+    text scrollbar maps proportionally to file size,
+    scrolling clamps to the indexed prefix, and a row
+    anchor memoizes the first visible line's start so a
+    view parked past the frontier never re-scans per
+    frame. Small files (≤ 4 MB) keep the old behaviour
+    exactly; hex mode is untouched.
+  - `cargo fmt --all -- --check` — clean (exit 0)
+  - `cargo test` — **249 passed, 0 failed, 2 ignored**
+    (exit 0)
+  - `cargo clippy --all-targets -- -D warnings` (host) —
+    clean (exit 0)
+  - `cargo clippy --target x86_64-pc-windows-gnu
+    --all-targets -- -D warnings` — clean (exit 0)
+  - `cargo check --target x86_64-pc-windows-msvc` —
+    passed (exit 0)
+  - `cargo build --release --target
+    x86_64-pc-windows-gnu` — passed (exit 0);
+    `VeloEdit.exe` 927,744 bytes, SHA-256
+    `06c7b690c7abc7f65a78a7b7d8c3a44fdfca1ebc87ab240d2b2fc59da33df7d2`;
+    string-checked for the new status text ("Indexing")
+    and the size/hash differ from the previous build,
+    proving it is the fresh binary
+  - Bench (host proxies, in-memory 1 GB source, release
+    test build): one-shot index build 3,112.4 ms; head
+    prefix (4 MB) 4.89 ms; staged full build in 32 MB
+    steps 2,045.9 ms; editor staged open answering its
+    first line question in 32.81 ms. Recorded in
+    `docs/BENCHMARKS.md`.
+  - Honest status: **the staged open path is verified by
+    host tests and compile checks only; Windows runtime
+    is Unverified** until the owner opens a huge file on
+    a real Windows 11 machine and times it.
 
 ## Known gaps (honest list)
 
