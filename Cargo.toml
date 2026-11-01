@@ -37,6 +37,9 @@ path = "src/main.rs"
 #   Win32_System_DataExchange     clipboard (OpenClipboard & friends)
 #   Win32_System_LibraryLoader    GetModuleHandleW for the window class
 #   Win32_System_Ole              the CF_UNICODETEXT clipboard format constant
+#   Win32_System_Registry         the opt-in Explorer context-menu item
+#                                 (roadmap item 38): RegCreateKeyExW & friends
+#                                 under HKCU only, never written unless asked
 #   Win32_UI_Controls             the tooltip control (TOOLTIPS_CLASS)
 #   Win32_UI_Controls_Dialogs     GetOpenFileNameW / ChooseColorW common dialogs
 #   Win32_UI_HiDpi                Per-Monitor V2 DPI awareness + GetDpiForWindow
@@ -60,6 +63,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Registry",
     "Win32_UI_Controls",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
