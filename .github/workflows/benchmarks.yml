@@ -1,0 +1,54 @@
+# VeloEdit — benchmark harness (roadmap item 50)
+#
+# Manual only (workflow_dispatch): benchmarks are evidence, not a
+# merge gate, so this never runs on push or pull request. It builds
+# the release executable the same way the release workflow does
+# (gate first, then the MSVC static-CRT build), runs
+# scripts/Run-Benchmarks.ps1 at 1 GB on the Windows runner, and
+# uploads the printed table as a build artifact. The 10 GB and
+# 100 GB runs are local — see docs/BENCHMARKS.md.
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_gb:
+        description: "Sparse test file size in GB (save-copy needs this much free disk)"
+        required: true
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Benchmark (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- Same gate as the release workflow: benchmarks of a
+      # broken build would be meaningless evidence.
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test gate (host target)
+        run: cargo test
+
+      # ---- Build the release binary (static CRT via .cargo/config.toml),
+      # exactly as the release workflow builds it.
+      - name: Build release (x86_64-pc-windows-msvc, crt-static)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Run the benchmark harness
+        shell: pwsh
+        run: |
+          scripts\Run-Benchmarks.ps1 -SizeGB ${{ inputs.size_gb }} -Exe "target\x86_64-pc-windows-msvc\release\VeloEdit.exe" |
+            Tee-Object benchmark-results.txt
+
+      - name: Upload the benchmark table
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ inputs.size_gb }}gb
+          path: benchmark-results.txt
