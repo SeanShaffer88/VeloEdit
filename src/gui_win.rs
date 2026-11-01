@@ -28,13 +28,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
-    GlobalFree, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    GlobalFree, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect,
-    InvalidateRect, ScreenToClient, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, HBRUSH, HDC,
-    HGDIOBJ, OPAQUE, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
+    FrameRect, GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, Rectangle,
+    ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, HBRUSH, HDC,
+    HGDIOBJ, HPEN, NULL_BRUSH, OPAQUE, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
@@ -68,13 +69,13 @@ use crate::cli::{CliOptions, Mode as CliMode};
 use crate::editor::{Editor, EditorMode};
 use crate::encoding;
 use crate::hexview;
-use crate::line_index::LineIndex;
+use crate::line_index::{LineIndex, LineIndexBuilder};
 use crate::mmap_win::MmapFile;
 use crate::piece_table::PieceTable;
 use crate::save::SaveOptions;
 use crate::search::{self, SearchOptions};
-use crate::settings::Settings;
-use crate::theme::{Theme, ACCENT_PRESETS};
+use crate::settings::{Settings, DEFAULT_FONT_SIZE};
+use crate::theme::{Rgba, Theme, ACCENT_PRESETS};
 
 // ---------------------------------------------------------------------------
 // Command ids (menus, toolbar buttons and find-bar buttons share them, so a
@@ -159,9 +160,29 @@ const RECOVERY_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const BG_FIND_THRESHOLD: u64 = 4 * 1024 * 1024;
 const BG_FIND_WINDOW: u64 = 4 * 1024 * 1024;
 
+/// The background line-index thread publishes a fresh snapshot to
+/// its slot after every step of this many newly indexed bytes, so
+/// the tick can extend the editor's indexed prefix and advance the
+/// status readout's "Indexing NN%" while the build runs.
+const INDEX_PUBLISH_STEP: u64 = 32 * 1024 * 1024;
+
+/// One staged line-index publication: how far the background build
+/// has got, plus the index snapshot at that frontier (partial until
+/// the last one, whose snapshot is complete). Delivered through
+/// `App::index_slot`, tagged with the spawn epoch — the same slot
+/// discipline as the background find's progress.
+#[derive(Clone)]
+struct IndexProgress {
+    indexed_bytes: u64,
+    snapshot: LineIndex,
+}
+
 // Layout constants (in DIPs; scaled to physical pixels for child windows).
 const TOOLBAR_H: f32 = 30.0;
-const FINDBAR_H: f32 = 34.0;
+/// The find bar row matches the toolbar row's height, so the find
+/// bar's controls come out the same size as the toolbar buttons
+/// (both rows place their controls at `row height − 6` DIPs).
+const FINDBAR_H: f32 = 30.0;
 /// Height of the external-change notice bar (roadmap item 34) when
 /// it is showing, directly under the toolbar.
 const CHANGEBAR_H: f32 = 30.0;
@@ -208,6 +229,176 @@ unsafe fn window_text(hwnd: HWND) -> String {
         }
         buf.truncate(read as usize);
         String::from_utf16_lossy(&buf)
+    }
+}
+
+/// Fill selected 1-px edge strips of `rect` with `brush`. The
+/// segmented Text / Hex pair shares one outer frame with a single
+/// divider, so its edges are drawn strip by strip instead of two
+/// `FrameRect`s (which would double the shared edge).
+fn draw_frame_edges(
+    hdc: HDC,
+    rect: &RECT,
+    brush: HBRUSH,
+    top: bool,
+    bottom: bool,
+    left: bool,
+    right: bool,
+) {
+    let strips = [
+        (
+            top,
+            RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.top + 1,
+            },
+        ),
+        (
+            bottom,
+            RECT {
+                left: rect.left,
+                top: rect.bottom - 1,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+        ),
+        (
+            left,
+            RECT {
+                left: rect.left,
+                top: rect.top,
+                right: rect.left + 1,
+                bottom: rect.bottom,
+            },
+        ),
+        (
+            right,
+            RECT {
+                left: rect.right - 1,
+                top: rect.top,
+                right: rect.right,
+                bottom: rect.bottom,
+            },
+        ),
+    ];
+    for (on, strip) in strips {
+        if on {
+            // SAFETY: GDI fill on the caller's button DC; the strip
+            // is a plain value inside the button's own rect.
+            unsafe { FillRect(hdc, &strip, brush) };
+        }
+    }
+}
+
+/// Draw one toolbar glyph (polish pass) in the `size` × `size` box
+/// at (`x`, `y`) on a button's DC, in `colour`. The buttons are
+/// owner-drawn through GDI (the `WM_DRAWITEM` pass draws their
+/// labels with `DrawTextW`), so the glyphs are GDI too: one pen in
+/// the label colour plus the hollow stock brush, keeping every
+/// shape an outline. Simple geometry only — folder (Open), floppy
+/// (Save), curved arrows (Undo / Redo, a nine-segment semicircle
+/// polyline, mirrored by arrowhead placement), magnifier (Find),
+/// and two opposed arrows (Replace).
+fn draw_toolbar_icon(hdc: HDC, id: usize, x: i32, y: i32, size: i32, colour: COLORREF) {
+    // A hairline at the reference size, thickening as the box
+    // grows so high-DPI buttons keep the same visual weight.
+    let pen_width = (size / 13).max(1);
+    // SAFETY: plain GDI object juggling on the button's own DC;
+    // the pen is created here and deleted before returning, the
+    // stock hollow brush is borrowed and never deleted, and the
+    // previously selected objects are restored.
+    unsafe {
+        let pen: HPEN = CreatePen(PS_SOLID, pen_width, colour);
+        let old_pen = SelectObject(hdc, pen as HGDIOBJ);
+        let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        // One straight segment on the same DC.
+        let seg = |x1: i32, y1: i32, x2: i32, y2: i32| {
+            MoveToEx(hdc, x1, y1, std::ptr::null_mut());
+            LineTo(hdc, x2, y2);
+        };
+        let s = size;
+        match id {
+            CMD_OPEN => {
+                // Folder: a tab stepping up on the top-left, over a
+                // body outline.
+                let top = y + s * 35 / 100;
+                seg(x + 1, top, x + 1, y + s * 22 / 100);
+                seg(x + 1, y + s * 22 / 100, x + s * 45 / 100, y + s * 22 / 100);
+                seg(x + s * 45 / 100, y + s * 22 / 100, x + s * 58 / 100, top);
+                Rectangle(hdc, x + 1, top, x + s - 1, y + s - 1);
+            }
+            CMD_SAVE => {
+                // Floppy: the outline, the shutter slot across the
+                // top, and the label window at the bottom.
+                Rectangle(hdc, x + 1, y + 1, x + s - 1, y + s - 1);
+                Rectangle(
+                    hdc,
+                    x + s * 30 / 100,
+                    y + 1,
+                    x + s * 74 / 100,
+                    y + s * 38 / 100,
+                );
+                Rectangle(
+                    hdc,
+                    x + s * 28 / 100,
+                    y + s * 60 / 100,
+                    x + s * 72 / 100,
+                    y + s - 1,
+                );
+            }
+            CMD_UNDO | CMD_REDO => {
+                // A top semicircle as a polyline (no reliance on
+                // Arc's direction convention); the arrowhead sits
+                // at the end the action points to.
+                let cx = x + s / 2;
+                let cy = y + s / 2 + s * 14 / 100;
+                let rx = s / 2 - 2;
+                let ry = s / 2 - 2;
+                let mut prev: Option<(i32, i32)> = None;
+                for i in 0..=8 {
+                    let t = std::f32::consts::PI * i as f32 / 8.0;
+                    let px = cx + (rx as f32 * t.cos()).round() as i32;
+                    let py = cy - (ry as f32 * t.sin()).round() as i32;
+                    if let Some((ox, oy)) = prev {
+                        seg(ox, oy, px, py);
+                    }
+                    prev = Some((px, py));
+                }
+                let h = (s * 28 / 100).max(2);
+                if id == CMD_UNDO {
+                    seg(cx - rx, cy, cx - rx + h, cy - h);
+                    seg(cx - rx, cy, cx - rx + h, cy + h);
+                } else {
+                    seg(cx + rx, cy, cx + rx - h, cy - h);
+                    seg(cx + rx, cy, cx + rx - h, cy + h);
+                }
+            }
+            CMD_FIND => {
+                // Magnifier: a circle with a handle running
+                // down-right from its rim.
+                let d = s * 62 / 100;
+                Ellipse(hdc, x + 1, y + 1, x + 1 + d, y + 1 + d);
+                seg(x + 1 + d * 3 / 4, y + 1 + d * 3 / 4, x + s - 1, y + s - 1);
+            }
+            CMD_REPLACE => {
+                // Two horizontal arrows pointing opposite ways.
+                let h = (s * 22 / 100).max(2);
+                let y1 = y + s * 35 / 100;
+                let y2 = y + s * 68 / 100;
+                seg(x + 1, y1, x + s - 1, y1);
+                seg(x + s - 1, y1, x + s - 1 - h, y1 - h);
+                seg(x + s - 1, y1, x + s - 1 - h, y1 + h);
+                seg(x + s - 1, y2, x + 1, y2);
+                seg(x + 1, y2, x + 1 + h, y2 - h);
+                seg(x + 1, y2, x + 1 + h, y2 + h);
+            }
+            _ => {}
+        }
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(pen as HGDIOBJ);
     }
 }
 
@@ -329,6 +520,22 @@ fn colorref(c: crate::theme::Rgba) -> COLORREF {
     (c.r as u32) | ((c.g as u32) << 8) | ((c.b as u32) << 16)
 }
 
+/// Blend two theme colours in plain sRGB space: `t` is the weight
+/// of `b` (0 = all `a`, 1 = all `b`). The polish pass derives its
+/// two chrome tones this way — the current-line band (background
+/// toward panel) and the brighter gutter numbers (muted toward
+/// text) — so no theme grows new fields for them.
+fn blend_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
+    let mix = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
+    Rgba::rgb(mix(a.r, b.r), mix(a.g, b.g), mix(a.b, b.b))
+}
+
+/// The editor zoom as a status-bar percentage: the settings'
+/// default font size is 100%, everything else scales from it.
+fn zoom_percent(font_size: u16) -> u32 {
+    (font_size as u32 * 100 + DEFAULT_FONT_SIZE as u32 / 2) / DEFAULT_FONT_SIZE as u32
+}
+
 /// The plain-words built-in guide (F1 / Help ▸ Guide). Kept short and
 /// jargon-free on purpose; the README carries the same content.
 const GUIDE_TEXT: &str = "\
@@ -420,7 +627,16 @@ the highlight colour on top of any theme. Moving through those menus\r\n\
 previews each choice in the window — click to keep it, or close the\r\n\
 menu to go back to what you had. Your choices are stored in\r\n\
 the data folder next to the program — VeloEdit is fully portable and\r\n\
-works completely offline.\r\n";
+works completely offline.\r\n\
+\r\n\
+READING THE WINDOW\r\n\
+The toolbar buttons carry small icons beside their words, and\r\n\
+the Text / Hex switch is one joined control with the side in\r\n\
+use filled in the accent colour. If you move through the\r\n\
+controls with the keyboard, the control you are on is outlined\r\n\
+inside its border in the accent colour, so you can always see\r\n\
+where you are. The status bar shows the text size as a\r\n\
+percentage beside the file facts — 100% is the standard size.\r\n";
 
 // ---------------------------------------------------------------------------
 // Hand-declared Direct2D / DirectWrite COM (see the module note). Vtable
@@ -661,7 +877,12 @@ struct Brushes {
     muted: *mut c_void,
     line: *mut c_void,
     gutter: *mut c_void,
-    current: *mut c_void,
+    /// The current-line band (polish pass): the theme background
+    /// blended halfway toward the panel colour, opaque.
+    band: *mut c_void,
+    /// Gutter numbers off the current line (polish pass): muted
+    /// blended halfway toward the text colour.
+    gutter_num: *mut c_void,
     selection: *mut c_void,
     match_bg: *mut c_void,
     accent: *mut c_void,
@@ -676,7 +897,8 @@ impl Brushes {
             &mut self.muted,
             &mut self.line,
             &mut self.gutter,
-            &mut self.current,
+            &mut self.band,
+            &mut self.gutter_num,
             &mut self.selection,
             &mut self.match_bg,
             &mut self.accent,
@@ -760,8 +982,9 @@ struct App {
     find_label: HWND,
     replace_label: HWND,
     /// The find bar's "In selection" toggle (an owner-drawn button,
-    /// drawn like the other find-bar buttons; its text carries the
-    /// ☐/☑ state glyph).
+    /// drawn like the other find-bar buttons; while on it takes the
+    /// accent state in the draw pass and a ✓ prefix in its text,
+    /// like the Text / Hex mode toggles).
     find_scope_check: HWND,
     /// Whether the find bar is scoped to a selection (roadmap 11).
     find_in_selection: bool,
@@ -870,7 +1093,13 @@ struct App {
     menu_preview: Option<MenuPreview>,
     pending_high_surrogate: Option<u16>,
     hex_nibble: Option<u8>,
-    index_slot: Arc<Mutex<Option<(u64, LineIndex)>>>,
+    index_slot: Arc<Mutex<Option<(u64, IndexProgress)>>>,
+    /// The staged line-index build's progress for the status
+    /// readout — `(indexed bytes, total bytes)` while a build is
+    /// running for the current document, `None` otherwise. The
+    /// status bar turns it into "· Indexing NN%" (and suppresses
+    /// it whenever the editor already holds a complete index).
+    indexing: Option<(u64, u64)>,
     doc_generation: u64,
     open_generation: u64,
     last_edit: Option<Instant>,
@@ -878,8 +1107,10 @@ struct App {
     last_find_text: String,
     /// A `--line` target waiting for the background line index.
     pending_goto: Option<u64>,
-    /// Incremented on every document open; index threads tag their
-    /// result with the epoch they were spawned for.
+    /// Incremented on every index-thread spawn (open, startup,
+    /// post-save baseline); index threads tag every publication
+    /// with the epoch they were spawned for, and the tick drops
+    /// publications from older epochs.
     index_epoch: u64,
 }
 
@@ -1008,7 +1239,8 @@ fn ensure_target(app: &mut App) {
         muted: make_brush(target, t.muted),
         line: make_brush(target, t.line),
         gutter: make_brush(target, t.gutter_bg),
-        current: make_brush(target, t.current_line),
+        band: make_brush(target, blend_rgba(t.bg, t.panel, 0.5)),
+        gutter_num: make_brush(target, blend_rgba(t.muted, t.text, 0.5)),
         selection: make_brush(target, t.selection),
         match_bg: make_brush(target, t.match_bg),
         accent: make_brush(target, t.accent),
@@ -1266,9 +1498,13 @@ fn layout_children(app: &mut App) {
         x += w + app.px(4.0);
     }
     if app.toolbar.len() >= 8 {
-        let mode_w = app.px(52.0);
+        // The Text / Hex pair is one segmented control (polish
+        // pass): no gap between the segments, and each segment is
+        // 54 DIPs so the pair's combined footprint (108 DIPs)
+        // matches the old two-buttons-plus-gap layout exactly.
+        let mode_w = app.px(54.0);
         let hex_x = cw - app.px(4.0) - mode_w;
-        let text_x = hex_x - app.px(4.0) - mode_w;
+        let text_x = hex_x - mode_w;
         // SAFETY: our child windows.
         unsafe {
             MoveWindow(
@@ -1335,52 +1571,57 @@ fn layout_children(app: &mut App) {
         place(app, find_edit, &mut fx, 190.0);
         // Buttons follow in find_controls order after the two edits:
         // [find_edit, prev, next, count, replace_edit, replace, replace_all, close]
-        let order: [(HWND, f32); 7] = [
-            (app.find_controls[1], 52.0),
-            (app.find_controls[2], 52.0),
-            (find_count, 96.0),
-            (replace_label, 50.0),
-            (replace_edit, 190.0),
-            (app.find_controls[5], 68.0),
-            (app.find_controls[6], 82.0),
-        ];
-        for (hwnd, w) in order {
-            place(app, hwnd, &mut fx, w);
-        }
+        // The match count is quiet text between the two button
+        // groups, not another box: it gets an extra 4 DIPs of clear
+        // space on both sides (8 in all with the standard gap).
+        place(app, app.find_controls[1], &mut fx, 52.0);
+        place(app, app.find_controls[2], &mut fx, 52.0);
+        fx += app.px(4.0);
+        place(app, find_count, &mut fx, 96.0);
+        fx += app.px(4.0);
+        place(app, replace_label, &mut fx, 50.0);
+        place(app, replace_edit, &mut fx, 190.0);
+        place(app, app.find_controls[5], &mut fx, 68.0);
+        place(app, app.find_controls[6], &mut fx, 82.0);
         // The scope toggle follows the action buttons; the close
         // button stays last (find_controls[8] is the toggle, appended
-        // after the original eight controls).
+        // after the original eight controls) and is square at the
+        // shared control height.
         if app.find_controls.len() > 8 {
             let scope_btn = app.find_controls[8];
             place(app, scope_btn, &mut fx, 124.0);
         }
         let close_btn = app.find_controls[7];
-        place(app, close_btn, &mut fx, 30.0);
+        place(app, close_btn, &mut fx, 24.0);
     }
     // Status strip along the bottom: position text on the left, the
-    // document facts (encoding · line endings · size) on the right.
-    // An armed save conversion (roadmap items 31/32) widens the
-    // right control so the "· → CRLF · +BOM" suffix is not clipped.
+    // document facts (zoom · encoding · line endings · size) on the
+    // right. An armed save conversion (roadmap items 31/32) widens
+    // the right control so the "· → CRLF · +BOM" suffix is not
+    // clipped; both widths grew by the zoom segment's room in the
+    // polish pass. The strip also keeps 8 DIPs of clear space at
+    // both ends of the window now (polish pass padding).
     let status_h = app.px(STATUS_H);
     let armed = !save_armed_suffix(
         app.settings.save_eol_choice(),
         app.settings.save_bom_choice(),
     )
     .is_empty();
-    let right_w = app.px(if armed { 480.0 } else { 340.0 }).min(cw);
+    let right_w = app.px(if armed { 528.0 } else { 392.0 }).min(cw);
+    let pad = app.px(8.0);
     // SAFETY: our child windows.
     unsafe {
         MoveWindow(
             app.status,
-            0,
+            pad,
             ch - status_h,
-            (cw - right_w).max(0),
+            (cw - right_w - 2 * pad).max(0),
             status_h,
             1,
         );
         MoveWindow(
             app.status_right,
-            cw - right_w,
+            cw - right_w - pad,
             ch - status_h,
             right_w,
             status_h,
@@ -1476,12 +1717,28 @@ fn refresh_status(app: &mut App) {
         // column is counting from this base.
         left.push_str(&format!(" \u{00B7} Offsets from base 0x{:X}", app.rel_base));
     }
+    if let Some((indexed, total)) = app.indexing {
+        // The staged line index is still building: report its
+        // percentage. The status bar never presents the partial
+        // index's prefix line count as a document total, so this
+        // progress note is the honest readout while it runs; it
+        // disappears the moment the complete index lands.
+        if !app.editor.has_complete_index() {
+            if let Some(suffix) = crate::line_index::indexing_status_suffix(indexed, total) {
+                left.push_str(&suffix);
+            }
+        }
+    }
     let wide = wstr(&left);
     // SAFETY: our status control plus a NUL-terminated string.
     unsafe { SetWindowTextW(app.status, wide.as_ptr()) };
-    // Right: the document facts.
+    // Right: the zoom readout (polish pass — 100% is the default
+    // font size; this refresh runs on every font change, menu or
+    // Ctrl+wheel alike, so the percentage is always live), then
+    // the document facts.
     let mut right = format!(
-        "{} \u{00B7} {} \u{00B7} {}",
+        "{}% \u{00B7} {} \u{00B7} {} \u{00B7} {}",
+        zoom_percent(app.settings.font_size),
         encoding_display(st.encoding),
         app.eol,
         human_size(st.size)
@@ -1502,9 +1759,27 @@ fn refresh_status(app: &mut App) {
 
 /// (total rows, first visible row, visible rows) for the current mode
 /// — the numbers the custom scrollbar's geometry helpers work in.
+/// While the staged line index is partial, text mode reports *byte*
+/// units instead of lines: line numbers do not yet span the
+/// document, but byte positions always do, so the thumb shows the
+/// view's true position and extent within the file and settles into
+/// line units when the complete index lands.
 fn scroll_metrics(app: &mut App) -> (u64, u64, u64) {
     let (total, first) = match app.editor.mode() {
-        EditorMode::Text => (app.editor.line_count(), app.editor.first_line()),
+        EditorMode::Text => {
+            if app.editor.index_is_partial() {
+                let total = app.editor.total_len();
+                let first_line = app.editor.first_line();
+                let first = app.editor.line_start_byte(first_line).unwrap_or(0);
+                let page_lines = page_rows(app);
+                let end = app
+                    .editor
+                    .line_start_byte(first_line + page_lines)
+                    .unwrap_or(total);
+                return (total, first, end.saturating_sub(first).max(1));
+            }
+            (app.editor.line_count(), app.editor.first_line())
+        }
         EditorMode::Hex => (
             hexview::row_count_w(
                 app.editor.total_len(),
@@ -1800,14 +2075,23 @@ fn render(app: &mut App) {
         RowData::Text(text_rows) => {
             for (i, row) in text_rows.iter().enumerate() {
                 let y = top + i as f32 * app.line_h;
-                let row_rect = D2dRectF {
-                    left: 0.0,
-                    top: y,
-                    right: layout.editor_right,
-                    bottom: y + app.line_h,
-                };
+                // Current-line band (polish pass): a raised strip
+                // behind the caret's row — background blended
+                // halfway toward the panel colour — spanning the
+                // text area only, not the gutter. It goes first, so
+                // match, selection, and text all draw over it.
                 if row.line_no == caret_line {
-                    fill_rect(fill, target, row_rect, brushes.current);
+                    fill_rect(
+                        fill,
+                        target,
+                        D2dRectF {
+                            left: layout.gutter_w,
+                            top: y,
+                            right: layout.editor_right,
+                            bottom: y + app.line_h,
+                        },
+                        brushes.band,
+                    );
                 }
                 // Find-match highlights: every match overlapping this
                 // row gets the match wash; the current match also gets
@@ -1869,7 +2153,10 @@ fn render(app: &mut App) {
                 let num_brush = if row.line_no == caret_line {
                     brushes.accent
                 } else {
-                    brushes.muted
+                    // Polish pass: off-current numbers sit one
+                    // step brighter than muted (a 50/50 blend
+                    // toward the text colour) for legibility.
+                    brushes.gutter_num
                 };
                 draw_text(
                     draw,
@@ -1949,16 +2236,19 @@ fn render(app: &mut App) {
             for (i, row) in hex_rows.iter().enumerate() {
                 let y = top + i as f32 * app.line_h;
                 if caret >= row.address && caret < row.address + row.len {
+                    // The same current-line band as text mode
+                    // (polish pass), text area only, drawn before
+                    // the selection cells and the row's text.
                     fill_rect(
                         fill,
                         target,
                         D2dRectF {
-                            left: 0.0,
+                            left: layout.gutter_w,
                             top: y,
                             right: layout.editor_right,
                             bottom: y + app.line_h,
                         },
-                        brushes.current,
+                        brushes.band,
                     );
                 }
                 // Selection: one background cell per selected byte.
@@ -2032,11 +2322,13 @@ fn render(app: &mut App) {
                     format!("{:016X}", row.address)
                 };
                 // The caret row's address takes the accent colour,
-                // mirroring the current line number in text mode.
+                // mirroring the current line number in text mode;
+                // other rows take the same brightened gutter tone
+                // as text-mode line numbers (polish pass).
                 let address_brush = if caret >= row.address && caret < row.address + row.len {
                     brushes.accent
                 } else {
-                    brushes.muted
+                    brushes.gutter_num
                 };
                 draw_text(
                     draw,
@@ -2542,29 +2834,70 @@ fn message_box(hwnd: HWND, text: &str, caption: &str, style: u32) -> i32 {
 // Document lifecycle
 // ---------------------------------------------------------------------------
 
-/// Build the line index for a freshly opened mapping on a background
-/// thread (SPEC.md section 3.1: the secondary indexing thread). The
-/// result lands in the shared slot; the UI thread picks it up on its
-/// tick and the editor only accepts it if the document is untouched.
-fn spawn_index_thread(app: &App, mmap: Arc<MmapFile>) {
-    let slot = app.index_slot.clone();
+/// Build the line index for a freshly opened mapping on a
+/// background thread (SPEC.md section 3.1: the secondary indexing
+/// thread), in stages: after every [`INDEX_PUBLISH_STEP`] of newly
+/// indexed bytes the worker publishes a snapshot of the build so
+/// far to the shared slot, and the UI thread's tick attaches each
+/// one in turn — the editor's indexed prefix (and the status
+/// readout's "Indexing NN%") grows while the scan runs, and the
+/// final snapshot is the complete index. Each spawn bumps the
+/// epoch, so a superseded thread's publications are dropped by the
+/// tick — and a worker that finds a newer epoch already in the
+/// slot stops quietly rather than overwriting it; an edit bumps
+/// the document generation, which makes the tick discard the
+/// build outright (the editor keeps answering exactly from its
+/// stale index's valid prefix meanwhile).
+fn spawn_index_thread(app: &mut App, mmap: Arc<MmapFile>) {
+    app.index_epoch += 1;
     let epoch = app.index_epoch;
+    let slot = app.index_slot.clone();
     if let Ok(mut guard) = slot.lock() {
         *guard = None;
     }
+    app.indexing = Some((0, mmap.len()));
     std::thread::spawn(move || {
-        let index = LineIndex::build(mmap.len(), |offset, out| {
-            let bytes = mmap.as_slice();
-            let start = offset as usize;
-            if start >= bytes.len() {
-                return 0;
+        let total = mmap.len();
+        let mut builder = LineIndexBuilder::new(total);
+        loop {
+            let complete = builder.advance(
+                builder.indexed_bytes() + INDEX_PUBLISH_STEP,
+                |offset, out| {
+                    let bytes = mmap.as_slice();
+                    let start = offset as usize;
+                    if start >= bytes.len() {
+                        return 0;
+                    }
+                    let n = out.len().min(bytes.len() - start);
+                    out[..n].copy_from_slice(&bytes[start..start + n]);
+                    n
+                },
+            );
+            let mut superseded = false;
+            if let Ok(mut guard) = slot.lock() {
+                // A newer spawn (another open, or a save-baseline
+                // restart) may have published first: its epoch in
+                // the slot means this worker is superseded. Stop
+                // quietly instead of overwriting the newer build's
+                // publication — the tick would drop ours anyway,
+                // and clobbering the slot could lose the newer
+                // build's final snapshot.
+                if let Some((held_epoch, _)) = guard.as_ref() {
+                    superseded = *held_epoch != epoch;
+                }
+                if !superseded {
+                    *guard = Some((
+                        epoch,
+                        IndexProgress {
+                            indexed_bytes: builder.indexed_bytes(),
+                            snapshot: builder.snapshot(),
+                        },
+                    ));
+                }
             }
-            let n = out.len().min(bytes.len() - start);
-            out[..n].copy_from_slice(&bytes[start..start + n]);
-            n
-        });
-        if let Ok(mut guard) = slot.lock() {
-            *guard = Some((epoch, index));
+            if complete || superseded {
+                break;
+            }
         }
     });
 }
@@ -2673,6 +3006,15 @@ fn after_save_tracking(app: &mut App, adopted_new_path: bool) {
     };
     app.file_stamp = crate::bookmarks::stamp_path(&path).ok();
     app.doc_mmap = MmapFile::open(&path).ok().map(Arc::new);
+    // The saved file is the document's new baseline, exactly like a
+    // fresh open: the editor dropped any stale index at the save
+    // boundary, so re-align the generations and let the staged
+    // background build re-index the saved bytes (its publications
+    // attach under the same rules as at open).
+    app.open_generation = app.doc_generation;
+    if let Some(mmap) = app.doc_mmap.clone() {
+        spawn_index_thread(app, mmap);
+    }
     if adopted_new_path {
         app.doc_stamp = app.file_stamp;
         load_session_bookmarks(app);
@@ -2996,6 +3338,11 @@ fn open_document(app: &mut App, path: &Path) {
         Some(path.to_path_buf()),
         app.read_only_flag,
     );
+    // Staged open: index the head region synchronously so the
+    // first paint and the status readout below never wait for a
+    // full scan; the background thread spawned further down
+    // completes the index in stages.
+    app.editor.seed_line_index();
     // Roadmap item 6: the owner's configured undo limits apply to
     // every freshly opened document.
     app.editor.set_undo_limits(
@@ -3312,6 +3659,16 @@ unsafe extern "system" fn split_dialog_proc(
             unsafe {
                 FillRect(dis.hDC, &rect, app.panel_brush);
                 FrameRect(dis.hDC, &rect, app.line_brush);
+                if dis.itemState & 0x10 != 0 {
+                    // ODS_FOCUS: the same accent inset focus frame
+                    // the main window's buttons draw (polish pass).
+                    let mut inner = rect;
+                    inner.left += 2;
+                    inner.top += 2;
+                    inner.right -= 2;
+                    inner.bottom -= 2;
+                    FrameRect(dis.hDC, &inner, app.accent_brush);
+                }
                 SetBkMode(dis.hDC, TRANSPARENT as i32);
                 SetTextColor(dis.hDC, colorref(app.theme.text));
                 let text = window_text(dis.hwndItem);
@@ -3701,6 +4058,16 @@ unsafe extern "system" fn hash_dialog_proc(
             unsafe {
                 FillRect(dis.hDC, &rect, app.panel_brush);
                 FrameRect(dis.hDC, &rect, app.line_brush);
+                if dis.itemState & 0x10 != 0 {
+                    // ODS_FOCUS: the same accent inset focus frame
+                    // the main window's buttons draw (polish pass).
+                    let mut inner = rect;
+                    inner.left += 2;
+                    inner.top += 2;
+                    inner.right -= 2;
+                    inner.bottom -= 2;
+                    FrameRect(dis.hDC, &inner, app.accent_brush);
+                }
                 SetBkMode(dis.hDC, TRANSPARENT as i32);
                 SetTextColor(dis.hDC, colorref(app.theme.text));
                 let text = window_text(dis.hwndItem);
@@ -4205,7 +4572,8 @@ fn apply_theme_visual(app: &mut App, theme_name: &str, accent: Option<&str>) {
             muted: make_brush(target, t.muted),
             line: make_brush(target, t.line),
             gutter: make_brush(target, t.gutter_bg),
-            current: make_brush(target, t.current_line),
+            band: make_brush(target, blend_rgba(t.bg, t.panel, 0.5)),
+            gutter_num: make_brush(target, blend_rgba(t.muted, t.text, 0.5)),
             selection: make_brush(target, t.selection),
             match_bg: make_brush(target, t.match_bg),
             accent: make_brush(target, t.accent),
@@ -4759,12 +5127,16 @@ fn create_children(app: &mut App) {
     // in find_controls is fixed — layout_children indexes into it.
     let edit_style = WS_CHILD | 0x80; // ES_AUTOHSCROLL
     let button_style = WS_CHILD | 0xB; // BS_OWNERDRAW
-    app.find_label = create_child(app, "Static", "Find:", WS_CHILD, 0, 0);
-    app.replace_label = create_child(app, "Static", "Replace:", WS_CHILD, 0, 0);
+                                       // SS_CENTERIMAGE (0x200) centres the statics' text vertically,
+                                       // so the labels and the match count sit on the same line as the
+                                       // buttons' centred labels instead of hugging the top of the bar.
+    let label_style = WS_CHILD | 0x200;
+    app.find_label = create_child(app, "Static", "Find:", label_style, 0, 0);
+    app.replace_label = create_child(app, "Static", "Replace:", label_style, 0, 0);
     app.find_edit = create_child(app, "Edit", "", edit_style, 0, ID_FIND_EDIT);
     let prev = create_child(app, "Button", "Prev", button_style, 0, CMD_FIND_PREV);
     let next = create_child(app, "Button", "Next", button_style, 0, CMD_FIND_NEXT);
-    app.find_count = create_child(app, "Static", "", WS_CHILD, 0, ID_FIND_COUNT);
+    app.find_count = create_child(app, "Static", "", label_style, 0, ID_FIND_COUNT);
     app.replace_edit = create_child(app, "Edit", "", edit_style, 0, ID_REPLACE_EDIT);
     let replace = create_child(app, "Button", "Replace", button_style, 0, CMD_DO_REPLACE);
     let replace_all = create_child(
@@ -4805,12 +5177,13 @@ fn create_children(app: &mut App) {
     add_tooltip(tooltip, app.hwnd, close, "Close the find bar (Esc)");
     // The "In selection" scope toggle (roadmap item 11): an
     // owner-drawn button like the others, so it draws in the same
-    // themed style; its state lives in `app.find_in_selection` and
-    // its text carries the ☐/☑ glyph the draw pass renders.
+    // themed style; its state lives in `app.find_in_selection` —
+    // while on, the draw pass gives it the accent state (like the
+    // Text / Hex toggles) and its text gains a ✓ prefix.
     app.find_scope_check = create_child(
         app,
         "Button",
-        "\u{2610} In selection",
+        "In selection",
         button_style,
         0,
         CMD_FIND_SCOPE,
@@ -5522,7 +5895,8 @@ fn on_command(app: &mut App, id: usize) {
         CMD_FIND_CLOSE => hide_find_bar(app),
         CMD_FIND_SCOPE => {
             // The "In selection" toggle: update the state, the
-            // button's state glyph, and re-run the find so the count
+            // button's ✓ prefix (the draw pass adds the accent
+            // state while on), and re-run the find so the count
             // immediately reflects the new scope (or the whole
             // document, when toggled off).
             app.find_in_selection = !app.find_in_selection;
@@ -5531,9 +5905,9 @@ fn on_command(app: &mut App, id: usize) {
                 app.last_scope_range = None;
             }
             let label = if app.find_in_selection {
-                "\u{2611} In selection"
+                "\u{2713} In selection"
             } else {
-                "\u{2610} In selection"
+                "In selection"
             };
             let wide = wstr(label);
             // SAFETY: our find-bar button; the string outlives the call.
@@ -5996,10 +6370,18 @@ fn scrollbar_hit(app: &mut App, x_px: i32, y_px: i32) -> Option<ScrollHit> {
     let track_h = layout.editor_bottom - layout.editor_top;
     let (thumb_y, thumb_h) = scrollbar_geometry(track_h, total, visible, first)?;
     let rel = y - layout.editor_top;
+    // A page step is expressed in the editor's scroll unit (text
+    // lines / hex rows) even while the geometry above runs in bytes
+    // (partial index): in line units `visible` already is a page of
+    // lines, so only text mode needs the translation.
+    let page_step = match app.editor.mode() {
+        EditorMode::Text => page_rows(app) as i64,
+        EditorMode::Hex => visible as i64,
+    };
     if rel < thumb_y {
-        Some(ScrollHit::Page(-(visible as i64)))
+        Some(ScrollHit::Page(-page_step))
     } else if rel > thumb_y + thumb_h {
-        Some(ScrollHit::Page(visible as i64))
+        Some(ScrollHit::Page(page_step))
     } else {
         Some(ScrollHit::Thumb(rel - thumb_y))
     }
@@ -6042,7 +6424,22 @@ fn on_scrollbar_move(app: &mut App, lparam: LPARAM) -> bool {
     let thumb_y = app.dip(y_px) - layout.editor_top - grab;
     let first = scrollbar_first_row(track_h, total, visible, thumb_y);
     match app.editor.mode() {
-        EditorMode::Text => app.editor.set_first_line(first),
+        EditorMode::Text => {
+            if app.editor.index_is_partial() {
+                // Byte units while the staged index builds: the
+                // drag position is a byte offset; land on the line
+                // containing it (exact, from the checkpoints plus
+                // a forward count). `set_first_line` still clamps
+                // to the indexed prefix, so a drag past the
+                // frontier rests at the frontier until the build
+                // sweeps past — the thumb keeps showing the true
+                // file proportion throughout.
+                let line = app.editor.line_col_of(first).0;
+                app.editor.set_first_line(line);
+            } else {
+                app.editor.set_first_line(first);
+            }
+        }
         EditorMode::Hex => app.editor.set_first_row(first),
     }
     invalidate(app);
@@ -6301,21 +6698,41 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 TIMER_TICK => {
-                    // Pick up the background line index (only when the
-                    // document is untouched since it was opened).
-                    if app.doc_generation == app.open_generation {
-                        let ready = match app.index_slot.try_lock() {
-                            Ok(mut guard) => guard.take(),
-                            Err(_) => None,
-                        };
-                        if let Some((epoch, index)) = ready {
-                            if epoch == app.index_epoch {
-                                app.editor.attach_line_index(index);
+                    // Pick up the staged line index's latest
+                    // publication: each snapshot extends the editor's
+                    // indexed prefix, and the last one completes it.
+                    // Publications from a superseded spawn (an older
+                    // epoch) are dropped. When the document has been
+                    // edited since the build's baseline, the build is
+                    // discarded outright — the safe rule for an edit
+                    // landing mid-build; the editor keeps answering
+                    // exactly from its stale index's valid prefix,
+                    // and the next baseline (open / save) restarts
+                    // the build.
+                    let publication = match app.index_slot.try_lock() {
+                        Ok(mut guard) => guard.take(),
+                        Err(_) => None,
+                    };
+                    if let Some((epoch, progress)) = publication {
+                        if epoch == app.index_epoch {
+                            if app.doc_generation == app.open_generation {
+                                let complete = progress.snapshot.is_complete();
+                                let total = progress.snapshot.total_length();
+                                app.editor.attach_line_index(progress.snapshot);
+                                app.indexing = if complete {
+                                    None
+                                } else {
+                                    Some((progress.indexed_bytes, total))
+                                };
+                                refresh_status(app);
                                 invalidate(app);
+                            } else if app.indexing.is_some() {
+                                app.indexing = None;
+                                refresh_status(app);
                             }
                         }
                     }
-                    if app.pending_goto.is_some() && app.editor.has_current_index() {
+                    if app.pending_goto.is_some() && app.editor.has_complete_index() {
                         let line = app.pending_goto.take().expect("checked above");
                         app.editor.goto_line(line);
                         after_caret_move(app);
@@ -6465,14 +6882,41 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_CTLCOLORSTATIC => {
             let hdc = wparam as HDC;
+            // The find bar's statics are quiet text on the bar's own
+            // background, not panel-coloured patches: they blend
+            // with the row like the find edits do, and the match
+            // count is muted. The status strip and the change bar's
+            // label keep the panel treatment.
+            let control = lparam as HWND;
+            let is_find_count = control == app.find_count;
+            let on_find_bar =
+                is_find_count || control == app.find_label || control == app.replace_label;
             // SAFETY: colouring our status / find-bar labels from the
-            // active theme; returns the panel brush.
+            // active theme; returns the background brush.
             unsafe {
-                SetTextColor(hdc, colorref(app.theme.text));
-                SetBkColor(hdc, colorref(app.theme.panel));
+                SetTextColor(
+                    hdc,
+                    colorref(if is_find_count {
+                        app.theme.muted
+                    } else {
+                        app.theme.text
+                    }),
+                );
+                SetBkColor(
+                    hdc,
+                    colorref(if on_find_bar {
+                        app.theme.bg
+                    } else {
+                        app.theme.panel
+                    }),
+                );
                 SetBkMode(hdc, OPAQUE as i32);
             }
-            app.panel_brush as LRESULT
+            if on_find_bar {
+                app.edit_brush as LRESULT
+            } else {
+                app.panel_brush as LRESULT
+            }
         }
         WM_CTLCOLOREDIT => {
             let hdc = wparam as HDC;
@@ -6489,50 +6933,136 @@ unsafe extern "system" fn wnd_proc(
             // SAFETY: lparam is a DRAWITEMSTRUCT for one of our
             // owner-drawn buttons.
             let dis = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
-            let pressed = dis.itemState & 0x1 != 0; // ODS_SELECTED
-                                                    // The mode toggle for the *active* mode is picked out in
-                                                    // the accent colour (text and border), as in the mockup.
-            let active_mode = (dis.CtlID as usize == CMD_MODE_TEXT
-                && app.editor.mode() == EditorMode::Text)
-                || (dis.CtlID as usize == CMD_MODE_HEX && app.editor.mode() == EditorMode::Hex);
-            let brush = if pressed {
+            let id = dis.CtlID as usize;
+            // ODS_SELECTED (0x1), ODS_DISABLED (0x4), ODS_FOCUS (0x10).
+            let pressed = dis.itemState & 0x1 != 0;
+            let disabled = dis.itemState & 0x4 != 0;
+            let focused = dis.itemState & 0x10 != 0;
+            // The Text / Hex pair is one segmented control (polish
+            // pass): the segment for the current mode is filled
+            // with the accent colour and labelled in white. Every
+            // other "on" toggle — the find bar's "In selection" —
+            // keeps the accent text and border treatment the mode
+            // pair used before, as in the mockup.
+            let seg_active = (id == CMD_MODE_TEXT && app.editor.mode() == EditorMode::Text)
+                || (id == CMD_MODE_HEX && app.editor.mode() == EditorMode::Hex);
+            let active = seg_active || (id == CMD_FIND_SCOPE && app.find_in_selection);
+            let brush = if seg_active {
+                app.accent_brush
+            } else if pressed {
                 app.edit_brush
             } else {
                 app.panel_brush
+            };
+            let label_colour = if disabled {
+                app.theme.muted
+            } else if seg_active {
+                Rgba::rgb(0xFF, 0xFF, 0xFF)
+            } else if active {
+                app.theme.accent
+            } else {
+                app.theme.text
             };
             let mut rect = dis.rcItem;
             // SAFETY: GDI drawing on the button's own DC.
             unsafe {
                 FillRect(dis.hDC, &rect, brush);
-                FrameRect(
-                    dis.hDC,
-                    &rect,
-                    if active_mode {
-                        app.accent_brush
+                if id == CMD_MODE_TEXT || id == CMD_MODE_HEX {
+                    // One shared frame for the pair: top and bottom
+                    // edges on both segments, the outer side edge
+                    // on each, and the single divider drawn as the
+                    // Text segment's right edge (the Hex segment's
+                    // left edge stays undrawn, so the divider is
+                    // one line, not two).
+                    let (left, right) = if id == CMD_MODE_TEXT {
+                        (true, true)
                     } else {
-                        app.line_brush
-                    },
-                );
+                        (false, true)
+                    };
+                    draw_frame_edges(dis.hDC, &rect, app.line_brush, true, true, left, right);
+                } else {
+                    FrameRect(
+                        dis.hDC,
+                        &rect,
+                        if active {
+                            app.accent_brush
+                        } else {
+                            app.line_brush
+                        },
+                    );
+                }
+                if focused {
+                    // Keyboard focus (polish pass, accessibility):
+                    // an accent frame inset by 2 px inside the
+                    // normal border, so tabbing through the chrome
+                    // is visible — owner-drawn buttons otherwise
+                    // show no focus at all.
+                    let mut inner = rect;
+                    inner.left += 2;
+                    inner.top += 2;
+                    inner.right -= 2;
+                    inner.bottom -= 2;
+                    FrameRect(dis.hDC, &inner, app.accent_brush);
+                }
                 SetBkMode(dis.hDC, TRANSPARENT as i32);
-                SetTextColor(
-                    dis.hDC,
-                    colorref(if active_mode {
-                        app.theme.accent
-                    } else {
-                        app.theme.text
-                    }),
-                );
+                SetTextColor(dis.hDC, colorref(label_colour));
                 let text = window_text(dis.hwndItem);
                 let mut wide: Vec<u16> = text.encode_utf16().collect();
                 if !wide.is_empty() {
-                    // DT_CENTER (0x1) | DT_VCENTER (0x4) | DT_SINGLELINE (0x20)
-                    DrawTextW(
-                        dis.hDC,
-                        wide.as_mut_ptr(),
-                        wide.len() as i32,
-                        &mut rect,
-                        0x1 | 0x4 | 0x20,
+                    let has_icon = matches!(
+                        id,
+                        CMD_OPEN | CMD_SAVE | CMD_UNDO | CMD_REDO | CMD_FIND | CMD_REPLACE
                     );
+                    if has_icon {
+                        // Toolbar polish: the glyph sits left of
+                        // the label, the pair centred as a group.
+                        // The label is measured with the DC's own
+                        // font (the button's), so the centring is
+                        // exact at any DPI.
+                        let mut extent = SIZE { cx: 0, cy: 0 };
+                        GetTextExtentPoint32W(
+                            dis.hDC,
+                            wide.as_ptr(),
+                            wide.len() as i32,
+                            &mut extent,
+                        );
+                        let icon_px = app.px(13.0);
+                        let gap = app.px(4.0);
+                        let group_w = icon_px + gap + extent.cx;
+                        let icon_x = rect.left + (rect.right - rect.left - group_w) / 2;
+                        let icon_y = rect.top + (rect.bottom - rect.top - icon_px) / 2;
+                        draw_toolbar_icon(
+                            dis.hDC,
+                            id,
+                            icon_x,
+                            icon_y,
+                            icon_px,
+                            colorref(label_colour),
+                        );
+                        let mut text_rect = RECT {
+                            left: icon_x + icon_px + gap,
+                            top: rect.top,
+                            right: rect.right,
+                            bottom: rect.bottom,
+                        };
+                        // DT_LEFT (0x0) | DT_VCENTER (0x4) | DT_SINGLELINE (0x20)
+                        DrawTextW(
+                            dis.hDC,
+                            wide.as_mut_ptr(),
+                            wide.len() as i32,
+                            &mut text_rect,
+                            0x4 | 0x20,
+                        );
+                    } else {
+                        // DT_CENTER (0x1) | DT_VCENTER (0x4) | DT_SINGLELINE (0x20)
+                        DrawTextW(
+                            dis.hDC,
+                            wide.as_mut_ptr(),
+                            wide.len() as i32,
+                            &mut rect,
+                            0x1 | 0x4 | 0x20,
+                        );
+                    }
                 }
             }
             1
@@ -6717,6 +7247,10 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         settings.undo_limit,
         settings.undo_byte_budget_mb * 1024 * 1024,
     );
+    // Staged open, as in open_document: only the head region is
+    // indexed before the window exists; the background thread
+    // spawned below completes the index in stages.
+    editor.seed_line_index();
     if options.file.is_none() {
         // Recovery snapshot (or a blank page): sample what was loaded.
         let sample = editor.table().read(0, editor.total_len().min(64 * 1024));
@@ -6809,6 +7343,7 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         pending_high_surrogate: None,
         hex_nibble: None,
         index_slot: Arc::new(Mutex::new(None)),
+        indexing: None,
         doc_generation: 0,
         open_generation: 0,
         last_edit: None,
@@ -6830,7 +7365,7 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         app.doc_fingerprint = Some(fingerprint);
     }
     if let Some(mmap) = index_source {
-        spawn_index_thread(&app, mmap);
+        spawn_index_thread(&mut app, mmap);
     }
 
     // SAFETY: the instance handle identifies this process's module.
@@ -7229,6 +7764,29 @@ mod tests {
         // Huge offsets stay exact through the u128 maths.
         let big = u64::MAX / 2;
         assert_eq!(tick_rows(&[big], u64::MAX, 1000), vec![499]);
+    }
+
+    /// The status bar's zoom readout: the settings default is
+    /// 100%, and the percentage scales with the font size.
+    #[test]
+    fn zoom_percent_centres_on_the_default_size() {
+        assert_eq!(zoom_percent(DEFAULT_FONT_SIZE), 100);
+        assert_eq!(zoom_percent(DEFAULT_FONT_SIZE * 2), 200);
+        assert_eq!(zoom_percent(DEFAULT_FONT_SIZE / 2), 50);
+        // One step up from the default (the menu/Ctrl+wheel step
+        // is 2 points) rounds to the nearest whole percent.
+        assert_eq!(zoom_percent(DEFAULT_FONT_SIZE + 2), 114);
+    }
+
+    /// The polish pass's two derived tones are exact 50/50 blends.
+    #[test]
+    fn blend_rgba_halves_each_channel() {
+        let bg = Rgba::rgb(0x10, 0x20, 0x30);
+        let panel = Rgba::rgb(0x20, 0x40, 0x60);
+        assert_eq!(blend_rgba(bg, panel, 0.5), Rgba::rgb(0x18, 0x30, 0x48));
+        // The endpoints are the inputs themselves.
+        assert_eq!(blend_rgba(bg, panel, 0.0), bg);
+        assert_eq!(blend_rgba(bg, panel, 1.0), panel);
     }
 
     /// The status bar's size format: exact bytes, one decimal above.
