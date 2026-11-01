@@ -634,6 +634,33 @@ impl Editor {
         }
     }
 
+    /// A snapshot of the line index this editor currently holds, for
+    /// a background builder that wants to RESUME a build (Ghost Tail:
+    /// after growth adoption, the held index describes the grown
+    /// document's prefix and `LineIndexBuilder::resume_from` can
+    /// continue from its frontier). `None` when no untampered index
+    /// is held — the caller then builds from scratch.
+    pub fn line_index_snapshot(&self) -> Option<crate::line_index::LineIndex> {
+        if self.index_dirty_from.is_some() {
+            return None;
+        }
+        self.index.clone()
+    }
+
+    /// Build the structural-filter view of the document (roadmap
+    /// item 18): the ordered lines in which a match of `query`
+    /// starts, over the current line index. On a still-partial index
+    /// the view covers only the indexed prefix and says so
+    /// (`FilterView::is_complete` is false).
+    pub fn filter_view(
+        &mut self,
+        query: crate::filter::FilterQuery<'_>,
+    ) -> Option<crate::filter::FilterView> {
+        self.ensure_index();
+        let index = self.index.as_ref()?;
+        Some(crate::filter::build_filter(&self.table, index, query))
+    }
+
     /// Force a full re-index now, discarding the lazy stale state.
     /// Editing never needs this (the lazy paths stay exact); it exists
     /// for callers that want the index itself refreshed in one go.
@@ -686,10 +713,56 @@ impl Editor {
         {
             return Err(GrowthError::EditedDocument);
         }
-        let growth = self
-            .table
-            .extend_original(new_len, tail)
-            .map_err(GrowthError::Backing)?;
+        self.grow_with(new_len, |table| table.extend_original(new_len, tail))
+    }
+
+    /// Ghost Tail adoption with a re-mapped backing (roadmap item
+    /// 22, window path): the same guards as [`Editor::note_file_growth`],
+    /// but the grown original is adopted from `backing` — the shell
+    /// re-opens the grown file, maps it fresh, and hands the new
+    /// mapping in, because a memory map cannot grow in place. The
+    /// caller must pass a backing whose length is exactly `new_len`
+    /// (the piece table refuses anything else).
+    pub fn adopt_grown_backing(
+        &mut self,
+        new_len: u64,
+        backing: crate::piece_table::OriginalBuffer,
+    ) -> Result<GrowthReport, GrowthError> {
+        let old_len = self.table.original_file_size;
+        if new_len <= old_len {
+            return Err(GrowthError::NotGrowth {
+                current: old_len,
+                requested: new_len,
+            });
+        }
+        if self.dirty
+            || self.history.can_undo()
+            || self.history.can_redo()
+            || self.index_dirty_from.is_some()
+        {
+            return Err(GrowthError::EditedDocument);
+        }
+        self.grow_with(new_len, |table| {
+            table.adopt_grown_original(new_len, backing)
+        })
+    }
+
+    /// The shared tail of both growth paths: apply the piece-table
+    /// growth, then extend the held line index's promise to the new
+    /// length (an index describing anything else is dropped and
+    /// rebuilds lazily instead of lying).
+    fn grow_with(
+        &mut self,
+        new_len: u64,
+        apply: impl FnOnce(
+            &mut PieceTable,
+        ) -> Result<
+            crate::piece_table::Growth,
+            crate::piece_table::ExtendOriginalError,
+        >,
+    ) -> Result<GrowthReport, GrowthError> {
+        let old_len = self.table.original_file_size;
+        let growth = apply(&mut self.table).map_err(GrowthError::Backing)?;
         // The held index was built over the old length: extend its
         // promise to the new length so it stays the valid partial
         // index of the grown document. An index describing anything
@@ -1571,6 +1644,26 @@ impl Editor {
         }
         self.caret = (at + 1).min(self.total_len());
         self.anchor = None;
+        self.after_mutation(at);
+        Ok(())
+    }
+
+    /// Replace the single byte at `at` in place, as one undoable
+    /// edit, WITHOUT moving the caret (the hex bit tooling flips bits
+    /// of the byte under the caret through this). Replacing with the
+    /// byte already there, or at/past the end of the document, is a
+    /// no-op that records no history.
+    pub fn replace_byte_at(&mut self, at: u64, byte: u8) -> Result<(), EditorError> {
+        self.require_writable()?;
+        if at >= self.total_len() {
+            return Ok(());
+        }
+        let old = self.table.byte_at(at).unwrap_or(0);
+        if old == byte {
+            return Ok(());
+        }
+        self.note_newline_delta(&[byte], &[old]);
+        search::replace_one(&mut self.table, &mut self.history, at, 1, &[byte]);
         self.after_mutation(at);
         Ok(())
     }
@@ -3063,5 +3156,73 @@ mod tests {
             Err(GrowthError::EditedDocument)
         );
         assert_eq!(content(&e), b"abc\n");
+    }
+
+    #[test]
+    fn growth_adoption_with_a_fresh_backing_matches_note_file_growth() {
+        // The window path: re-map the grown file and adopt the new
+        // backing. Same guards, same report, same content.
+        use crate::piece_table::OriginalBuffer;
+        let mut e = ed(b"line one\nline two\n");
+        e.seed_line_index();
+        e.move_caret_to(4, false);
+        let grown = b"line one\nline two\nline three\n".to_vec();
+        let report = e
+            .adopt_grown_backing(29, OriginalBuffer::Memory(grown))
+            .unwrap();
+        assert_eq!(report.old_len, 18);
+        assert_eq!(report.new_len, 29);
+        assert_eq!(report.added, 11);
+        assert_eq!(content(&e), b"line one\nline two\nline three\n");
+        assert_eq!(e.caret(), 4);
+        assert!(!e.is_dirty());
+        assert!(e.index_is_partial());
+        assert_eq!(e.line_text(2).unwrap(), "line three");
+        // A backing whose length disagrees with the claimed growth
+        // is refused by the piece table, surfaced as a backing error.
+        let mut e = ed(b"abc\n");
+        assert!(matches!(
+            e.adopt_grown_backing(9, OriginalBuffer::Memory(b"abc\n".to_vec())),
+            Err(GrowthError::Backing(_))
+        ));
+    }
+
+    #[test]
+    fn replace_byte_at_edits_in_place_without_moving_the_caret() {
+        let mut e = ed(b"\x00\x41\n");
+        e.move_caret_to(1, false);
+        e.replace_byte_at(0, 0x80).unwrap();
+        assert_eq!(content(&e), vec![0x80, 0x41, b'\n']);
+        assert_eq!(e.caret(), 1);
+        assert!(e.is_dirty());
+        // Same byte again: no change, no extra history entry.
+        e.replace_byte_at(0, 0x80).unwrap();
+        assert!(e.undo());
+        assert_eq!(content(&e), vec![0x00, 0x41, b'\n']);
+        assert!(!e.can_undo());
+        // Past the end is a no-op.
+        e.replace_byte_at(99, 0xFF).unwrap();
+        assert_eq!(content(&e), vec![0x00, 0x41, b'\n']);
+    }
+
+    #[test]
+    fn filter_view_over_the_editor_index() {
+        use crate::filter::FilterQuery;
+        use crate::search::SearchOptions;
+        let mut e = ed(b"alpha\nbeta needle\ngamma\nneedle two\n");
+        e.seed_line_index();
+        let view = e
+            .filter_view(FilterQuery::literal(b"needle", SearchOptions::default()))
+            .unwrap();
+        assert_eq!(view.len(), 2);
+        assert_eq!(view.line_at_row(0).unwrap().line_no, 1);
+        assert_eq!(view.line_at_row(1).unwrap().line_no, 3);
+        assert!(view.is_complete());
+        // The index snapshot is available for a resumed build and is
+        // withheld once edits make it stale.
+        assert!(e.line_index_snapshot().is_some());
+        e.move_doc_end(false);
+        e.insert_text("x").unwrap();
+        assert!(e.line_index_snapshot().is_none());
     }
 }
