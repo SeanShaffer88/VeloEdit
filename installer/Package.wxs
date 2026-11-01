@@ -17,24 +17,25 @@
   product that upgrades the previous one under the same UpgradeCode.
 
   This file is built ONLY on a Windows machine (the release workflow does
-  it; WiX cannot build an MSI on Linux). Exact build commands:
+  it; WiX cannot build an MSI on Linux). Exact build commands (run from
+  the repo root, after a cargo release build for the MSVC target):
 
     dotnet tool install (global) wix, version 4.0.6
     wix extension add WixToolset.UI.wixext/4.0.6
     (the extension version must match the tool's major version,
     or the build fails with WIX0144)
-    wix build installer\Package.wxs -ext WixToolset.UI.wixext ^
-        -d ExePath=target\x86_64-pc-windows-msvc\release\VeloEdit.exe ^
+    wix build installer\Package.wxs -ext WixToolset.UI.wixext
         -o VeloEdit-v1.0.0-x64-Setup.msi
 
-  ExePath defaults to the repo-relative MSVC release build so a plain
-  wix build of this file works after a cargo release build for the
-  x86_64-pc-windows-msvc target.
+  File sources are written with the sys.SOURCEFILEDIR preprocessor
+  variable (the folder this file lives in), because WiX resolves plain
+  relative sources against the build's working folder, not this file:
+  an earlier revision used plain relative paths and the CI build could
+  not find the payload (WIX0103).
 
   The payload exe must be staged in the data-adjacent layout: the package
   creates an empty data\ folder next to the program for portable settings.
 -->
-<?define ExePath = "..\target\x86_64-pc-windows-msvc\release\VeloEdit.exe" ?>
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="VeloEdit"
@@ -63,12 +64,12 @@
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
       <Component Id="MainExecutable" Guid="*">
         <File Id="VeloEditExe"
-              Source="$(var.ExePath)"
+              Source="$(sys.SOURCEFILEDIR)..\target\x86_64-pc-windows-msvc\release\VeloEdit.exe"
               KeyPath="yes" />
       </Component>
       <Component Id="LicenseFile" Guid="*">
         <File Id="LicenseTxt"
-              Source="..\LICENSE"
+              Source="$(sys.SOURCEFILEDIR)..\LICENSE"
               KeyPath="yes" />
       </Component>
     </ComponentGroup>
