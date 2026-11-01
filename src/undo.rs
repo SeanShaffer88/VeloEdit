@@ -51,6 +51,15 @@ pub enum EditAction {
     },
 }
 
+// Layout pins (architectural audit): the history bounds — at most
+// `DEFAULT_HISTORY_LIMIT` steps and a byte budget over the stored
+// payloads (see [`entry_payload`]) — are spent against records of
+// exactly these sizes. If a variant or field change grows either
+// record, the build breaks here instead of silently weakening the
+// memory bounds the budget math assumes.
+const _: () = assert!(std::mem::size_of::<EditAction>() == 48);
+const _: () = assert!(std::mem::size_of::<HistoryEntry>() == 104);
+
 /// Internal history record: the logical action plus the exact piece segment
 /// needed to restore the layout in either direction.
 #[derive(Debug)]
