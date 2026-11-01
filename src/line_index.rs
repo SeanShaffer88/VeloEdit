@@ -6,19 +6,22 @@
 //! checkpoints in O(log M), seeks to the nearest preceding checkpoint, and
 //! scans forward only the remaining lines — never the whole file.
 //!
-//! SPEC.md calls for a SIMD-accelerated scan (AVX2 / SSE4.2) on a secondary
-//! thread. This foundation implementation uses a plain chunked scan with no
-//! `unsafe`; the newline counting is isolated in [`count_newlines_in`] and
-//! the per-chunk inner loop is structured so a SIMD implementation can
-//! replace it later without changing this module's API. Whether the scan
-//! runs on a background thread is a coordinator decision for a later slice;
-//! building the index itself is synchronous and bounded here.
+//! The scan is word-parallel (roadmap item 3): newline counting
+//! processes eight bytes per step with SWAR bit tricks (see
+//! [`count_newlines_in`]) — portable, safe code that gets most of the
+//! practical win of a SIMD kernel without `unsafe` or CPU-specific
+//! intrinsics. The initial build is also parallel: blocks are read in
+//! bounded rounds and their newline counts are computed on up to eight
+//! worker threads, then assembled in order, so the checkpoints are
+//! identical to a purely serial build for every input.
 
 /// Distance between line checkpoints: 64 KB (SPEC.md section 3.1).
 pub const CHECKPOINT_INTERVAL: u64 = 64 * 1024;
 
-/// Size of the sub-chunks the newline counter walks. Kept separate from
-/// `CHECKPOINT_INTERVAL` so a SIMD inner loop can adopt its own width.
+/// Buffer size for the forward scan in
+/// [`LineIndex::line_start_offset`] (kept separate from
+/// `CHECKPOINT_INTERVAL`: it bounds one resolver step, not the index
+/// density).
 const COUNT_CHUNK: usize = 8192;
 
 /// One sparse checkpoint: a known line number at a known byte offset.
@@ -35,18 +38,37 @@ pub struct LineCheckpoint {
     pub at_line_start: bool,
 }
 
-/// Count newline bytes in `data`.
-///
-/// This is the single seam where a SIMD implementation (SPEC.md section 3.1)
-/// replaces the inner loop: it walks the input in fixed sub-chunks and
-/// counts within each chunk, exactly the shape a vectorised
-/// compare-and-popcount kernel consumes.
-pub fn count_newlines_in(data: &[u8]) -> u64 {
+/// High bits of the bytes in `word` that equal `byte`, via SWAR:
+/// broadcast the byte, XOR, then flag every zero byte. The zero test
+/// per byte is `(x & 0x7F..) + 0x7F..) | x`: a byte's high bit ends up
+/// set iff the byte was non-zero, and no carry can cross a byte
+/// boundary (both addends have their high bit clear), so the result
+/// is exact — unlike the subtract-based haszero trick, which can
+/// over-count through borrow chains.
+pub(crate) fn swar_match_high_bits(word: u64, byte: u8) -> u64 {
+    let broadcast = u64::from_le_bytes([byte; 8]);
+    let x = word ^ broadcast;
+    let nonzero = ((x & 0x7F7F_7F7F_7F7F_7F7F) + 0x7F7F_7F7F_7F7F_7F7F) | x;
+    !nonzero & 0x8080_8080_8080_8080
+}
+
+/// Count occurrences of `byte` in `data`, eight bytes per step with
+/// the SWAR matcher above and a scalar tail for the remainder.
+pub fn count_byte_swar(data: &[u8], byte: u8) -> u64 {
     let mut total: u64 = 0;
-    for chunk in data.chunks(COUNT_CHUNK) {
-        total += chunk.iter().filter(|&&b| b == b'\n').count() as u64;
+    let mut words = data.chunks_exact(8);
+    for w in &mut words {
+        let word = u64::from_le_bytes(w.try_into().expect("chunk of 8"));
+        total += swar_match_high_bits(word, byte).count_ones() as u64;
     }
+    total += words.remainder().iter().filter(|&&b| b == byte).count() as u64;
     total
+}
+
+/// Count newline bytes in `data` (word-parallel SWAR; see
+/// [`count_byte_swar`]).
+pub fn count_newlines_in(data: &[u8]) -> u64 {
+    count_byte_swar(data, b'\n')
 }
 
 /// The sparse checkpoint index over one byte source.
@@ -65,27 +87,72 @@ impl LineIndex {
     /// the source. The scan proceeds one checkpoint interval at a time, so
     /// the live memory cost is one 64 KB buffer regardless of file size.
     pub fn build(total_len: u64, mut read_at: impl FnMut(u64, &mut [u8]) -> usize) -> Self {
+        // Worker count for the parallel counting: the machine's
+        // parallelism, capped at 8 (roadmap item 3).
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, 8);
+
         let mut checkpoints: Vec<LineCheckpoint> = Vec::new();
         let mut lines_before: u64 = 0;
         let mut prev_byte: Option<u8> = None;
-        let mut buffer = vec![0u8; CHECKPOINT_INTERVAL as usize];
         let mut offset: u64 = 0;
+        let mut stopped = false;
 
-        while offset < total_len {
-            checkpoints.push(LineCheckpoint {
-                byte_offset: offset,
-                line_number: lines_before,
-                at_line_start: offset == 0 || prev_byte == Some(b'\n'),
-            });
-            let want = (CHECKPOINT_INTERVAL).min(total_len - offset) as usize;
-            let read = read_at(offset, &mut buffer[..want]);
-            if read == 0 {
-                break; // Source ended earlier than promised; index what we saw.
+        // Blocks are read serially (the `read_at` contract is a
+        // single-threaded cursor) in rounds of up to `workers` blocks
+        // — at most 8 × 64 KB of live memory — and each round's
+        // newline counts are computed in parallel, then assembled in
+        // order. The checkpoint stream is exactly the serial one.
+        while offset < total_len && !stopped {
+            let mut blocks: Vec<(u64, Vec<u8>)> = Vec::with_capacity(workers);
+            let mut round_offset = offset;
+            while blocks.len() < workers && round_offset < total_len {
+                let want = (CHECKPOINT_INTERVAL).min(total_len - round_offset) as usize;
+                let mut buffer = vec![0u8; want];
+                let read = read_at(round_offset, &mut buffer);
+                buffer.truncate(read);
+                blocks.push((round_offset, buffer));
+                if read == 0 {
+                    break; // Source ended earlier than promised.
+                }
+                round_offset += read as u64;
             }
-            let data = &buffer[..read];
-            lines_before += count_newlines_in(data);
-            prev_byte = data.last().copied();
-            offset += read as u64;
+            // Per-block results: (newline count, last byte).
+            let results: Vec<(u64, Option<u8>)> = if blocks.len() > 1 {
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = blocks
+                        .iter()
+                        .map(|(_, data)| {
+                            scope.spawn(|| (count_newlines_in(data), data.last().copied()))
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("line-index worker panicked"))
+                        .collect()
+                })
+            } else {
+                blocks
+                    .iter()
+                    .map(|(_, data)| (count_newlines_in(data), data.last().copied()))
+                    .collect()
+            };
+            for ((block_offset, data), (count, last)) in blocks.iter().zip(results.iter()) {
+                checkpoints.push(LineCheckpoint {
+                    byte_offset: *block_offset,
+                    line_number: lines_before,
+                    at_line_start: *block_offset == 0 || prev_byte == Some(b'\n'),
+                });
+                if data.is_empty() {
+                    stopped = true; // the read==0 block: index what we saw
+                    break;
+                }
+                lines_before += count;
+                prev_byte = *last;
+                offset = block_offset + data.len() as u64;
+            }
         }
         if checkpoints.is_empty() {
             checkpoints.push(LineCheckpoint {
@@ -230,6 +297,121 @@ mod tests {
         assert_eq!(count_newlines_in(b"no breaks"), 0);
         assert_eq!(count_newlines_in(b"a\nb\nc\n"), 3);
         assert_eq!(count_newlines_in(b"\n\n\n"), 3);
+    }
+
+    /// The serial reference the parallel build must reproduce exactly.
+    fn serial_checkpoints(data: &[u8]) -> Vec<LineCheckpoint> {
+        let mut out = Vec::new();
+        let mut lines_before = 0u64;
+        let mut prev: Option<u8> = None;
+        let mut offset = 0u64;
+        while offset < data.len() as u64 {
+            out.push(LineCheckpoint {
+                byte_offset: offset,
+                line_number: lines_before,
+                at_line_start: offset == 0 || prev == Some(b'\n'),
+            });
+            let want = (CHECKPOINT_INTERVAL).min(data.len() as u64 - offset) as usize;
+            let block = &data[offset as usize..offset as usize + want];
+            lines_before += block.iter().filter(|&&b| b == b'\n').count() as u64;
+            prev = block.last().copied();
+            offset += want as u64;
+        }
+        if out.is_empty() {
+            out.push(LineCheckpoint {
+                byte_offset: 0,
+                line_number: 0,
+                at_line_start: true,
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn swar_count_matches_scalar_on_adversarial_and_random_data() {
+        // Adversarial for borrow-based SWAR: 0x0A beside 0x0B / 0x00 /
+        // 0xFF patterns that smear borrows in the naive formula.
+        let cases: Vec<&[u8]> = vec![
+            b"\n\x0B\n\x00\n\xFF\n",
+            b"\x0A\x0A\x0A\x0A\x0A\x0A\x0A\x0A\x0A",
+            b"aaaaaaaa\nbbbbbbbb\n",
+            b"\xFF\xFE\n\x00\x01\n",
+        ];
+        for case in cases {
+            let naive = case.iter().filter(|&&b| b == b'\n').count() as u64;
+            assert_eq!(count_newlines_in(case), naive, "{case:?}");
+        }
+        // Randomised buffers, all lengths around word boundaries.
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for len in [
+            0usize, 1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 1000, 8191, 8192, 8193,
+        ] {
+            let data: Vec<u8> = (0..len)
+                .map(|_| {
+                    let r = next();
+                    if r % 7 == 0 {
+                        b'\n'
+                    } else {
+                        (r % 256) as u8
+                    }
+                })
+                .collect();
+            let naive = data.iter().filter(|&&b| b == b'\n').count() as u64;
+            assert_eq!(count_newlines_in(&data), naive, "len {len}");
+        }
+    }
+
+    #[test]
+    fn parallel_build_matches_serial_on_randomised_buffers() {
+        // Roadmap item 3 equivalence: the parallel build's checkpoints
+        // are identical to the serial reference for every input shape:
+        // block-straddling newlines, \r\n data, no trailing newline,
+        // empty input, exact interval multiples.
+        let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut buffers: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"no newline at all".to_vec(),
+            b"trailing newline\n".to_vec(),
+            b"crlf\r\nlines\r\nend".to_vec(),
+            vec![b'x'; CHECKPOINT_INTERVAL as usize], // exactly one block
+            vec![b'\n'; CHECKPOINT_INTERVAL as usize + 1], // straddle
+        ];
+        // A long random buffer with newlines and CRLF pairs sprinkled
+        // across many block boundaries.
+        let mut big = Vec::new();
+        while big.len() < (CHECKPOINT_INTERVAL as usize) * 9 + 123 {
+            match next() % 11 {
+                0 => big.extend_from_slice(b"\r\n"),
+                1 => big.push(b'\n'),
+                _ => big.push(b'a' + (next() % 26) as u8),
+            }
+        }
+        buffers.push(big);
+        for data in &buffers {
+            let index = LineIndex::build_from_bytes(data);
+            assert_eq!(
+                index.checkpoints(),
+                serial_checkpoints(data).as_slice(),
+                "checkpoints for len {}",
+                data.len()
+            );
+            assert_eq!(
+                index.total_newlines(),
+                data.iter().filter(|&&b| b == b'\n').count() as u64
+            );
+        }
     }
 
     #[test]
