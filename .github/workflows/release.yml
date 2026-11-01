@@ -76,8 +76,10 @@ jobs:
             "program: settings.json (theme, accent, font size, window"
             "position, recent files) and, while you edit a document up to"
             "16 MB, the crash-recovery snapshot (recovery.bin /"
-            "recovery.json). Nothing is written to %APPDATA% or the"
-            "registry, so the whole program folder stays portable."
+            "recovery.json). Nothing is written to %APPDATA%, and the"
+            "only registry entry is the Explorer menu item, added only"
+            "if you ask for it (--install-shell) — so the whole program"
+            "folder stays portable."
             ""
             "Deleting this folder resets VeloEdit to its first-run state."
           ) | Set-Content stage-portable\data\README-data.txt
