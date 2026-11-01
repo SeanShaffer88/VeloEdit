@@ -61,6 +61,18 @@ Working in this build:
   saves a copy of a file through the same pipeline.
 - **Portable cleanup** — `--clean` removes only the `data/` folder next to
   the program file, and `--dry-run` shows what would happen first.
+- **Scoped and masked search** — the find bar can limit find/replace to
+  the current selection, and in hex mode it understands byte patterns
+  with wildcards (`4A ?? FF 00 2B`, `?` = any nibble). The Edit menu can
+  also sort the lines in a selection or remove duplicate lines.
+- **File splitter** — split a huge file into numbered parts
+  (`part001`, `part002`, …) from the command line or the window,
+  streamed, without loading it.
+- **Explorer menu item (opt-in)** — an "Open in VeloEdit" right-click
+  entry for Explorer, added only when you ask for it
+  (`--install-shell`, or File ▸ Explorer Menu Item) and removed by
+  `--uninstall-shell` or `--clean`. It is the only registry entry the
+  program writes, and it needs no administrator rights.
 
 - **Graphical editor window (Windows)** — pure Win32 with
   Direct2D/DirectWrite rendering, per-monitor DPI scaling, and only the
@@ -135,10 +147,19 @@ Once the window is open:
   atomic and clears the undo history. If you close with unsaved
   changes, you are asked first.
 - **Find** with Ctrl+F; **find and replace** with Ctrl+H. Enter finds
-  the next match; the bar shows how many matches there are.
+  the next match; the bar shows how many matches there are. Tick
+  **In selection** on the bar to search and replace only inside the
+  part you selected first; in hex mode, typing a byte pattern like
+  `4A ?? FF 00 2B` (a `?` matches any nibble) searches by pattern.
 - **Hex mode**: press F6 (or the Hex button) to see the raw bytes —
   16 per row, with the same bytes as characters on the right. Typing a
   hex digit (0–9, A–F) changes the byte under the caret.
+- **Tidy a selection**: Edit ▸ Sort Lines in Selection orders the
+  selected lines; Edit ▸ Remove Duplicate Lines in Selection drops
+  repeated lines, keeping the first of each. Each is one undo step.
+- **Split a file**: File ▸ Split File Copy… asks for a part size in
+  megabytes, then writes a copy of the document as numbered parts in
+  a `<name>-parts` folder and reports how many parts it made.
 - **Themes**: View ▸ Theme picks from 20 built-in themes; View ▸
   Accent changes just the highlight colour. Font size is in the same
   menu (or Ctrl+ '+' / Ctrl+ '-').
@@ -209,14 +230,37 @@ The headless tools run without opening a window:
    a start past the end of the file is an error (exit 2), and the
    bytes are streamed in 4 MB chunks, so the source can be huge.
 
-6. See everything the program can do from the command line:
+6. Split a big file into numbered parts that are easier to move:
+
+   ```bash
+   VeloEdit.exe --split "huge-dump.bin" --part-size 4G --out-dir "parts"
+   ```
+
+   This writes `huge-dump.bin.part001`, `.part002`, … into the
+   `parts` folder (the current folder when `--out-dir` is omitted);
+   joining the parts in order restores the file exactly. Part sizes
+   are plain byte counts or carry a `K`, `M`, or `G` suffix, and at
+   most 10,000 parts are made.
+
+7. Add the Explorer right-click menu item (and remove it again):
+
+   ```bash
+   VeloEdit.exe --install-shell
+   VeloEdit.exe --uninstall-shell
+   ```
+
+   This adds "Open in VeloEdit" for all files under your user
+   account only — no administrator prompt. `--clean` (next step)
+   removes it too.
+
+8. See everything the program can do from the command line:
 
    ```bash
    VeloEdit.exe --help
    VeloEdit.exe --version
    ```
 
-7. Remove the portable data folder (with a safe preview first):
+9. Remove the portable data folder (with a safe preview first):
 
    ```bash
    VeloEdit.exe --clean --dry-run
@@ -241,6 +285,8 @@ serves both.
 | `--encoding <NAME>` | Force the file encoding for `--find`: `utf8`, `utf16le`, `utf16be`, or `ansi` (default: detect) |
 | `--save-copy <DEST>` | Save a copy of the file to DEST through the atomic save pipeline (destination must differ from the source) |
 | `extract <file> --start <N> --length <M> --out <DEST>` | Copy one byte range of the file to DEST, streamed in 4 MB chunks; numbers are decimal or `0x`-hex, range clamped to the file |
+| `--split <FILE> --part-size <SIZE> [--out-dir <DIR>]` | Split FILE into `<name>.part001`, `.part002`, … parts of SIZE bytes (a number, or `K`/`M`/`G`-suffixed like `500M`); streamed, at most 10,000 parts |
+| `--install-shell`, `--uninstall-shell` | Add or remove the opt-in "Open in VeloEdit" Explorer menu item (current user only) |
 | `--output <PATH>` | Write the JSON report (diff or save-copy) to a file |
 | `--headless` | Run without opening a window |
 | `--clean`, `--uninstall` | Remove the adjacent `data/` folder only |
@@ -298,6 +344,8 @@ docs/PARITY.md        Operation registry: core API, CLI form, GUI form
 docs/BENCHMARKS.md    SPEC §8 evidence: what is measured, what is not
 installer/            Release packaging: VeloEdit.nsi (NSIS Setup exe),
                       Package.wxs (WiX v4 MSI)
+scripts/              Run-Benchmarks.ps1 — the benchmark harness
+                      (sparse fixtures, timed headless operations)
 src/lib.rs            Library root and the operation (op_*) surface
 src/editor.rs         Editor state machine the window is built on (caret,
                       selection, scroll, viewport rows, find state)
@@ -365,8 +413,11 @@ trips, corruption handling, recent-file rules).
 - Works 100% offline. There is no network code in the program.
 - Zero telemetry: nothing about your files or usage is collected or sent.
 - Your data stays in the file you are editing and the adjacent `data/`
-  folder. Nothing is written to `%APPDATA%`, `%LOCALAPPDATA%`,
-  `%PROGRAMDATA%`, or the registry.
+  folder. Nothing is written to `%APPDATA%`, `%LOCALAPPDATA%`, or
+  `%PROGRAMDATA%`. The one registry entry the program can write is
+  the Explorer menu item, and only when you explicitly add it with
+  `--install-shell` or File ▸ Explorer Menu Item — per-user, and
+  removed by `--uninstall-shell` or `--clean`.
 
 ## Screenshots
 
