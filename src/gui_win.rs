@@ -30,6 +30,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
     GlobalFree, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
 };
+use windows_sys::Win32::Globalization::{MultiByteToWideChar, WideCharToMultiByte};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
@@ -63,7 +64,9 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
 };
-use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
+use windows_sys::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::cli::{CliOptions, Mode as CliMode};
@@ -144,6 +147,18 @@ const CMD_ANSI: usize = 1047;
 const CMD_CTL_CHARS: usize = 1048;
 const CMD_JUMP_BACK: usize = 1049;
 const CMD_JUMP_FORWARD: usize = 1050;
+// Slice R4c (systems wiring) commands:
+const CMD_EXTRACT_RANGES: usize = 1051;
+const CMD_EXPORT_PATCH: usize = 1052;
+const CMD_APPLY_PATCH: usize = 1053;
+const CMD_COMPARE_WITH: usize = 1054;
+const CMD_OPEN_ADMIN: usize = 1055;
+const CMD_INSERT_ZEROES: usize = 1056;
+const CMD_CLEAR_FILTER: usize = 1057;
+const CMD_BOOKMARK_EDIT: usize = 1058;
+const CMD_BOOKMARK_TOGGLE: usize = 1059;
+const CMD_BOOKMARK_NEXT: usize = 1060;
+const CMD_BOOKMARK_PREV: usize = 1061;
 const CMD_THEME_BASE: usize = 3000; // + theme index (20 themes)
 const CMD_ACCENT_BASE: usize = 3100; // 0 = theme default, 1..=11 presets, then Custom…
 const CMD_ACCENT_CUSTOM: usize = CMD_ACCENT_BASE + 1 + ACCENT_PRESETS.len();
@@ -160,6 +175,13 @@ const CMD_HEX_ENDIAN: usize = 3330;
 // endings Keep / LF / CRLF, then BOM Keep / Add / Remove.
 const CMD_SAVE_EOL_BASE: usize = 3340;
 const CMD_SAVE_BOM_BASE: usize = 3360;
+/// Encoding menu (slice R4c, item 29): the standard encodings as
+/// radio items, `CMD_ENC_BASE + index` into the menu's order
+/// (UTF-8, UTF-16 LE, UTF-16 BE, ANSI).
+const CMD_ENC_BASE: usize = 3380;
+/// The Code Pages submenu: `CMD_CODEPAGE_BASE + 0` is "None
+/// (detected)"; `+ 1 + i` selects `CodePage::ALL[i]`.
+const CMD_CODEPAGE_BASE: usize = 3390;
 
 const ID_FIND_EDIT: usize = 2001;
 const ID_REPLACE_EDIT: usize = 2002;
@@ -640,8 +662,9 @@ it is off until you turn it on, and turning it off removes it.\r\n\
 View ▸ Data Inspector opens a panel that reads the 16 bytes at\r\n\
 the caret as numbers, text, a GUID, and dates — handy for picking\r\n\
 apart headers and other binary formats. File ▸ File Hashes… works\r\n\
-out the MD5, SHA-1 and SHA-256 checksums of the file on disk, and\r\n\
-checks any checksum you paste in against them.\r\n\
+out the MD5, SHA-1, SHA-256, CRC32 and xxHash64 checksums of\r\n\
+the file on disk, and checks any checksum you paste in\r\n\
+against them.\r\n\
 \r\n\
 THEMES\r\n\
 View ▸ Theme offers 20 built-in colour themes; View ▸ Accent recolours\r\n\
@@ -657,10 +680,15 @@ written (a log, for instance): when the file grows and you have\r\n\
 not edited it, the new lines simply arrive — nothing reloads and\r\n\
 your place is kept. The status bar reads Following while it is on.\r\n\
 Search \u{25B8} Filter\u{2026} shows only the lines that contain a word\r\n\
-or phrase, each with its real line number. Walk the rows with the\r\n\
-arrow keys; Enter jumps back to the full file at that line, and\r\n\
-Esc goes back without moving. You cannot type while the filter\r\n\
-is up — the status bar says what is happening.\r\n\
+or phrase, each with its real line number. On a large file the\r\n\
+filter opens at once and fills in as the search works through\r\n\
+the file — the status bar reads Filtering\u{2026} with a percentage\r\n\
+until it is done. Walk the rows with the arrow keys; Enter\r\n\
+jumps back to the full file at that line, and Esc goes back\r\n\
+without moving. Confirming the Filter prompt with the text\r\n\
+left empty leaves the filter, and Search \u{25B8} Clear Filter does\r\n\
+the same. You cannot type while the filter is up — the status\r\n\
+bar says what is happening.\r\n\
 View \u{25B8} Word Wrap folds long lines at the edge of the window\r\n\
 instead of letting them run off it. Wrapping is only how lines\r\n\
 are shown; the file never changes.\r\n\
@@ -701,7 +729,67 @@ use filled in the accent colour. If you move through the\r\n\
 controls with the keyboard, the control you are on is outlined\r\n\
 inside its border in the accent colour, so you can always see\r\n\
 where you are. The status bar shows the text size as a\r\n\
-percentage beside the file facts — 100% is the standard size.\r\n";
+percentage beside the file facts — 100% is the standard size.\r\n\
+\r\n\
+MORE TOOLS\r\n\
+File \u{25B8} Extract Ranges\u{2026} copies chosen parts of the file into a\r\n\
+new file. Type the ranges in ascending order, separated by ; —\r\n\
+byte ranges count both ends in (0-1023, or hex 0x1000-0x1FFF),\r\n\
+and line ranges take whole lines with their endings (L10-L20).\r\n\
+File \u{25B8} Export Delta Patch\u{2026} writes a small patch file holding\r\n\
+only your changes compared with the file on disk; File \u{25B8} Apply\r\n\
+Patch\u{2026} applies such a patch to the file in the window and\r\n\
+writes the result to a new file — the original is never\r\n\
+overwritten. Edit \u{25B8} Insert Zeroes\u{2026} adds a run of zero bytes at\r\n\
+the caret (type a number, or a size like 4K, 2M or 1G); undo\r\n\
+removes the whole run at once. File \u{25B8} Compare With\u{2026} compares\r\n\
+the document with another file block by block and lists the\r\n\
+regions that differ; Go to jumps the caret to a region.\r\n\
+Bookmarks can carry a colour and a short note: right-click a\r\n\
+bookmark's gutter square, or use Search \u{25B8} Bookmarks \u{25B8} Edit\r\n\
+Bookmark\u{2026}. The gutter square and the scrollbar tick draw in\r\n\
+the bookmark's colour, and jumping to a bookmark with F2 shows\r\n\
+its note in the status bar.\r\n\
+The Encoding menu re-reads the document under a different\r\n\
+character encoding without changing its bytes, including the\r\n\
+Code Pages submenu (Shift-JIS, GBK, EUC-KR, ISO-8859-1,\r\n\
+ISO-8859-15, Windows-1250, Windows-1251) for files written by\r\n\
+older or regional programs. The status bar shows the page in\r\n\
+use, like CP932. Text typed or pasted is converted back\r\n\
+through the same page when you save. A character the page\r\n\
+cannot show becomes a replacement mark on screen, and one it\r\n\
+cannot store is written as ? — pages are a viewing choice;\r\n\
+nothing is detected or changed until you pick one.\r\n\
+A file marked read-only opens with (read-only) in the title\r\n\
+and Read-only file in the status bar. Saving then offers to\r\n\
+save a copy under a different name instead of failing. File \u{25B8}\r\n\
+Open as Administrator opens a new window with full rights on\r\n\
+the same file, for the rare case a file truly needs it —\r\n\
+Windows asks you to approve the step first.\r\n\
+\r\n\
+KEYBOARD SHORTCUTS\r\n\
+Every shortcut can be changed. Put a file named\r\n\
+keybindings.json in the data folder next to the program: a\r\n\
+flat list pairing an action name with the keys for it, like\r\n\
+{ \"find\": \"Ctrl+Shift+F\", \"toggle_hex\": \"F6\" }. An empty\r\n\
+string unbinds an action. If the file has mistakes, the\r\n\
+actions concerned keep their defaults and the status bar says\r\n\
+so once at startup. The defaults are: open Ctrl+O \u{00B7} save\r\n\
+Ctrl+S \u{00B7} save_as Ctrl+Shift+S \u{00B7} undo Ctrl+Z \u{00B7} redo Ctrl+Y \u{00B7}\r\n\
+cut Ctrl+X \u{00B7} copy Ctrl+C \u{00B7} paste Ctrl+V \u{00B7} select_all Ctrl+A \u{00B7}\r\n\
+find Ctrl+F \u{00B7} replace Ctrl+H \u{00B7} find_next F3 \u{00B7} find_prev\r\n\
+Shift+F3 \u{00B7} toggle_hex F6 \u{00B7} guide F1 \u{00B7} font_bigger Ctrl++ \u{00B7}\r\n\
+font_smaller Ctrl+- \u{00B7} toggle_bookmark Ctrl+F2 \u{00B7} bookmark_next\r\n\
+F2 \u{00B7} bookmark_prev Shift+F2 \u{00B7} jump_back Alt+Left \u{00B7}\r\n\
+jump_forward Alt+Right \u{00B7} pointer_follow Ctrl+Enter.\r\n\
+follow_tail, filter and clear_filter start unbound.\r\n\
+Two settings live only in settings.json in the data folder:\r\n\
+\"map_window_mb\" (0, 512, 1024, 2048 or 4096; 0 maps the whole\r\n\
+file, a number reads very large files through a moving window\r\n\
+of that many megabytes) and \"fast_save_clone\" (true lets a\r\n\
+save reuse the unchanged parts of the file already on disk\r\n\
+where the drive supports it, falling back to the normal save\r\n\
+whenever it cannot).\r\n";
 
 // ---------------------------------------------------------------------------
 // Hand-declared Direct2D / DirectWrite COM (see the module note). Vtable
@@ -957,6 +1045,11 @@ struct Brushes {
     /// The entropy strip's colour ramp (16 steps from the panel
     /// colour to the accent).
     ramp: [*mut c_void; 16],
+    /// The bookmark annotation swatches (slice R4c, item 5): one
+    /// brush per colour in `crate::bookmarks::BOOKMARK_SWATCHES`,
+    /// built from its fixed RGB values (theme-independent by
+    /// design — the swatches are chosen to read on every theme).
+    swatches: [*mut c_void; 6],
 }
 
 /// The ANSI SGR foreground palette: the standard terminal colours,
@@ -1000,6 +1093,10 @@ impl Brushes {
             ramp: std::array::from_fn(|i| {
                 make_brush(target, blend_rgba(t.panel, t.accent, i as f32 / 15.0))
             }),
+            swatches: std::array::from_fn(|i| {
+                let (_, (r, g, b)) = crate::bookmarks::BOOKMARK_SWATCHES[i];
+                make_brush(target, Rgba::rgb(r, g, b))
+            }),
         }
     }
 
@@ -1020,6 +1117,7 @@ impl Brushes {
         .into_iter()
         .chain(self.ansi.iter_mut())
         .chain(self.ramp.iter_mut())
+        .chain(self.swatches.iter_mut())
         {
             if !ptr.is_null() {
                 // SAFETY: each brush is a live ID2D1SolidColorBrush owned
@@ -1073,6 +1171,22 @@ struct FindProgress {
     done: bool,
 }
 
+/// Shared state for the background filter build (slice R4c, item
+/// 13): the worker folds its document snapshot window by window
+/// into a `crate::filter::FilterBuilder` and publishes view
+/// snapshots here; the UI thread attaches them on its tick. The
+/// generation tags follow the find discipline: `filter_gen` bumps
+/// on every new build and every cancel, `doc_gen` must match the
+/// document generation the build started from — a stale worker's
+/// snapshots are simply never attached.
+struct FilterProgress {
+    filter_gen: u64,
+    doc_gen: u64,
+    view: std::sync::Arc<crate::filter::FilterView>,
+    scanned: u64,
+    done: bool,
+}
+
 /// The canvas tooltip tool's id (the scrollbar tick hover preview).
 const TICK_TOOL_ID: usize = 0x7E57;
 
@@ -1117,6 +1231,12 @@ struct FilterState {
     first_row: usize,
     /// The row cursor (an index into the filtered rows).
     cursor_row: usize,
+    /// A background build is still walking the document (slice
+    /// R4c, item 13); `view` holds the matches found so far.
+    building: bool,
+    /// Bytes the running build has covered, for the banner's
+    /// "Filtering… NN%".
+    scanned: u64,
 }
 
 /// The strings worker's delivery slot: (generation, min length,
@@ -1361,6 +1481,27 @@ struct App {
     /// The strings pane's min-length chips from the last render:
     /// `(min_len, rect in DIPs)`.
     strings_chips: Vec<(u32, (f32, f32, f32, f32))>,
+    // --- Roadmap slice R4c (systems wiring) ------------------------
+    /// The background filter build's delivery slot and generation
+    /// (item 13).
+    filter_slot: Arc<Mutex<Option<FilterProgress>>>,
+    filter_gen: u64,
+    /// The merged key bindings (item 48): the shipped defaults
+    /// overlaid with `data/keybindings.json`. The accelerator
+    /// dispatch and the menu chord labels read from this map.
+    keybindings: crate::keybindings::KeyBindings,
+    /// `keybindings.json` existed but had problems (bad JSON,
+    /// unknown actions, unparseable chords); the status bar says
+    /// so once at startup and the defaults are in force.
+    keybindings_problem: bool,
+    /// The current document's file carries the read-only
+    /// attribute (item 33): the title and status bar say so, and
+    /// Save offers a copy instead of writing.
+    doc_read_only_file: bool,
+    /// The Encoding menu and its Code Pages submenu, kept for the
+    /// check-mark sync (item 29).
+    encoding_menu: HMENU,
+    codepage_menu: HMENU,
 }
 
 impl App {
@@ -1826,7 +1967,7 @@ fn char_slice(text: &str, from: u64, to: u64) -> String {
 fn line_row_text(ed: &Editor, start: u64, end: u64) -> String {
     let fetch_len = (end - start).min(256 * 1024);
     let bytes = ed.table().read(start, fetch_len);
-    let mut text = crate::editor::decode_lossy(&bytes, ed.encoding());
+    let mut text = crate::editor::decode_lossy_codec(&bytes, ed.codec());
     let truncated = fetch_len < end - start || text.chars().count() > crate::editor::MAX_ROW_CHARS;
     if text.chars().count() > crate::editor::MAX_ROW_CHARS {
         text = text.chars().take(crate::editor::MAX_ROW_CHARS).collect();
@@ -2384,6 +2525,11 @@ fn refresh_title(app: &App) {
     if app.editor.is_dirty() {
         title.push_str(" *");
     }
+    if app.doc_read_only_file {
+        // Protected file (slice R4c, item 33): the file itself is
+        // marked read-only on disk.
+        title.push_str(" (read-only)");
+    }
     let wide = wstr(&title);
     // SAFETY: our window plus a NUL-terminated string.
     unsafe { SetWindowTextW(app.hwnd, wide.as_ptr()) };
@@ -2405,7 +2551,15 @@ fn refresh_status(app: &mut App) {
                 filter.cursor_row + 1
             },
         );
-        if !filter.view.is_complete() {
+        if filter.building {
+            // The background build is still walking the document
+            // (slice R4c, item 13): the rows on screen are the
+            // matches found so far, and the banner says how far
+            // the walk has got.
+            let total = filter.view.total_length().max(1);
+            let pct = filter.scanned.saturating_mul(100) / total;
+            left.push_str(&format!(" \u{00B7} Filtering\u{2026} {pct}%"));
+        } else if !filter.view.is_complete() {
             left.push_str(" \u{00B7} indexing\u{2026} (indexed prefix only)");
         }
         let wide = wstr(&left);
@@ -2425,7 +2579,12 @@ fn refresh_status(app: &mut App) {
             human_size(st.selection_len)
         ));
     }
-    if st.read_only {
+    if app.doc_read_only_file {
+        // Protected file (slice R4c, item 33) — distinct wording
+        // from the --read-only launch flag below: this one is the
+        // file's own attribute.
+        left.push_str(" \u{00B7} Read-only file");
+    } else if st.read_only {
         left.push_str(" \u{00B7} Read-only");
     }
     if st.dirty {
@@ -2469,14 +2628,21 @@ fn refresh_status_right(app: &App, st: &crate::editor::StatusInfo) {
     // The zoom readout (polish pass — 100% is the default font
     // size; this refresh runs on every font change, menu or
     // Ctrl+wheel alike, so the percentage is always live).
+    // A user-chosen code page (slice R4c, item 29) replaces the
+    // detected encoding's name here — "CP932" and friends — and
+    // the detection-confidence suffix does not apply to it.
+    let encoding_label = match st.page {
+        Some(page) => page.label(),
+        None => encoding_display(st.encoding),
+    };
     let mut right = format!(
         "{}% \u{00B7} {} \u{00B7} {} \u{00B7} {}",
         zoom_percent(app.settings.font_size),
-        encoding_display(st.encoding),
+        encoding_label,
         app.eol,
         human_size(st.size)
     );
-    if !st.encoding_confident {
+    if st.page.is_none() && !st.encoding_confident {
         right.push_str(" (detected, not certain)");
     }
     // Armed save conversions (roadmap items 31/32) are visible
@@ -2556,6 +2722,17 @@ fn fill_rect(fill: RtFillRect, target: *mut c_void, rect: D2dRectF, brush: *mut 
         // SAFETY: `fill` is ID2D1RenderTarget::FillRectangle (slot 17)
         // resolved from the live target; the rect is a plain value.
         unsafe { fill(target, &rect, brush) };
+    }
+}
+
+/// The brush a bookmark's gutter marker and scrollbar tick draw
+/// in (slice R4c, item 5): its annotation swatch when it has one,
+/// otherwise the theme accent — the colour bookmarks have always
+/// used.
+fn bookmark_brush(brushes: &Brushes, bookmark: &crate::bookmarks::Bookmark) -> *mut c_void {
+    match bookmark.color {
+        Some(i) if (i as usize) < brushes.swatches.len() => brushes.swatches[i as usize],
+        _ => brushes.accent,
     }
 }
 
@@ -2641,7 +2818,7 @@ fn draw_text(
 /// except on very long lines, where the row-fetch cap applies).
 fn col_of_byte(
     table: &PieceTable,
-    enc: crate::encoding::TextEncoding,
+    enc: crate::encoding::TextCodec,
     row_start: u64,
     byte: u64,
 ) -> f32 {
@@ -2649,7 +2826,9 @@ fn col_of_byte(
         return 0.0;
     }
     let bytes = table.read(row_start, byte - row_start);
-    crate::editor::decode_lossy(&bytes, enc).chars().count() as f32
+    crate::editor::decode_lossy_codec(&bytes, enc)
+        .chars()
+        .count() as f32
 }
 
 /// Format a float reading for the inspector panel: `NaN` and the
@@ -2731,7 +2910,9 @@ struct RowPaint<'a> {
     matches: &'a [u64],
     match_len: u64,
     current_match: Option<(u64, u64)>,
-    bookmarks: &'a [u64],
+    /// The document's bookmarks, annotations included: the gutter
+    /// markers draw in each bookmark's colour (slice R4c, item 5).
+    bookmarks: &'a [crate::bookmarks::Bookmark],
     deltas: &'a std::collections::HashMap<u64, i64>,
     dim_range: Option<(u64, u64)>,
     seg_mode: bool,
@@ -2779,7 +2960,7 @@ fn grid_model(
     app: &mut App,
     disp: &[DisplayRow],
 ) -> Option<(crate::delimited::Delimiter, Vec<u64>)> {
-    let enc = app.editor.encoding();
+    let enc = app.editor.codec();
     let contents: Vec<Vec<u8>> = disp
         .iter()
         .filter(|r| r.char_start == 0)
@@ -2797,7 +2978,7 @@ fn grid_model(
             .into_iter()
             .enumerate()
         {
-            let n = crate::editor::decode_lossy(&content[fs as usize..fe as usize], enc)
+            let n = crate::editor::decode_lossy_codec(&content[fs as usize..fe as usize], enc)
                 .chars()
                 .count() as u64;
             if widths.len() <= fi {
@@ -2874,9 +3055,11 @@ fn render(app: &mut App) {
     let match_len = current_match
         .map(|(s, e)| e - s)
         .unwrap_or(if app.bg_active { app.bg_needle_len } else { 0 });
-    // Bookmark offsets (sorted) for the gutter markers and the
-    // scrollbar ticks.
+    // Bookmark offsets (sorted) for the scrollbar ticks, and the
+    // full entries for the gutter markers (which draw in each
+    // bookmark's annotation colour, slice R4c item 5).
     let bookmark_offsets: Vec<u64> = app.bookmarks.iter().map(|b| b.offset).collect();
+    let bookmark_entries: Vec<crate::bookmarks::Bookmark> = app.bookmarks.iter().cloned().collect();
     let (sb_total, sb_first, sb_page) = scroll_metrics(app);
     let (caret_line, caret_col) = app.editor.line_col_of(app.editor.caret());
     let caret = app.editor.caret();
@@ -2925,7 +3108,7 @@ fn render(app: &mut App) {
         matches: &all_matches,
         match_len,
         current_match,
-        bookmarks: &bookmark_offsets,
+        bookmarks: &bookmark_entries,
         deltas: &row_deltas,
         dim_range,
         seg_mode,
@@ -3178,10 +3361,13 @@ fn render(app: &mut App) {
                     }
                 }
                 // Bookmark marker (roadmap item 20): the same
-                // accent square as text mode, at the gutter's right
-                // edge here — the address text starts at the left.
-                let bm_at = bookmark_offsets.partition_point(|&b| b < row.address);
-                if matches!(bookmark_offsets.get(bm_at), Some(&b) if b < row.address + row.len) {
+                // square as text mode, at the gutter's right edge
+                // here — the address text starts at the left. Its
+                // colour is the bookmark's annotation colour, or
+                // the accent (slice R4c, item 5).
+                let bm_at = bookmark_entries.partition_point(|b| b.offset < row.address);
+                if matches!(bookmark_entries.get(bm_at), Some(b) if b.offset < row.address + row.len)
+                {
                     let size = 6.0;
                     let my = y + (app.line_h - size) / 2.0;
                     fill_rect(
@@ -3193,7 +3379,7 @@ fn render(app: &mut App) {
                             right: layout.gutter_w - 2.0,
                             bottom: my + size,
                         },
-                        brushes.accent,
+                        bookmark_brush(brushes, &bookmark_entries[bm_at]),
                     );
                 }
                 // The address column: absolute offsets, or — while
@@ -3380,6 +3566,28 @@ fn render(app: &mut App) {
             table.len(),
             brushes.text,
         );
+        // Coloured bookmarks (slice R4c, item 5) redraw their
+        // ticks in their swatch colour, over the plain pass above.
+        for (i, swatch) in brushes.swatches.iter().enumerate() {
+            let offsets: Vec<u64> = bookmark_entries
+                .iter()
+                .filter(|b| b.color == Some(i as u8))
+                .map(|b| b.offset)
+                .collect();
+            if !offsets.is_empty() {
+                draw_offset_ticks(
+                    fill,
+                    target,
+                    track.left,
+                    track.right,
+                    rtop,
+                    rbottom - rtop,
+                    &offsets,
+                    table.len(),
+                    *swatch,
+                );
+            }
+        }
     }
 
     // The data inspector panel (roadmap item 15): docked on the
@@ -3715,7 +3923,7 @@ fn paint_text_row(
     let brushes = app.brushes.as_ref().expect("checked above");
     let format = app.text_format;
     let table = app.editor.table();
-    let enc = app.editor.encoding();
+    let enc = app.editor.codec();
     let fill: RtFillRect = unsafe { vfn(target, SLOT_RT_FILL_RECTANGLE) };
     let draw_rect: RtDrawRectangle = unsafe { vfn(target, SLOT_RT_DRAW_RECTANGLE) };
     let draw: RtDrawText = unsafe { vfn(target, SLOT_RT_DRAW_TEXT) };
@@ -3863,8 +4071,9 @@ fn paint_text_row(
         // Bookmark marker (roadmap item 20): a small accent square
         // at the gutter's left edge — or just right of the delta
         // column when that is showing.
-        let bm_at = paint.bookmarks.partition_point(|&b| b < row.start);
-        if matches!(paint.bookmarks.get(bm_at), Some(&b) if b < row.end || b == row.start) {
+        let bm_at = paint.bookmarks.partition_point(|b| b.offset < row.start);
+        if matches!(paint.bookmarks.get(bm_at), Some(b) if b.offset < row.end || b.offset == row.start)
+        {
             let size = 6.0;
             let my = y + (app.line_h - size) / 2.0;
             let bx = if layout.delta_w > 0.0 {
@@ -3881,7 +4090,7 @@ fn paint_text_row(
                     right: bx + size,
                     bottom: my + size,
                 },
-                brushes.accent,
+                bookmark_brush(brushes, &paint.bookmarks[bm_at]),
             );
         }
     }
@@ -3997,7 +4206,7 @@ fn paint_grid_rows(
     let brushes = app.brushes.as_ref().expect("checked above");
     let format = app.text_format;
     let table = app.editor.table();
-    let enc = app.editor.encoding();
+    let enc = app.editor.codec();
     let fill: RtFillRect = unsafe { vfn(target, SLOT_RT_FILL_RECTANGLE) };
     let draw_rect: RtDrawRectangle = unsafe { vfn(target, SLOT_RT_DRAW_RECTANGLE) };
     let draw: RtDrawText = unsafe { vfn(target, SLOT_RT_DRAW_TEXT) };
@@ -4071,8 +4280,9 @@ fn paint_grid_rows(
                 brushes.gutter_num
             },
         );
-        let bm_at = paint.bookmarks.partition_point(|&b| b < row.start);
-        if matches!(paint.bookmarks.get(bm_at), Some(&b) if b < row.end || b == row.start) {
+        let bm_at = paint.bookmarks.partition_point(|b| b.offset < row.start);
+        if matches!(paint.bookmarks.get(bm_at), Some(b) if b.offset < row.end || b.offset == row.start)
+        {
             let size = 6.0;
             let my = y + (app.line_h - size) / 2.0;
             let bx = if layout.delta_w > 0.0 {
@@ -4089,7 +4299,7 @@ fn paint_grid_rows(
                     right: bx + size,
                     bottom: my + size,
                 },
-                brushes.accent,
+                bookmark_brush(brushes, &paint.bookmarks[bm_at]),
             );
         }
         // The fields themselves.
@@ -4150,7 +4360,7 @@ fn paint_grid_rows(
                     );
                 }
             }
-            let text = crate::editor::decode_lossy(&content[fs as usize..fe as usize], enc);
+            let text = crate::editor::decode_lossy_codec(&content[fs as usize..fe as usize], enc);
             draw_text(
                 draw,
                 target,
@@ -4213,7 +4423,7 @@ fn pos_to_offset_grid(app: &mut App, x: f32, row_in_view: usize) -> u64 {
     };
     let layout = compute_layout(app);
     let text_x = layout.gutter_w + TEXT_PAD;
-    let enc = app.editor.encoding();
+    let enc = app.editor.codec();
     let content = app
         .editor
         .table()
@@ -4228,7 +4438,7 @@ fn pos_to_offset_grid(app: &mut App, x: f32, row_in_view: usize) -> u64 {
         let field_w = (col_w + GRID_GAP_CHARS) as f32 * app.char_w;
         let last = fi + 1 == fields.len();
         if x < fx + field_w || last {
-            let own = crate::editor::decode_lossy(&content[fs as usize..fe as usize], enc)
+            let own = crate::editor::decode_lossy_codec(&content[fs as usize..fe as usize], enc)
                 .chars()
                 .count() as u64;
             let within = (((x - fx) / app.char_w.max(1.0)).floor().max(0.0) as u64).min(own);
@@ -4631,14 +4841,12 @@ fn load_session_bookmarks(app: &mut App) {
     let Some(stamp) = app.doc_stamp else {
         return;
     };
-    let entries: Vec<(u64, String)> = app
-        .bookmark_store
-        .bookmarks(&path, stamp)
-        .iter()
-        .map(|b| (b.offset, b.name.clone()))
-        .collect();
-    for (offset, name) in entries {
-        app.bookmarks.toggle(offset, &name);
+    // Clone the full stored entries (slice R4c: colour and note
+    // annotations ride along, not just offsets and names).
+    let entries: Vec<crate::bookmarks::Bookmark> =
+        app.bookmark_store.bookmarks(&path, stamp).to_vec();
+    for entry in entries {
+        app.bookmarks.add(entry);
     }
 }
 
@@ -4655,6 +4863,7 @@ fn begin_document_tracking(app: &mut App) {
     // and the strings / entropy mirrors are staled so their panes
     // rescan the new document.
     app.filter = None;
+    cancel_filter_build(app);
     app.jump_history.clear();
     app.status_note = None;
     app.tail_pin_view = false;
@@ -4685,6 +4894,7 @@ fn begin_document_tracking(app: &mut App) {
             let stamp = crate::bookmarks::stamp_path(&path).ok();
             app.doc_stamp = stamp;
             app.file_stamp = stamp;
+            app.doc_read_only_file = crate::save::path_is_read_only(&path);
             load_session_bookmarks(app);
             app.doc_fingerprint = None;
             spawn_fingerprint_thread(app, &path);
@@ -4692,6 +4902,7 @@ fn begin_document_tracking(app: &mut App) {
         None => {
             app.doc_stamp = None;
             app.file_stamp = None;
+            app.doc_read_only_file = false;
             app.bookmarks.clear();
             app.doc_fingerprint = None;
             app.doc_mmap = None;
@@ -4717,6 +4928,7 @@ fn after_save_tracking(app: &mut App, adopted_new_path: bool) {
         return;
     };
     app.file_stamp = crate::bookmarks::stamp_path(&path).ok();
+    app.doc_read_only_file = crate::save::path_is_read_only(&path);
     app.doc_mmap = MmapFile::open(&path).ok().map(Arc::new);
     // The saved file is the document's new baseline, exactly like a
     // fresh open: the editor dropped any stale index at the save
@@ -4770,6 +4982,16 @@ fn jump_bookmark(app: &mut App, forward: bool) {
         app.editor.move_caret_to(offset, false);
         record_jump(app, caret, offset);
         after_caret_move(app);
+        // A bookmark note (slice R4c, item 5) rides the status bar
+        // for this jump — set after after_caret_move, which clears
+        // one-shot notes.
+        if let Some(bookmark) = app.bookmarks.get(offset) {
+            if !bookmark.note.is_empty() {
+                let note = bookmark.note.clone();
+                app.status_note = Some(note);
+                refresh_status(app);
+            }
+        }
     }
 }
 
@@ -4820,7 +5042,7 @@ fn snapshot_table(app: &App) -> PieceTable {
 /// needle cannot be encoded — the caller then runs the ordinary
 /// synchronous find, which reports the same error the same way.
 fn start_bg_find(app: &mut App, text: &str) -> bool {
-    let needle = match encoding::encode_needle(text, app.editor.encoding()) {
+    let needle = match app.editor.encode_text(text) {
         Ok(needle) => needle,
         Err(_) => return false,
     };
@@ -4829,12 +5051,12 @@ fn start_bg_find(app: &mut App, text: &str) -> bool {
     let options = SearchOptions::default();
     // The editor filters UTF-16 matches to code-unit-aligned
     // offsets; the worker applies the same filter so the two paths
-    // never disagree.
-    let utf16_bom = match app.editor.encoding() {
-        encoding::TextEncoding::Utf16Le | encoding::TextEncoding::Utf16Be => {
-            Some(app.editor.detection().bom_len as u64)
-        }
-        _ => None,
+    // never disagree. (Under a code page there is no alignment to
+    // filter — the codec check covers both cases.)
+    let utf16_bom = if app.editor.codec_is_utf16() {
+        Some(app.editor.bom_skip())
+    } else {
+        None
     };
     app.find_gen += 1;
     let find_gen = app.find_gen;
@@ -5115,8 +5337,38 @@ fn open_document(app: &mut App, path: &Path) {
         }
     };
     let sample_len = (mmap.len() as usize).min(64 * 1024);
-    let detection = encoding::detect(&mmap.as_slice()[..sample_len]);
-    app.eol = detect_eol(&mmap.as_slice()[..sample_len]);
+    // Mapping windows (slice R4c, item 1): with map_window_mb set,
+    // the detection sample is read through a remapped window
+    // instead of the whole-file view, exercising the windowed
+    // reader on the open path. The document backing itself stays
+    // whole-file in this slice (see PARITY) — the windowed reader
+    // is the seam the backing migrates to later. Any windowed
+    // failure falls back to the whole-file sample.
+    let windowed_sample = if app.settings.map_window_mb > 0 {
+        crate::mmap_win::WindowedMap::open(
+            path,
+            crate::mapwindow::window_bytes(app.settings.map_window_mb),
+        )
+        .ok()
+        .and_then(|map| {
+            let mut buf = vec![0u8; sample_len];
+            if map.read_at(0, &mut buf) == sample_len {
+                Some(buf)
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+    let (detection, eol) = match &windowed_sample {
+        Some(sample) => (encoding::detect(sample), detect_eol(sample)),
+        None => {
+            let sample = &mmap.as_slice()[..sample_len];
+            (encoding::detect(sample), detect_eol(sample))
+        }
+    };
+    app.eol = eol;
     let table = if mmap.is_empty() {
         PieceTable::new(0)
     } else {
@@ -5190,9 +5442,19 @@ fn prompt_save_if_dirty(app: &mut App) -> bool {
 /// and Save As alike.
 fn gui_save_options(app: &App) -> SaveOptions {
     SaveOptions {
-        encoding: app.editor.encoding(),
+        // Under a user-chosen code page (slice R4c, item 29) the
+        // save pipeline sees a unit-width-1, BOM-less encoding:
+        // the document bytes already ARE page bytes (the codec
+        // only translates at the display/typing edges), so the
+        // streamed save is a pass-through either way — what the
+        // page changes is how text converts, not how bytes move.
+        encoding: match app.editor.code_page() {
+            Some(_) => encoding::TextEncoding::Ansi,
+            None => app.editor.encoding(),
+        },
         eol: app.settings.save_eol_choice(),
         bom: app.settings.save_bom_choice(),
+        fast_clone: app.settings.fast_save_clone,
         ..SaveOptions::default()
     }
 }
@@ -5216,9 +5478,36 @@ fn save_armed_suffix(eol: crate::save::EolChoice, bom: crate::save::BomChoice) -
     }
 }
 
+/// Block-clone fast save (slice R4c, item 4): when the owner
+/// turned the setting on but the clone path could not serve this
+/// save, the status bar says so once. The save itself used the
+/// normal streamed path and is fully correct either way — the
+/// note is information, never an error.
+fn note_fast_clone_fallback(app: &mut App, report: &crate::save::SaveReport) {
+    if app.settings.fast_save_clone && !report.fast_clone_used {
+        app.status_note =
+            Some("Fast save was not available for this file; the normal save was used".to_string());
+    }
+}
+
 fn do_save(app: &mut App) -> bool {
     if app.editor.path().is_none() {
         return do_save_as(app);
+    }
+    // Protected file (slice R4c, item 33): the file on disk is
+    // marked read-only, so saving over it would fail with a raw
+    // OS error. Explain in plain words and offer a copy instead.
+    if app.doc_read_only_file {
+        let answer = message_box(
+            app.hwnd,
+            "This file is marked read-only, so VeloEdit cannot save over it.\n\nSave a copy under a different name instead?",
+            "VeloEdit",
+            MB_YESNO | MB_ICONINFORMATION,
+        );
+        if answer == IDYES {
+            return do_save_as(app);
+        }
+        return false;
     }
     // Roadmap item 34: surface an external change before we
     // overwrite the file. The notice is non-modal — the save still
@@ -5226,10 +5515,11 @@ fn do_save(app: &mut App) -> bool {
     // (after_save_tracking then retires it).
     check_external_change(app);
     match app.editor.save_with_options(&gui_save_options(app)) {
-        Ok(_) => {
+        Ok(report) => {
             delete_recovery_files();
             app.last_edit = None;
             after_save_tracking(app, false);
+            note_fast_clone_fallback(app, &report);
             refresh_title(app);
             refresh_status(app);
             true
@@ -5260,10 +5550,11 @@ fn do_save_as(app: &mut App) -> bool {
         .editor
         .save_as_with_options(&path, &gui_save_options(app))
     {
-        Ok(_) => {
+        Ok(report) => {
             delete_recovery_files();
             app.last_edit = None;
             after_save_tracking(app, true);
+            note_fast_clone_fallback(app, &report);
             let path_string = path.to_string_lossy().into_owned();
             app.settings.add_recent(&path_string);
             save_settings(app);
@@ -5628,12 +5919,1175 @@ fn do_split_file(app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
+// Slice R4c handlers: bookmark annotations, Extract Ranges, delta
+// patches, Insert Zeroes, Compare With, Open as Administrator.
+// ---------------------------------------------------------------------------
+
+/// Owner-drawn button paint shared by the slice R4c dialogs (the
+/// older dialog procs carry their own copies; the new ones use
+/// this). `lparam` is the WM_DRAWITEM payload.
+fn draw_dialog_button(app: &App, lparam: LPARAM) -> LRESULT {
+    // SAFETY: lparam is a DRAWITEMSTRUCT for one of our buttons.
+    let dis = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
+    let mut rect = dis.rcItem;
+    // SAFETY: GDI drawing on the button's own DC.
+    unsafe {
+        FillRect(dis.hDC, &rect, app.panel_brush);
+        FrameRect(dis.hDC, &rect, app.line_brush);
+        if dis.itemState & 0x10 != 0 {
+            let mut inner = rect;
+            inner.left += 2;
+            inner.top += 2;
+            inner.right -= 2;
+            inner.bottom -= 2;
+            FrameRect(dis.hDC, &inner, app.accent_brush);
+        }
+        SetBkMode(dis.hDC, TRANSPARENT as i32);
+        SetTextColor(dis.hDC, colorref(app.theme.text));
+        let text = window_text(dis.hwndItem);
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        if !wide.is_empty() {
+            DrawTextW(
+                dis.hDC,
+                wide.as_mut_ptr(),
+                wide.len() as i32,
+                &mut rect,
+                0x1 | 0x4 | 0x20,
+            );
+        }
+    }
+    1
+}
+
+/// The session bookmark sitting on document line `line`, if any
+/// (slice R4c, item 5).
+fn bookmark_on_line(app: &mut App, line: u64) -> Option<u64> {
+    let offsets: Vec<u64> = app.bookmarks.iter().map(|b| b.offset).collect();
+    offsets
+        .into_iter()
+        .find(|&offset| app.editor.line_col_of(offset).0 == line)
+}
+
+/// Right-click in the text gutter (slice R4c, item 5): when the
+/// click lands on a line that carries a bookmark, open that
+/// bookmark's annotation editor. Returns true when a dialog
+/// opened (the click is consumed); anything else falls through
+/// to the default right-click behaviour.
+fn gutter_bookmark_click(app: &mut App, lparam: LPARAM) -> bool {
+    if app.filter.is_some() || app.editor.mode() != EditorMode::Text {
+        return false;
+    }
+    let (x_px, y_px) = mouse_xy(lparam);
+    let layout = compute_layout(app);
+    if app.dip(x_px) >= layout.gutter_w {
+        return false;
+    }
+    let offset = pos_to_offset(app, x_px, y_px);
+    let line = app.editor.line_col_of(offset).0;
+    match bookmark_on_line(app, line) {
+        Some(bookmark_offset) => {
+            edit_bookmark_dialog(app, bookmark_offset);
+            true
+        }
+        None => false,
+    }
+}
+
+// ---- Bookmark annotation editor (slice R4c, item 5) ----------
+
+const BMEDIT_CLASS: &str = "VeloEditBookmarkEdit";
+const ID_BMEDIT_NOTE: usize = 5501;
+const ID_BMEDIT_COLOR_BASE: usize = 5502; // +0 = Default, +1..=+6 = swatches
+const ID_BMEDIT_OK: usize = 5509;
+const ID_BMEDIT_CANCEL: usize = 5510;
+
+struct BookmarkEditState {
+    app: *mut App,
+    note_edit: HWND,
+    /// -1 = the default (theme accent); 0..=5 = a swatch index.
+    chosen: i32,
+    result: Option<(Option<u8>, String)>,
+}
+
+unsafe extern "system" fn bookmark_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CREATE {
+        // SAFETY: lparam is the CREATESTRUCTW from CreateWindowExW,
+        // whose lpCreateParams is the caller's BookmarkEditState.
+        let create = unsafe { &*(lparam as *const CREATESTRUCTW) };
+        let state_ptr = create.lpCreateParams as *mut BookmarkEditState;
+        // SAFETY: storing the state pointer for the dialog's life.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
+        // SAFETY: the state outlives the dialog (caller's frame).
+        let state = unsafe { &mut *state_ptr };
+        // SAFETY: the App is alive and exclusively ours on this thread.
+        let app = unsafe { &*state.app };
+        let scale = app.scale();
+        let px = |dip: f32| (dip * scale).round() as i32;
+        let place = |child: HWND, x: f32, y: f32, w: f32, h: f32| {
+            // SAFETY: reparent and position our fresh child window.
+            unsafe {
+                SetParent(child, hwnd);
+                MoveWindow(child, px(x), px(y), px(w), px(h), 1);
+            }
+        };
+        let label = create_child(app, "Static", "Colour:", WS_CHILD | WS_VISIBLE, 0, 0);
+        place(label, 12.0, 12.0, 404.0, 18.0);
+        let button_style = WS_CHILD | WS_VISIBLE | 0xB; // BS_OWNERDRAW
+        let mut names: Vec<String> = vec!["Default".to_string()];
+        for (name, _) in crate::bookmarks::BOOKMARK_SWATCHES {
+            names.push(name.to_string());
+        }
+        for (i, name) in names.iter().enumerate() {
+            let button = create_child(
+                app,
+                "Button",
+                name,
+                button_style,
+                0,
+                ID_BMEDIT_COLOR_BASE + i,
+            );
+            let row = (i / 4) as f32;
+            let col = (i % 4) as f32;
+            place(button, 12.0 + col * 104.0, 34.0 + row * 30.0, 98.0, 24.0);
+        }
+        let note_label = create_child(app, "Static", "Note:", WS_CHILD | WS_VISIBLE, 0, 0);
+        place(note_label, 12.0, 100.0, 404.0, 18.0);
+        let edit_style = WS_CHILD | WS_VISIBLE | 0x80; // ES_AUTOHSCROLL
+        let edit = create_child(
+            app,
+            "Edit",
+            "",
+            edit_style,
+            WS_EX_CLIENTEDGE,
+            ID_BMEDIT_NOTE,
+        );
+        place(edit, 12.0, 122.0, 404.0, 24.0);
+        state.note_edit = edit;
+        let ok = create_child(app, "Button", "OK", button_style, 0, ID_BMEDIT_OK);
+        let cancel = create_child(app, "Button", "Cancel", button_style, 0, ID_BMEDIT_CANCEL);
+        place(ok, 268.0, 158.0, 70.0, 24.0);
+        place(cancel, 346.0, 158.0, 70.0, 24.0);
+        return 0;
+    }
+    // SAFETY: the state pointer was stored at WM_CREATE.
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut BookmarkEditState;
+    if state_ptr.is_null() {
+        // SAFETY: default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    // SAFETY: the state outlives the dialog (see WM_CREATE).
+    let state = unsafe { &mut *state_ptr };
+    match msg {
+        WM_COMMAND => {
+            let id = wparam & 0xFFFF;
+            if (ID_BMEDIT_COLOR_BASE..ID_BMEDIT_COLOR_BASE + 7).contains(&id) {
+                state.chosen = (id - ID_BMEDIT_COLOR_BASE) as i32 - 1;
+                // SAFETY: repaint so the selection frame moves.
+                unsafe { InvalidateRect(hwnd, std::ptr::null(), 1) };
+            } else if id == ID_BMEDIT_OK {
+                let color = if state.chosen < 0 {
+                    None
+                } else {
+                    Some(state.chosen as u8)
+                };
+                // SAFETY: our edit control.
+                let note = unsafe { window_text(state.note_edit) };
+                state.result = Some((color, note.trim().to_string()));
+                // SAFETY: our dialog window.
+                unsafe { DestroyWindow(hwnd) };
+            } else if id == ID_BMEDIT_CANCEL {
+                // SAFETY: our dialog window.
+                unsafe { DestroyWindow(hwnd) };
+            }
+            0
+        }
+        WM_CLOSE => {
+            // SAFETY: closing is cancelling.
+            unsafe { DestroyWindow(hwnd) };
+            0
+        }
+        WM_DRAWITEM => {
+            // SAFETY: lparam is a DRAWITEMSTRUCT for one of our buttons.
+            let dis = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
+            let id = dis.CtlID as usize;
+            if (ID_BMEDIT_COLOR_BASE..ID_BMEDIT_COLOR_BASE + 7).contains(&id) {
+                // SAFETY: the App is alive (modal dialog, UI thread).
+                let app = unsafe { &*state.app };
+                let rect = dis.rcItem;
+                let index = id - ID_BMEDIT_COLOR_BASE;
+                let selected = state.chosen == index as i32 - 1;
+                // SAFETY: GDI drawing on the button's own DC.
+                unsafe {
+                    FillRect(dis.hDC, &rect, app.panel_brush);
+                    FrameRect(dis.hDC, &rect, app.line_brush);
+                    if selected {
+                        let mut inner = rect;
+                        inner.left += 2;
+                        inner.top += 2;
+                        inner.right -= 2;
+                        inner.bottom -= 2;
+                        FrameRect(dis.hDC, &inner, app.accent_brush);
+                    }
+                    // The colour block: the swatch itself, or the
+                    // theme accent for "Default".
+                    let rgb = if index == 0 {
+                        app.theme.accent
+                    } else {
+                        let (r, g, b) = crate::bookmarks::BOOKMARK_SWATCHES[index - 1].1;
+                        crate::theme::Rgba::rgb(r, g, b)
+                    };
+                    let swatch_brush = CreateSolidBrush(colorref(rgb));
+                    let mut block = rect;
+                    block.left += 5;
+                    block.top += 5;
+                    block.right = block.left + 16;
+                    block.bottom -= 5;
+                    FillRect(dis.hDC, &block, swatch_brush);
+                    DeleteObject(swatch_brush);
+                    SetBkMode(dis.hDC, TRANSPARENT as i32);
+                    SetTextColor(dis.hDC, colorref(app.theme.text));
+                    let text = window_text(dis.hwndItem);
+                    let mut wide: Vec<u16> = text.encode_utf16().collect();
+                    let mut text_rect = rect;
+                    text_rect.left += 26;
+                    if !wide.is_empty() {
+                        DrawTextW(
+                            dis.hDC,
+                            wide.as_mut_ptr(),
+                            wide.len() as i32,
+                            &mut text_rect,
+                            0x4 | 0x20,
+                        );
+                    }
+                }
+                1
+            } else {
+                // SAFETY: the App is alive (modal dialog, UI thread).
+                let app = unsafe { &*state.app };
+                draw_dialog_button(app, lparam)
+            }
+        }
+        // SAFETY: default handling for everything else.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Show the bookmark annotation editor for the bookmark at
+/// `offset`, prefilled with its current colour and note. Returns
+/// the confirmed (colour, note), or `None` on cancel.
+fn show_bookmark_edit_dialog(
+    app: &mut App,
+    bookmark: &crate::bookmarks::Bookmark,
+) -> Option<(Option<u8>, String)> {
+    let mut state = BookmarkEditState {
+        app: app as *mut App,
+        note_edit: std::ptr::null_mut(),
+        chosen: bookmark.color.map(|c| c as i32).unwrap_or(-1),
+        result: None,
+    };
+    let note_prefill = bookmark.note.clone();
+    let class = wstr(BMEDIT_CLASS);
+    let title = wstr("Edit Bookmark");
+    // SAFETY: the class is registered in run_gui; the state
+    // travels in lpCreateParams and lives in this stack frame
+    // until the dialog is destroyed (the modal loop below).
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            app.px(440.0),
+            app.px(228.0),
+            app.hwnd,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            &mut state as *mut BookmarkEditState as *const c_void,
+        )
+    };
+    if hwnd.is_null() {
+        return None;
+    }
+    // SAFETY: prefill the note and focus it; the edit was created
+    // in WM_CREATE.
+    unsafe {
+        let wide = wstr(&note_prefill);
+        SetWindowTextW(state.note_edit, wide.as_ptr());
+        SetFocus(state.note_edit);
+        SendMessageW(state.note_edit, 0xB1, 0, -1isize); // EM_SETSEL all
+        EnableWindow(app.hwnd, 0);
+        ShowWindow(hwnd, SW_SHOW);
+    }
+    loop {
+        // SAFETY: MSG is a plain C struct; GetMessageW fills it.
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; 0 = WM_QUIT, -1 = error.
+        let result = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+        if result <= 0 {
+            // SAFETY: preserve the quit for the main loop.
+            unsafe { PostQuitMessage(0) };
+            break;
+        }
+        // SAFETY: standard message pumping.
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        // SAFETY: a plain liveness query on our dialog.
+        if unsafe { IsWindow(hwnd) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: restore the main window and give it the focus back.
+    unsafe {
+        EnableWindow(app.hwnd, 1);
+        SetFocus(app.hwnd);
+    }
+    state.result
+}
+
+/// Open the annotation editor for the bookmark at `offset` and,
+/// on confirm, apply it to the session list and the central
+/// store (slice R4c, item 5 — the store is the one portable
+/// `data/bookmarks.json`; no sidecar files, by decision).
+fn edit_bookmark_dialog(app: &mut App, offset: u64) {
+    let Some(bookmark) = app.bookmarks.get(offset).cloned() else {
+        return;
+    };
+    let Some((color, note)) = show_bookmark_edit_dialog(app, &bookmark) else {
+        return;
+    };
+    app.bookmarks.set_annotation(offset, color, &note);
+    if let (Some(path), Some(stamp)) = (
+        app.editor.path().map(|p| p.to_string_lossy().into_owned()),
+        app.doc_stamp,
+    ) {
+        if app
+            .bookmark_store
+            .set_annotation(&path, stamp, offset, color, &note)
+        {
+            let _ = app
+                .bookmark_store
+                .save_to(&crate::bookmarks::bookmarks_path());
+            load_session_bookmarks(app);
+        }
+    }
+    invalidate(app);
+}
+
+// ---- Extract Ranges dialog (slice R4c, item 2) ---------------
+
+const SLICE_CLASS: &str = "VeloEditSlice";
+const ID_SLICE_EDIT: usize = 5401;
+const ID_SLICE_OK: usize = 5402;
+const ID_SLICE_CANCEL: usize = 5403;
+
+struct SliceDialogState {
+    app: *mut App,
+    edit: HWND,
+    result: Option<String>,
+}
+
+const PROP_SLICE_OLD: &str = "VeloEdit.SliceOldProc";
+const PROP_SLICE_DLG: &str = "VeloEdit.SliceDlg";
+
+/// Subclass the slice dialog's edit so Enter confirms and Esc
+/// cancels — the same property-based trick as the prompt dialog.
+fn subclass_slice_edit(edit: HWND, dlg: HWND) {
+    let name_old = wstr(PROP_SLICE_OLD);
+    let name_dlg = wstr(PROP_SLICE_DLG);
+    // SAFETY: `edit` is our child window; the old proc is stored
+    // in a window property before the new proc is installed.
+    unsafe {
+        let old = SetWindowLongPtrW(
+            edit,
+            GWLP_WNDPROC,
+            slice_edit_proc as *const () as usize as isize,
+        );
+        SetPropW(edit, name_old.as_ptr(), old as HANDLE);
+        SetPropW(edit, name_dlg.as_ptr(), dlg as HANDLE);
+    }
+}
+
+unsafe extern "system" fn slice_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let name_old = wstr(PROP_SLICE_OLD);
+    let name_dlg = wstr(PROP_SLICE_DLG);
+    // SAFETY: the props were stored by subclass_slice_edit before
+    // this proc was installed, and are removed at WM_NCDESTROY.
+    let old = unsafe { GetPropW(hwnd, name_old.as_ptr()) } as isize;
+    let dlg = unsafe { GetPropW(hwnd, name_dlg.as_ptr()) } as HWND;
+    if msg == WM_KEYDOWN {
+        let cmd = match wparam as u32 {
+            0x0D => Some(ID_SLICE_OK),     // Enter: confirm
+            0x1B => Some(ID_SLICE_CANCEL), // Esc: cancel
+            _ => None,
+        };
+        if let Some(cmd) = cmd {
+            // SAFETY: `dlg` is the slice dialog stored at subclass
+            // time; the command is handled there.
+            unsafe { PostMessageW(dlg, WM_COMMAND, cmd, 0) };
+            return 0;
+        }
+    }
+    if msg == WM_NCDESTROY {
+        // SAFETY: restore the original proc and drop our props.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
+            RemovePropW(hwnd, name_old.as_ptr());
+            RemovePropW(hwnd, name_dlg.as_ptr());
+        }
+    }
+    let proc_fn: WNDPROC = unsafe { std::mem::transmute(old) };
+    // SAFETY: proc_fn is the edit control's original window
+    // procedure, retrieved from our own property above.
+    unsafe { CallWindowProcW(proc_fn, hwnd, msg, wparam, lparam) }
+}
+
+unsafe extern "system" fn slice_dialog_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CREATE {
+        // SAFETY: lparam is the CREATESTRUCTW from CreateWindowExW,
+        // whose lpCreateParams is the caller's SliceDialogState.
+        let create = unsafe { &*(lparam as *const CREATESTRUCTW) };
+        let state_ptr = create.lpCreateParams as *mut SliceDialogState;
+        // SAFETY: storing the state pointer for the dialog's life.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
+        // SAFETY: the state outlives the dialog (caller's frame).
+        let state = unsafe { &mut *state_ptr };
+        // SAFETY: the App is alive and exclusively ours on this thread.
+        let app = unsafe { &*state.app };
+        let scale = app.scale();
+        let px = |dip: f32| (dip * scale).round() as i32;
+        let place = |child: HWND, x: f32, y: f32, w: f32, h: f32| {
+            // SAFETY: reparent and position our fresh child window.
+            unsafe {
+                SetParent(child, hwnd);
+                MoveWindow(child, px(x), px(y), px(w), px(h), 1);
+            }
+        };
+        let hint = create_child(
+            app,
+            "Static",
+            "Ranges to extract, in ascending order, separated by ;\nByte ranges count both ends in: 0-1023  ·  0x1000-0x1FFF\nLine ranges take whole lines with endings: L10-L20",
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+        );
+        place(hint, 12.0, 10.0, 424.0, 48.0);
+        let edit_style = WS_CHILD | WS_VISIBLE | 0x80; // ES_AUTOHSCROLL
+        let edit = create_child(app, "Edit", "", edit_style, WS_EX_CLIENTEDGE, ID_SLICE_EDIT);
+        place(edit, 12.0, 62.0, 424.0, 24.0);
+        state.edit = edit;
+        subclass_slice_edit(edit, hwnd);
+        // SAFETY: focus the spec field.
+        unsafe { SetFocus(edit) };
+        let button_style = WS_CHILD | WS_VISIBLE | 0xB; // BS_OWNERDRAW
+        let ok = create_child(app, "Button", "Extract", button_style, 0, ID_SLICE_OK);
+        let cancel = create_child(app, "Button", "Cancel", button_style, 0, ID_SLICE_CANCEL);
+        place(ok, 268.0, 96.0, 80.0, 24.0);
+        place(cancel, 356.0, 96.0, 80.0, 24.0);
+        return 0;
+    }
+    // SAFETY: the state pointer was stored at WM_CREATE.
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SliceDialogState;
+    if state_ptr.is_null() {
+        // SAFETY: default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    // SAFETY: the state outlives the dialog (see WM_CREATE).
+    let state = unsafe { &mut *state_ptr };
+    match msg {
+        WM_COMMAND => {
+            match wparam & 0xFFFF {
+                ID_SLICE_OK => {
+                    // SAFETY: our edit control.
+                    state.result = Some(unsafe { window_text(state.edit) });
+                    // SAFETY: our dialog window.
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                ID_SLICE_CANCEL => {
+                    // SAFETY: our dialog window.
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            // SAFETY: closing is cancelling.
+            unsafe { DestroyWindow(hwnd) };
+            0
+        }
+        WM_DRAWITEM => {
+            // SAFETY: the App is alive (modal dialog, UI thread).
+            let app = unsafe { &*state.app };
+            draw_dialog_button(app, lparam)
+        }
+        // SAFETY: default handling for everything else.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Show the Extract Ranges spec dialog (the Split dialog's modal
+/// pattern). Returns the confirmed spec text, or `None` on cancel.
+fn show_slice_dialog(app: &mut App) -> Option<String> {
+    let mut state = SliceDialogState {
+        app: app as *mut App,
+        edit: std::ptr::null_mut(),
+        result: None,
+    };
+    let class = wstr(SLICE_CLASS);
+    let title = wstr("Extract Ranges");
+    // SAFETY: the slice class is registered in run_gui; the state
+    // travels in lpCreateParams and lives in this stack frame
+    // until the dialog is destroyed (the modal loop below).
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            app.px(460.0),
+            app.px(168.0),
+            app.hwnd,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            &mut state as *mut SliceDialogState as *const c_void,
+        )
+    };
+    if hwnd.is_null() {
+        return None;
+    }
+    // SAFETY: modal behaviour, exactly like the Split dialog.
+    unsafe {
+        EnableWindow(app.hwnd, 0);
+        ShowWindow(hwnd, SW_SHOW);
+    }
+    loop {
+        // SAFETY: MSG is a plain C struct; GetMessageW fills it.
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; 0 = WM_QUIT, -1 = error.
+        let result = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+        if result <= 0 {
+            // SAFETY: preserve the quit for the main loop.
+            unsafe { PostQuitMessage(0) };
+            break;
+        }
+        // SAFETY: standard message pumping.
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        // SAFETY: a plain liveness query on our dialog.
+        if unsafe { IsWindow(hwnd) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: restore the main window and give it the focus back.
+    unsafe {
+        EnableWindow(app.hwnd, 1);
+        SetFocus(app.hwnd);
+    }
+    state.result
+}
+
+/// File ▸ Extract Ranges… (slice R4c, item 2): ask for a spec,
+/// then an output path, then stream the ranges out through the
+/// slicing core. Line ranges need the complete line index: while
+/// it is still building, the core's own error says so, verbatim.
+fn do_extract_ranges(app: &mut App) {
+    let Some(spec) = show_slice_dialog(app) else {
+        return;
+    };
+    let Some(out_path) = file_dialog(app, true, Some("extract.bin")) else {
+        return;
+    };
+    if app.editor.path() == Some(out_path.as_path()) {
+        message_box(
+            app.hwnd,
+            "The extract cannot overwrite the file it reads from. Pick a different output name.",
+            "Extract Ranges",
+            MB_OK | MB_ICONERROR,
+        );
+        return;
+    }
+    let index = app.editor.line_index_snapshot();
+    let result = (|| -> Result<crate::slicing::ExtractReport, crate::slicing::SliceError> {
+        let mut file = std::fs::File::create(&out_path).map_err(crate::slicing::SliceError::Io)?;
+        crate::slicing::extract_ranges(app.editor.table(), index.as_ref(), &spec, &mut file)
+    })();
+    match result {
+        Ok(report) => {
+            app.status_note = Some(format!(
+                "Extracted {} range(s) \u{2014} {} bytes written to {}",
+                report.ranges,
+                report.bytes_written,
+                out_path.display()
+            ));
+            refresh_status(app);
+        }
+        Err(err) => {
+            message_box(
+                app.hwnd,
+                &format!("{err}"),
+                "Extract Ranges",
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
+
+/// File ▸ Export Delta Patch… (slice R4c, item 3): write the
+/// VELOPAT1 patch for the current edits against the on-disk
+/// original. The menu greys this unless the document is dirty
+/// and backed; the checks repeat here for safety.
+fn do_export_patch(app: &mut App) {
+    if app.editor.path().is_none() || !app.editor.is_dirty() {
+        return;
+    }
+    let Some(dest) = file_dialog(app, true, Some("delta.velopat")) else {
+        return;
+    };
+    let Some(mmap) = &app.doc_mmap else {
+        message_box(
+            app.hwnd,
+            "The original file is not available, so no patch can be built.",
+            "Export Delta Patch",
+            MB_OK | MB_ICONERROR,
+        );
+        return;
+    };
+    let original = mmap.as_slice();
+    let read_original = |offset: u64, out: &mut [u8]| -> usize {
+        let start = offset as usize;
+        if start >= original.len() {
+            return 0;
+        }
+        let n = out.len().min(original.len() - start);
+        out[..n].copy_from_slice(&original[start..start + n]);
+        n
+    };
+    let patch =
+        match crate::op_build_patch(original.len() as u64, read_original, app.editor.table()) {
+            Ok(patch) => patch,
+            Err(err) => {
+                message_box(
+                    app.hwnd,
+                    &format!("The patch could not be built: {err}"),
+                    "Export Delta Patch",
+                    MB_OK | MB_ICONERROR,
+                );
+                return;
+            }
+        };
+    match std::fs::write(&dest, patch.to_bytes()) {
+        Ok(()) => {
+            app.status_note = Some(format!(
+                "Delta patch written: {} hunk(s), original {} bytes \u{2192} result {} bytes",
+                patch.hunks.len(),
+                patch.original_len,
+                patch.result_len
+            ));
+            refresh_status(app);
+        }
+        Err(err) => {
+            message_box(
+                app.hwnd,
+                &format!("The patch could not be written: {err}"),
+                "Export Delta Patch",
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
+
+/// File ▸ Apply Patch… (slice R4c, item 3): apply a VELOPAT1
+/// patch whose base is the current document's file, writing the
+/// result to a NEW file (Save As semantics — the base is never
+/// overwritten in place).
+fn do_apply_patch(app: &mut App) {
+    let Some(base) = app.editor.path().map(|p| p.to_path_buf()) else {
+        message_box(
+            app.hwnd,
+            "Open a file first \u{2014} a patch applies to the file of the document in the window.",
+            "Apply Patch",
+            MB_OK | MB_ICONERROR,
+        );
+        return;
+    };
+    let Some(patch_path) = file_dialog(app, false, None) else {
+        return;
+    };
+    let patch = match std::fs::read(&patch_path)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| crate::patch::Patch::from_bytes(&bytes).map_err(|e| e.to_string()))
+    {
+        Ok(patch) => patch,
+        Err(message) => {
+            message_box(
+                app.hwnd,
+                &format!("That is not a usable VeloEdit patch: {message}"),
+                "Apply Patch",
+                MB_OK | MB_ICONERROR,
+            );
+            return;
+        }
+    };
+    let Some(out_path) = file_dialog(app, true, Some("patched.bin")) else {
+        return;
+    };
+    if out_path == base {
+        message_box(
+            app.hwnd,
+            "The result cannot overwrite the file the patch is based on. Pick a different name.",
+            "Apply Patch",
+            MB_OK | MB_ICONERROR,
+        );
+        return;
+    }
+    let result = (|| -> Result<u64, String> {
+        let mut base_file = std::fs::File::open(&base).map_err(|e| e.to_string())?;
+        let base_len = base_file.metadata().map_err(|e| e.to_string())?.len();
+        let mut out_file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
+        crate::patch::apply_patch(
+            base_len,
+            |offset: u64, out: &mut [u8]| -> usize {
+                use std::io::{Read, Seek, SeekFrom};
+                if base_file.seek(SeekFrom::Start(offset)).is_err() {
+                    return 0;
+                }
+                base_file.read(out).unwrap_or(0)
+            },
+            &patch,
+            &mut out_file,
+        )
+        .map_err(|e| e.to_string())
+    })();
+    match result {
+        Ok(written) => {
+            app.status_note = Some(format!(
+                "Patch applied \u{2014} {written} bytes written to {}",
+                out_path.display()
+            ));
+            refresh_status(app);
+        }
+        Err(message) => {
+            message_box(
+                app.hwnd,
+                &format!("The patch could not be applied: {message}"),
+                "Apply Patch",
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
+
+/// Edit ▸ Insert Zeroes… (slice R4c, item 4): a run of zero
+/// bytes at the caret, one undo entry, via the editor op.
+fn do_insert_zeroes(app: &mut App) {
+    let Some(text) = show_prompt(
+        app,
+        "Insert Zeroes",
+        "Zero bytes to insert at the caret (a number, or a K / M / G suffix):",
+        "",
+    ) else {
+        return;
+    };
+    match crate::cli::parse_size(text.trim()) {
+        Ok(count) if count > 0 => match app.editor.insert_zeroes(count) {
+            Ok(()) => after_edit(app),
+            Err(err) => {
+                message_box(
+                    app.hwnd,
+                    &format!("{err}"),
+                    "Insert Zeroes",
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+        },
+        _ => {
+            message_box(
+                app.hwnd,
+                "Enter a whole number of bytes, optionally with a K, M or G suffix \u{2014} for example 4096 or 4K.",
+                "Insert Zeroes",
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
+
+/// File ▸ Open as Administrator (slice R4c, item 8): relaunch
+/// elevated on the same file. The plain-words explanation comes
+/// BEFORE the UAC prompt, per the house rule — the message box
+/// is the explanation; only an OK reaches ShellExecuteW.
+fn do_open_admin(app: &mut App) {
+    let Some(path) = app.editor.path().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    let answer = message_box(
+        app.hwnd,
+        "This opens a new VeloEdit window as administrator on the same file.\n\nWindows will ask you to approve it with a User Account Control prompt. The new window runs with full rights, so only do this when a file truly needs them \u{2014} working around a read-only mark usually does not.\n\nOpen the administrator window?",
+        "Open as Administrator",
+        MB_OKCANCEL | MB_ICONINFORMATION,
+    );
+    if answer != IDOK {
+        return;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let verb = wstr("runas");
+    let file = wstr(&exe.to_string_lossy());
+    let params = wstr(&format!("\"{}\"", path.display()));
+    // SAFETY: the strings are NUL-terminated and outlive the
+    // call; a null parent and directory are permitted. A return
+    // value of 32 or less is the documented failure signal.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result as usize) <= 32 {
+        message_box(
+            app.hwnd,
+            "Windows did not open the administrator window.",
+            "Open as Administrator",
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+// ---- Compare With dialog (slice R4c, item 11) ----------------
+
+const COMPARE_CLASS: &str = "VeloEditCompare";
+const ID_CMP_LIST: usize = 5451;
+const ID_CMP_GOTO: usize = 5452;
+const ID_CMP_CLOSE: usize = 5453;
+const TIMER_CMP: usize = 8;
+
+/// The compare worker's one-shot result slot.
+type CompareSlot =
+    std::sync::Arc<std::sync::Mutex<Option<Result<crate::structdiff::StructDiffReport, String>>>>;
+
+struct CompareDialogState {
+    app: *mut App,
+    slot: CompareSlot,
+    note: HWND,
+    list: HWND,
+    report: Option<crate::structdiff::StructDiffReport>,
+    chosen: Option<u64>,
+    done: bool,
+}
+
+unsafe extern "system" fn compare_dialog_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CREATE {
+        // SAFETY: lparam is the CREATESTRUCTW from CreateWindowExW,
+        // whose lpCreateParams is the caller's CompareDialogState.
+        let create = unsafe { &*(lparam as *const CREATESTRUCTW) };
+        let state_ptr = create.lpCreateParams as *mut CompareDialogState;
+        // SAFETY: storing the state pointer for the dialog's life.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
+        // SAFETY: the state outlives the dialog (caller's frame).
+        let state = unsafe { &mut *state_ptr };
+        // SAFETY: the App is alive and exclusively ours on this thread.
+        let app = unsafe { &*state.app };
+        let scale = app.scale();
+        let px = |dip: f32| (dip * scale).round() as i32;
+        let place = |child: HWND, x: f32, y: f32, w: f32, h: f32| {
+            // SAFETY: reparent and position our fresh child window.
+            unsafe {
+                SetParent(child, hwnd);
+                MoveWindow(child, px(x), px(y), px(w), px(h), 1);
+            }
+        };
+        let note = create_child(
+            app,
+            "Static",
+            "Comparing\u{2026}",
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+        );
+        place(note, 12.0, 10.0, 432.0, 20.0);
+        state.note = note;
+        // ListBox: LBS_NOTIFY (0x1) | WS_VSCROLL | WS_BORDER.
+        let list_style = WS_CHILD | WS_VISIBLE | 0x1 | 0x0020_0000 | 0x0080_0000;
+        let list = create_child(app, "ListBox", "", list_style, 0, ID_CMP_LIST);
+        place(list, 12.0, 34.0, 432.0, 196.0);
+        state.list = list;
+        let button_style = WS_CHILD | WS_VISIBLE | 0xB; // BS_OWNERDRAW
+        let goto = create_child(app, "Button", "Go to", button_style, 0, ID_CMP_GOTO);
+        let close = create_child(app, "Button", "Close", button_style, 0, ID_CMP_CLOSE);
+        place(goto, 268.0, 240.0, 80.0, 24.0);
+        place(close, 356.0, 240.0, 88.0, 24.0);
+        // SAFETY: poll for the worker's report.
+        unsafe { SetTimer(hwnd, TIMER_CMP, 100, None) };
+        return 0;
+    }
+    // SAFETY: the state pointer was stored at WM_CREATE.
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut CompareDialogState;
+    if state_ptr.is_null() {
+        // SAFETY: default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    // SAFETY: the state outlives the dialog (see WM_CREATE).
+    let state = unsafe { &mut *state_ptr };
+    match msg {
+        WM_TIMER if wparam == TIMER_CMP => {
+            if !state.done {
+                let outcome = match state.slot.lock() {
+                    Ok(mut guard) => guard.take(),
+                    Err(_) => None,
+                };
+                if let Some(outcome) = outcome {
+                    state.done = true;
+                    // SAFETY: our timer; the report has arrived.
+                    unsafe { KillTimer(hwnd, TIMER_CMP) };
+                    match outcome {
+                        Ok(report) => {
+                            let add_line = |text: &str| {
+                                let wide = wstr(text);
+                                // SAFETY: LB_ADDSTRING (0x0180) on
+                                // our list box; the string outlives
+                                // the call.
+                                unsafe {
+                                    SendMessageW(state.list, 0x0180, 0, wide.as_ptr() as LPARAM);
+                                }
+                            };
+                            if report.equal() {
+                                // SAFETY: our static control.
+                                unsafe {
+                                    SetWindowTextW(
+                                        state.note,
+                                        wstr("The two files are identical.").as_ptr(),
+                                    );
+                                }
+                                add_line("No differing regions");
+                            } else {
+                                let first = report
+                                    .first_divergence
+                                    .map(|o| o.to_string())
+                                    .unwrap_or_else(|| "?".to_string());
+                                // SAFETY: our static control.
+                                unsafe {
+                                    SetWindowTextW(
+                                        state.note,
+                                        wstr(&format!(
+                                            "{} region(s) differ \u{00B7} first difference at byte {first}",
+                                            report.regions.len()
+                                        ))
+                                        .as_ptr(),
+                                    );
+                                }
+                                for region in &report.regions {
+                                    add_line(&format!(
+                                        "Offset {} \u{00B7} {} bytes",
+                                        region.offset, region.length
+                                    ));
+                                }
+                            }
+                            state.report = Some(report);
+                        }
+                        Err(message) => {
+                            // SAFETY: our static control.
+                            unsafe {
+                                SetWindowTextW(state.note, wstr(&message).as_ptr());
+                            }
+                        }
+                    }
+                }
+            }
+            0
+        }
+        WM_COMMAND => {
+            let id = wparam & 0xFFFF;
+            let code = (wparam >> 16) & 0xFFFF;
+            // LBN_DBLCLK (1) on the list acts as Go to.
+            if id == ID_CMP_GOTO || (id == ID_CMP_LIST && code == 1) {
+                // SAFETY: LB_GETCURSEL (0x0188) on our list box.
+                let sel = unsafe { SendMessageW(state.list, 0x0188, 0, 0) };
+                if sel >= 0 {
+                    if let Some(report) = &state.report {
+                        if let Some(region) = report.regions.get(sel as usize) {
+                            state.chosen = Some(region.offset);
+                            // SAFETY: our dialog window.
+                            unsafe { DestroyWindow(hwnd) };
+                        }
+                    }
+                }
+            } else if id == ID_CMP_CLOSE {
+                // SAFETY: our dialog window.
+                unsafe { DestroyWindow(hwnd) };
+            }
+            0
+        }
+        WM_CLOSE => {
+            // SAFETY: closing is cancelling.
+            unsafe { DestroyWindow(hwnd) };
+            0
+        }
+        WM_DRAWITEM => {
+            // SAFETY: the App is alive (modal dialog, UI thread).
+            let app = unsafe { &*state.app };
+            draw_dialog_button(app, lparam)
+        }
+        // SAFETY: default handling for everything else.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Show the Compare With results dialog; returns the region
+/// offset chosen via Go to, if any.
+fn show_compare_dialog(app: &mut App, slot: CompareSlot) -> Option<u64> {
+    let mut state = CompareDialogState {
+        app: app as *mut App,
+        slot,
+        note: std::ptr::null_mut(),
+        list: std::ptr::null_mut(),
+        report: None,
+        chosen: None,
+        done: false,
+    };
+    let class = wstr(COMPARE_CLASS);
+    let title = wstr("Compare With");
+    // SAFETY: the compare class is registered in run_gui; the
+    // state travels in lpCreateParams and lives in this stack
+    // frame until the dialog is destroyed (the modal loop below).
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            app.px(480.0),
+            app.px(312.0),
+            app.hwnd,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            &mut state as *mut CompareDialogState as *const c_void,
+        )
+    };
+    if hwnd.is_null() {
+        return None;
+    }
+    // SAFETY: modal behaviour, exactly like the Split dialog.
+    unsafe {
+        EnableWindow(app.hwnd, 0);
+        ShowWindow(hwnd, SW_SHOW);
+    }
+    loop {
+        // SAFETY: MSG is a plain C struct; GetMessageW fills it.
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; 0 = WM_QUIT, -1 = error.
+        let result = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+        if result <= 0 {
+            // SAFETY: preserve the quit for the main loop.
+            unsafe { PostQuitMessage(0) };
+            break;
+        }
+        // SAFETY: standard message pumping.
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        // SAFETY: a plain liveness query on our dialog.
+        if unsafe { IsWindow(hwnd) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: restore the main window and give it the focus back.
+    unsafe {
+        EnableWindow(app.hwnd, 1);
+        SetFocus(app.hwnd);
+    }
+    state.chosen
+}
+
+/// File ▸ Compare With… (slice R4c, item 11): pick a second
+/// file; the structural-diff core compares block by block on a
+/// worker (1 MB blocks, hand-written SHA-256), and the results
+/// dialog's Go to jumps the caret to a differing region.
+fn do_compare_with(app: &mut App) {
+    let Some(other_path) = file_dialog(app, false, None) else {
+        return;
+    };
+    let table = snapshot_table(app);
+    let slot: CompareSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let worker_slot = std::sync::Arc::clone(&slot);
+    std::thread::spawn(move || {
+        use std::io::{Read, Seek, SeekFrom};
+        let outcome = (|| -> Result<crate::structdiff::StructDiffReport, String> {
+            let mut file = std::fs::File::open(&other_path)
+                .map_err(|e| format!("The other file could not be opened: {e}"))?;
+            let len_b = file
+                .metadata()
+                .map_err(|e| format!("The other file could not be read: {e}"))?
+                .len();
+            let read_a = |offset: u64, out: &mut [u8]| table.read_into(offset, out);
+            let read_b = |offset: u64, out: &mut [u8]| -> usize {
+                if file.seek(SeekFrom::Start(offset)).is_err() {
+                    return 0;
+                }
+                file.read(out).unwrap_or(0)
+            };
+            Ok(crate::structdiff::compare_sources(
+                table.len(),
+                read_a,
+                len_b,
+                read_b,
+                crate::structdiff::DEFAULT_BLOCK_SIZE,
+            ))
+        })();
+        if let Ok(mut guard) = worker_slot.lock() {
+            *guard = Some(outcome);
+        }
+    });
+    if let Some(offset) = show_compare_dialog(app, slot) {
+        let from = app.editor.caret();
+        app.editor.move_caret_to(offset, false);
+        record_jump(app, from, offset);
+        after_caret_move(app);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // File Hashes dialog (roadmap item 37): a small modal window in the
 // Split dialog's pattern. A worker thread streams the file ON DISK
 // through the hash core (the file can be huge — nothing is loaded
-// into memory) and delivers the three digests through a slot the
-// dialog polls on a timer. The compare box checks pasted text
-// against whichever digest it equals.
+// into memory) and delivers the five digests (MD5, SHA-1, SHA-256,
+// CRC32, xxHash64 — one worker pass, slice R4c item 6) through a
+// slot the dialog polls on a timer. The compare box checks pasted
+// text against whichever digest it equals.
 // ---------------------------------------------------------------------------
 
 const HASH_CLASS: &str = "VeloEditHash";
@@ -5656,8 +7110,10 @@ struct HashDialogState {
     done: bool,
     compare: HWND,
     verdict: HWND,
-    /// The three digest value controls, MD5 / SHA-1 / SHA-256.
-    values: [HWND; 3],
+    /// The five digest value controls, MD5 / SHA-1 / SHA-256 /
+    /// CRC32 / xxHash64 (slice R4c, item 6: the two R4a-core
+    /// checksums ride the same worker pass).
+    values: [HWND; 5],
 }
 
 /// The compare verdict for the dialog: what `input` (the compare
@@ -5679,6 +7135,10 @@ fn hash_verdict(input: &str, hashes: Option<&crate::hash::FileHashes>) -> String
         "Matches SHA-1".to_string()
     } else if pasted == h.md5 {
         "Matches MD5".to_string()
+    } else if pasted == format!("{:08x}", h.crc32) {
+        "Matches CRC32".to_string()
+    } else if pasted == format!("{:016x}", h.xxhash64) {
+        "Matches xxHash64".to_string()
     } else {
         "No match".to_string()
     }
@@ -5743,11 +7203,11 @@ unsafe extern "system" fn hash_dialog_proc(
             0,
         );
         place(file, 12.0, 32.0, 536.0, 20.0);
-        let labels = ["MD5", "SHA-1", "SHA-256"];
+        let labels = ["MD5", "SHA-1", "SHA-256", "CRC32", "xxHash64"];
         for (i, label) in labels.iter().enumerate() {
             let y = 62.0 + i as f32 * 28.0;
             let lab = create_child(app, "Static", label, WS_CHILD | WS_VISIBLE, 0, 0);
-            place(lab, 12.0, y, 70.0, 22.0);
+            place(lab, 12.0, y, 76.0, 22.0);
             let val = create_child(
                 app,
                 "Static",
@@ -5756,11 +7216,11 @@ unsafe extern "system" fn hash_dialog_proc(
                 0,
                 0,
             );
-            place(val, 88.0, y, 460.0, 22.0);
+            place(val, 94.0, y, 454.0, 22.0);
             state.values[i] = val;
         }
         let cmp_label = create_child(app, "Static", "Compare:", WS_CHILD | WS_VISIBLE, 0, 0);
-        place(cmp_label, 12.0, 152.0, 56.0, 22.0);
+        place(cmp_label, 12.0, 208.0, 56.0, 22.0);
         let edit_style = WS_CHILD | WS_VISIBLE | 0x80; // ES_AUTOHSCROLL
         let compare = create_child(
             app,
@@ -5770,14 +7230,14 @@ unsafe extern "system" fn hash_dialog_proc(
             WS_EX_CLIENTEDGE,
             ID_HASH_COMPARE,
         );
-        place(compare, 74.0, 150.0, 474.0, 24.0);
+        place(compare, 74.0, 206.0, 474.0, 24.0);
         state.compare = compare;
         let verdict = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE, 0, 0);
-        place(verdict, 12.0, 182.0, 536.0, 22.0);
+        place(verdict, 12.0, 238.0, 536.0, 22.0);
         state.verdict = verdict;
         let button_style = WS_CHILD | WS_VISIBLE | 0xB; // BS_OWNERDRAW, like the Split dialog
         let close = create_child(app, "Button", "Close", button_style, 0, ID_HASH_CLOSE);
-        place(close, 468.0, 212.0, 80.0, 26.0);
+        place(close, 468.0, 268.0, 80.0, 26.0);
         // SAFETY: the poll timer on our dialog; a null TIMERPROC
         // means WM_TIMER messages.
         unsafe { SetTimer(hwnd, TIMER_HASH, 100, None) };
@@ -5800,10 +7260,14 @@ unsafe extern "system" fn hash_dialog_proc(
                     state.done = true;
                     // SAFETY: our dialog's timer and value statics.
                     unsafe { KillTimer(hwnd, TIMER_HASH) };
+                    let crc32 = format!("{:08X}", h.crc32);
+                    let xxhash64 = format!("{:016X}", h.xxhash64);
                     for (control, digest) in state.values.iter().zip([
                         h.md5.as_str(),
                         h.sha1.as_str(),
                         h.sha256.as_str(),
+                        crc32.as_str(),
+                        xxhash64.as_str(),
                     ]) {
                         let wide = wstr(digest);
                         // SAFETY: as above; the string outlives the call.
@@ -5895,7 +7359,7 @@ fn show_hash_dialog(
         done: false,
         compare: std::ptr::null_mut(),
         verdict: std::ptr::null_mut(),
-        values: [std::ptr::null_mut(); 3],
+        values: [std::ptr::null_mut(); 5],
     };
     let class = wstr(HASH_CLASS);
     let title = wstr("File Hashes");
@@ -5911,7 +7375,7 @@ fn show_hash_dialog(
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             app.px(584.0),
-            app.px(286.0),
+            app.px(342.0),
             app.hwnd,
             std::ptr::null_mut(),
             GetModuleHandleW(std::ptr::null()),
@@ -6770,17 +8234,40 @@ fn open_filter_prompt(app: &mut App) {
     };
     let text = text.trim().to_string();
     if text.is_empty() {
+        // Empty confirmation (slice R4c, item 12): with a filter
+        // active it EXITS the filter view (the caret never moved
+        // while filtering, so nothing needs restoring); with none
+        // active it simply closes the prompt.
+        if app.filter.is_some() {
+            exit_filter(app);
+        }
         return;
     }
     enter_filter(app, text);
 }
 
+/// Cancel a running background filter build (slice R4c, item
+/// 13): bump the generation so the worker's next publication is
+/// dropped, and clear the slot. Called on exit, on jump-to-line,
+/// on a new build, and on document open.
+fn cancel_filter_build(app: &mut App) {
+    app.filter_gen += 1;
+    if let Ok(mut guard) = app.filter_slot.lock() {
+        *guard = None;
+    }
+}
+
 /// Build the filter view for `pattern` and switch to it. The
 /// cursor starts on the row at (or nearest after) the caret's line,
 /// so Enter without moving returns to familiar ground.
+///
+/// Documents up to the background-find threshold build
+/// synchronously, as they always have. Larger documents build on
+/// a worker (slice R4c, item 13): the view opens immediately with
+/// no rows and fills in as the worker's snapshots attach on the
+/// tick — the window never freezes for a whole-document scan.
 fn enter_filter(app: &mut App, pattern: String) {
-    let enc = app.editor.encoding();
-    let needle = match crate::encoding::encode_needle(&pattern, enc) {
+    let needle = match app.editor.encode_text(&pattern) {
         Ok(needle) => needle,
         Err(_) => {
             message_box(
@@ -6793,6 +8280,11 @@ fn enter_filter(app: &mut App, pattern: String) {
         }
     };
     app.last_find_text = pattern.clone();
+    cancel_filter_build(app);
+    if app.editor.total_len() > BG_FIND_THRESHOLD {
+        start_bg_filter(app, pattern, needle);
+        return;
+    }
     // Consume the needle before borrowing it for the query: the
     // editor borrows the table itself, so the query's lifetime is
     // satisfied by keeping `needle` alive across the call.
@@ -6819,7 +8311,133 @@ fn enter_filter(app: &mut App, pattern: String) {
         pattern,
         first_row: 0,
         cursor_row,
+        building: false,
+        scanned: app.editor.total_len(),
     });
+    filter_ensure_cursor_visible(app);
+    refresh_status(app);
+    invalidate(app);
+}
+
+/// Start the background filter build for a large document (slice
+/// R4c, item 13): the filter view opens NOW with an empty
+/// in-progress view; a worker walks a snapshot of the document in
+/// [`BG_FIND_WINDOW`] windows, folding matches into a
+/// `crate::filter::FilterBuilder` and publishing snapshots into
+/// the filter slot, which the tick attaches (`service_filter_build`).
+/// The caller has already bumped the build generation via
+/// `cancel_filter_build`.
+fn start_bg_filter(app: &mut App, pattern: String, needle: Vec<u8>) {
+    let snapshot = snapshot_table(app);
+    let total = snapshot.len();
+    let doc_gen = app.doc_generation;
+    let filter_gen = app.filter_gen;
+    let slot = app.filter_slot.clone();
+    let empty = crate::filter::FilterBuilder::new(total).snapshot(false);
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(FilterProgress {
+            filter_gen,
+            doc_gen,
+            view: std::sync::Arc::new(empty.clone()),
+            scanned: 0,
+            done: false,
+        });
+    }
+    app.filter = Some(FilterState {
+        view: empty,
+        pattern,
+        first_row: 0,
+        cursor_row: 0,
+        building: true,
+        scanned: 0,
+    });
+    refresh_status(app);
+    invalidate(app);
+    std::thread::spawn(move || {
+        let options = SearchOptions::default();
+        let mut builder = crate::filter::FilterBuilder::new(total);
+        let mut end = 0u64;
+        loop {
+            end = (end + BG_FIND_WINDOW).min(total);
+            builder.advance(&snapshot, end, &needle, &options);
+            let done = builder.is_done();
+            let view = std::sync::Arc::new(builder.snapshot(done));
+            if let Ok(mut guard) = slot.lock() {
+                match guard.as_mut() {
+                    Some(progress)
+                        if progress.filter_gen == filter_gen && progress.doc_gen == doc_gen =>
+                    {
+                        progress.view = view;
+                        progress.scanned = builder.scanned();
+                        progress.done = done;
+                    }
+                    // Superseded or cancelled: stop quietly.
+                    _ => return,
+                }
+            }
+            if done {
+                return;
+            }
+        }
+    });
+}
+
+/// The tick's filter-build service (slice R4c, item 13): attach
+/// the worker's latest snapshot to the live filter view. The
+/// cursor follows its line across snapshots (the first attach
+/// positions it at the caret's line, like the synchronous build);
+/// when the final snapshot lands, the banner's progress note
+/// clears and the view is complete.
+fn service_filter_build(app: &mut App) {
+    let snapshot = match app.filter_slot.try_lock() {
+        Ok(guard) => guard.as_ref().and_then(|progress| {
+            if progress.filter_gen == app.filter_gen && progress.doc_gen == app.doc_generation {
+                Some((progress.view.clone(), progress.scanned, progress.done))
+            } else {
+                None
+            }
+        }),
+        Err(_) => None,
+    };
+    let Some((view, scanned, done)) = snapshot else {
+        return;
+    };
+    let caret_line = app.editor.line_col_of(app.editor.caret()).0;
+    let Some(filter) = &mut app.filter else {
+        return;
+    };
+    if !filter.building {
+        return;
+    }
+    let first_attach = filter.scanned == 0;
+    let cursor_line = filter
+        .view
+        .line_at_row(filter.cursor_row)
+        .map(|line| line.line_no);
+    filter.view = (*view).clone();
+    filter.scanned = scanned;
+    if done {
+        filter.building = false;
+    }
+    if first_attach {
+        filter.cursor_row = if filter.view.is_empty() {
+            0
+        } else {
+            filter.view.row_of_line(caret_line).unwrap_or_else(|| {
+                let after = filter
+                    .view
+                    .lines()
+                    .partition_point(|line| line.line_no < caret_line);
+                after.min(filter.view.len() - 1)
+            })
+        };
+    } else if let Some(line_no) = cursor_line {
+        filter.cursor_row = filter
+            .view
+            .row_of_line(line_no)
+            .unwrap_or(filter.cursor_row)
+            .min(filter.view.len().saturating_sub(1));
+    }
     filter_ensure_cursor_visible(app);
     refresh_status(app);
     invalidate(app);
@@ -6827,6 +8445,7 @@ fn enter_filter(app: &mut App, pattern: String) {
 
 /// Leave the filter view without moving the caret.
 fn exit_filter(app: &mut App) {
+    cancel_filter_build(app);
     if app.filter.take().is_some() {
         refresh_status(app);
         invalidate(app);
@@ -6846,6 +8465,7 @@ fn filter_jump_to_cursor(app: &mut App) {
     };
     let from = app.editor.caret();
     app.filter = None;
+    cancel_filter_build(app);
     app.editor.move_caret_to(line.start, false);
     record_jump(app, from, line.start);
     after_caret_move(app);
@@ -6889,6 +8509,12 @@ fn rebuild_filter_if_stale(app: &mut App) {
     let Some(filter) = &app.filter else {
         return;
     };
+    if filter.building {
+        // A background build owns this view (slice R4c, item 13);
+        // its snapshots already cover the whole document when
+        // they finish, index or no index.
+        return;
+    }
     if filter.view.is_complete() {
         return;
     }
@@ -6897,8 +8523,7 @@ fn rebuild_filter_if_stale(app: &mut App) {
         .view
         .line_at_row(filter.cursor_row)
         .map(|line| line.line_no);
-    let enc = app.editor.encoding();
-    let Ok(needle) = crate::encoding::encode_needle(&pattern, enc) else {
+    let Ok(needle) = app.editor.encode_text(&pattern) else {
         return;
     };
     let Some(view) = app.editor.filter_view(crate::filter::FilterQuery::literal(
@@ -7859,6 +9484,17 @@ fn menu_popup(bar: HMENU, popup: HMENU, text: &str) {
     unsafe { AppendMenuW(bar, MF_POPUP, popup as usize, wide.as_ptr()) };
 }
 
+/// A menu label with the effective chord for `action` appended as
+/// the accelerator text (slice R4c, item 48): when the owner has
+/// rebound or unbound the action in `data/keybindings.json`, the
+/// menu shows the chord that actually works — or none.
+fn menu_label(app: &App, base: &str, action: &str) -> String {
+    match app.keybindings.label_for(action) {
+        Some(label) => format!("{base}\t{label}"),
+        None => base.to_string(),
+    }
+}
+
 fn build_menus(app: &mut App) {
     // SAFETY: the whole menu tree is built from fresh popup menus and
     // installed on our window; nothing else holds these handles.
@@ -7867,12 +9503,18 @@ fn build_menus(app: &mut App) {
 
         let file = CreatePopupMenu();
         app.file_menu = file;
-        menu_item(file, CMD_OPEN, "Open\tCtrl+O");
-        menu_item(file, CMD_SAVE, "Save\tCtrl+S");
+        menu_item(file, CMD_OPEN, &menu_label(app, "Open", "open"));
+        menu_item(file, CMD_SAVE, &menu_label(app, "Save", "save"));
         menu_item(file, CMD_SAVE_AS, "Save As\u{2026}");
         menu_item(file, CMD_SAVE_SELECTION, "Save Selection to File\u{2026}");
         menu_item(file, CMD_SPLIT_FILE, "Split File Copy\u{2026}");
         menu_item(file, CMD_FILE_HASHES, "File Hashes\u{2026}");
+        // Slice R4c: slicing export, delta patches, structural
+        // compare (items 2, 3 and 43).
+        menu_item(file, CMD_EXTRACT_RANGES, "Extract Ranges\u{2026}");
+        menu_item(file, CMD_EXPORT_PATCH, "Export Delta Patch\u{2026}");
+        menu_item(file, CMD_APPLY_PATCH, "Apply Patch\u{2026}");
+        menu_item(file, CMD_COMPARE_WITH, "Compare With\u{2026}");
         // Save Options (roadmap items 31/32): two radio groups —
         // what happens to line endings and to the byte-order mark
         // on every save. The choices persist in settings.
@@ -7913,50 +9555,107 @@ fn build_menus(app: &mut App) {
         menu_popup(file, app.recent_menu, "Recent");
         menu_sep(file);
         menu_item(file, CMD_EXPLORER_MENU, "Explorer Menu Item");
+        // Protected files (item 33): relaunch elevated on the
+        // current file (the handler explains before the UAC
+        // prompt; greyed while no file is open — see
+        // WM_INITMENUPOPUP).
+        menu_item(file, CMD_OPEN_ADMIN, "Open as Administrator");
         menu_sep(file);
         menu_item(file, CMD_EXIT, "Exit");
 
         let edit = CreatePopupMenu();
-        menu_item(edit, CMD_UNDO, "Undo\tCtrl+Z");
-        menu_item(edit, CMD_REDO, "Redo\tCtrl+Y");
+        menu_item(edit, CMD_UNDO, &menu_label(app, "Undo", "undo"));
+        menu_item(edit, CMD_REDO, &menu_label(app, "Redo", "redo"));
         menu_sep(edit);
-        menu_item(edit, CMD_CUT, "Cut\tCtrl+X");
-        menu_item(edit, CMD_COPY, "Copy\tCtrl+C");
-        menu_item(edit, CMD_PASTE, "Paste\tCtrl+V");
+        menu_item(edit, CMD_CUT, &menu_label(app, "Cut", "cut"));
+        menu_item(edit, CMD_COPY, &menu_label(app, "Copy", "copy"));
+        menu_item(edit, CMD_PASTE, &menu_label(app, "Paste", "paste"));
         menu_sep(edit);
-        menu_item(edit, CMD_FIND, "Find\tCtrl+F");
-        menu_item(edit, CMD_REPLACE, "Replace\tCtrl+H");
+        menu_item(edit, CMD_FIND, &menu_label(app, "Find", "find"));
+        menu_item(edit, CMD_REPLACE, &menu_label(app, "Replace", "replace"));
         menu_sep(edit);
-        menu_item(edit, CMD_SELECT_ALL, "Select All\tCtrl+A");
+        menu_item(
+            edit,
+            CMD_SELECT_ALL,
+            &menu_label(app, "Select All", "select_all"),
+        );
+        menu_item(edit, CMD_INSERT_ZEROES, "Insert Zeroes\u{2026}");
         menu_sep(edit);
         menu_item(edit, CMD_SORT_LINES, "Sort Lines in Selection");
         menu_item(edit, CMD_DEDUP_LINES, "Remove Duplicate Lines in Selection");
 
         let search = CreatePopupMenu();
-        menu_item(search, CMD_FIND, "Find\u{2026}\tCtrl+F");
-        menu_item(search, CMD_REPLACE, "Replace\u{2026}\tCtrl+H");
+        menu_item(search, CMD_FIND, &menu_label(app, "Find\u{2026}", "find"));
+        menu_item(
+            search,
+            CMD_REPLACE,
+            &menu_label(app, "Replace\u{2026}", "replace"),
+        );
         menu_sep(search);
-        menu_item(search, CMD_FIND_NEXT, "Find Next\tF3");
-        menu_item(search, CMD_FIND_PREV, "Find Previous\tShift+F3");
+        menu_item(
+            search,
+            CMD_FIND_NEXT,
+            &menu_label(app, "Find Next", "find_next"),
+        );
+        menu_item(
+            search,
+            CMD_FIND_PREV,
+            &menu_label(app, "Find Previous", "find_prev"),
+        );
         menu_sep(search);
         // Structural filter (roadmap item 18) and the jump history
-        // (item 11 wiring).
+        // (item 11 wiring). Clear Filter (slice R4c, item 12) is
+        // enabled only while a filter is up (WM_INITMENUPOPUP).
         menu_item(search, CMD_FILTER, "Filter\u{2026}");
+        menu_item(search, CMD_CLEAR_FILTER, "Clear Filter");
         menu_sep(search);
-        menu_item(search, CMD_JUMP_BACK, "Back\tAlt+Left");
-        menu_item(search, CMD_JUMP_FORWARD, "Forward\tAlt+Right");
+        // Bookmarks (roadmap item 20) with the annotation editor
+        // (slice R4c, item 5).
+        let bookmarks_menu = CreatePopupMenu();
+        menu_item(
+            bookmarks_menu,
+            CMD_BOOKMARK_TOGGLE,
+            &menu_label(app, "Toggle Bookmark", "toggle_bookmark"),
+        );
+        menu_item(
+            bookmarks_menu,
+            CMD_BOOKMARK_NEXT,
+            &menu_label(app, "Next Bookmark", "bookmark_next"),
+        );
+        menu_item(
+            bookmarks_menu,
+            CMD_BOOKMARK_PREV,
+            &menu_label(app, "Previous Bookmark", "bookmark_prev"),
+        );
+        menu_item(bookmarks_menu, CMD_BOOKMARK_EDIT, "Edit Bookmark\u{2026}");
+        menu_popup(search, bookmarks_menu, "Bookmarks");
+        menu_sep(search);
+        menu_item(search, CMD_JUMP_BACK, &menu_label(app, "Back", "jump_back"));
+        menu_item(
+            search,
+            CMD_JUMP_FORWARD,
+            &menu_label(app, "Forward", "jump_forward"),
+        );
 
         let view = CreatePopupMenu();
         app.view_menu = view;
         menu_item(view, CMD_MODE_TEXT, "Text Mode");
-        menu_item(view, CMD_MODE_HEX, "Hex Mode\tF6");
+        menu_item(
+            view,
+            CMD_MODE_HEX,
+            &menu_label(app, "Hex Mode", "toggle_hex"),
+        );
         menu_sep(view);
         menu_item(view, CMD_INSPECTOR, "Data Inspector");
         menu_item(view, CMD_STRINGS, "Strings Pane");
         menu_sep(view);
         // Roadmap slice R4b view features. Follow Tail and Word
         // Wrap persist; the rest are session view switches.
-        menu_item(view, CMD_FOLLOW_TAIL, "Follow Tail");
+        menu_item(
+            view,
+            CMD_FOLLOW_TAIL,
+            &menu_label(app, "Follow Tail", "follow_tail"),
+        );
         menu_item(view, CMD_WORD_WRAP, "Word Wrap");
         menu_sep(view);
         menu_item(view, CMD_GRID, "Delimiter Grid");
@@ -7982,8 +9681,16 @@ fn build_menus(app: &mut App) {
         menu_item(app.accent_menu, CMD_ACCENT_CUSTOM, "Custom\u{2026}");
         menu_popup(view, app.accent_menu, "Accent");
         menu_sep(view);
-        menu_item(view, CMD_FONT_BIGGER, "Font Size +\tCtrl++");
-        menu_item(view, CMD_FONT_SMALLER, "Font Size \u{2212}\tCtrl+-");
+        menu_item(
+            view,
+            CMD_FONT_BIGGER,
+            &menu_label(app, "Font Size +", "font_bigger"),
+        );
+        menu_item(
+            view,
+            CMD_FONT_SMALLER,
+            &menu_label(app, "Font Size \u{2212}", "font_smaller"),
+        );
         menu_sep(view);
         menu_item(view, CMD_VIEW_RULER, "Column Ruler");
         menu_sep(view);
@@ -8025,14 +9732,41 @@ fn build_menus(app: &mut App) {
         menu_item(view, CMD_REL_OFFSETS, "Relative Offsets");
         menu_item(view, CMD_SET_OFFSET_BASE, "Set Offset Base at Caret");
 
+        // Encoding (slice R4c, item 29): the four standard
+        // encodings as radios, plus the Code Pages submenu for
+        // the legacy single/double-byte pages. Detection is
+        // unchanged — a page is only ever active because the
+        // owner picked it here.
+        let encoding = CreatePopupMenu();
+        app.encoding_menu = encoding;
+        for (i, name) in ["UTF-8", "UTF-16 LE", "UTF-16 BE", "ANSI (Windows-1252)"]
+            .iter()
+            .enumerate()
+        {
+            menu_item(encoding, CMD_ENC_BASE + i, name);
+        }
+        menu_sep(encoding);
+        app.codepage_menu = CreatePopupMenu();
+        menu_item(app.codepage_menu, CMD_CODEPAGE_BASE, "None (detected)");
+        menu_sep(app.codepage_menu);
+        for (i, page) in crate::encoding::CodePage::ALL.iter().enumerate() {
+            menu_item(
+                app.codepage_menu,
+                CMD_CODEPAGE_BASE + 1 + i,
+                page.display_name(),
+            );
+        }
+        menu_popup(encoding, app.codepage_menu, "Code Pages");
+
         let help = CreatePopupMenu();
-        menu_item(help, CMD_GUIDE, "Built-in Guide\tF1");
+        menu_item(help, CMD_GUIDE, &menu_label(app, "Built-in Guide", "guide"));
         menu_item(help, CMD_ABOUT, "About VeloEdit");
 
         menu_popup(bar, file, "File");
         menu_popup(bar, edit, "Edit");
         menu_popup(bar, search, "Search");
         menu_popup(bar, view, "View");
+        menu_popup(bar, encoding, "Encoding");
         menu_popup(bar, help, "Help");
         SetMenu(app.hwnd, bar);
     }
@@ -8179,6 +9913,52 @@ fn refresh_menu_checks(app: &App) {
                 id as u32,
                 MF_BYCOMMAND | if on { MF_CHECKED } else { 0 },
             );
+        }
+        // Encoding radios and Code Pages checks (slice R4c, item
+        // 29): the standard group reflects the active standard
+        // encoding; while a code page is active no standard item
+        // is checked and the page's own item is.
+        if !app.encoding_menu.is_null() {
+            let enc_idx = match app.editor.codec() {
+                crate::encoding::TextCodec::Standard(crate::encoding::TextEncoding::Utf8) => {
+                    Some(0)
+                }
+                crate::encoding::TextCodec::Standard(crate::encoding::TextEncoding::Utf16Le) => {
+                    Some(1)
+                }
+                crate::encoding::TextCodec::Standard(crate::encoding::TextEncoding::Utf16Be) => {
+                    Some(2)
+                }
+                crate::encoding::TextCodec::Standard(crate::encoding::TextEncoding::Ansi) => {
+                    Some(3)
+                }
+                crate::encoding::TextCodec::Page(_) => None,
+            };
+            for i in 0..4 {
+                CheckMenuItem(
+                    app.encoding_menu,
+                    (CMD_ENC_BASE + i) as u32,
+                    MF_BYCOMMAND | if enc_idx == Some(i) { MF_CHECKED } else { 0 },
+                );
+            }
+        }
+        if !app.codepage_menu.is_null() {
+            let page_idx = match app.editor.code_page() {
+                None => 0,
+                Some(page) => {
+                    1 + crate::encoding::CodePage::ALL
+                        .iter()
+                        .position(|&p| p == page)
+                        .unwrap_or(0)
+                }
+            };
+            for i in 0..=crate::encoding::CodePage::ALL.len() {
+                CheckMenuItem(
+                    app.codepage_menu,
+                    (CMD_CODEPAGE_BASE + i) as u32,
+                    MF_BYCOMMAND | if i == page_idx { MF_CHECKED } else { 0 },
+                );
+            }
         }
         // Save Options radios (roadmap items 31/32).
         if !app.save_options_menu.is_null() {
@@ -8461,6 +10241,7 @@ fn on_command(app: &mut App, id: usize) {
                 | CMD_DO_REPLACE
                 | CMD_DO_REPLACE_ALL
                 | CMD_SAVE_SELECTION
+                | CMD_INSERT_ZEROES
         )
     {
         app.status_note = Some("Close the filter (Esc) to edit".to_string());
@@ -8803,6 +10584,79 @@ fn on_command(app: &mut App, id: usize) {
         CMD_FILTER => {
             open_filter_prompt(app);
         }
+        CMD_CLEAR_FILTER => {
+            exit_filter(app);
+        }
+        CMD_BOOKMARK_TOGGLE => {
+            toggle_bookmark(app);
+        }
+        CMD_BOOKMARK_NEXT => {
+            jump_bookmark(app, true);
+        }
+        CMD_BOOKMARK_PREV => {
+            jump_bookmark(app, false);
+        }
+        CMD_BOOKMARK_EDIT => {
+            // Edit the annotation of the bookmark on the caret's
+            // line (slice R4c, item 5).
+            let line = app.editor.line_col_of(app.editor.caret()).0;
+            match bookmark_on_line(app, line) {
+                Some(offset) => edit_bookmark_dialog(app, offset),
+                None => {
+                    app.status_note = Some("No bookmark on this line to edit".to_string());
+                    refresh_status(app);
+                }
+            }
+        }
+        CMD_INSERT_ZEROES => {
+            do_insert_zeroes(app);
+        }
+        CMD_EXTRACT_RANGES => {
+            do_extract_ranges(app);
+        }
+        CMD_EXPORT_PATCH => {
+            do_export_patch(app);
+        }
+        CMD_APPLY_PATCH => {
+            do_apply_patch(app);
+        }
+        CMD_COMPARE_WITH => {
+            do_compare_with(app);
+        }
+        CMD_OPEN_ADMIN => {
+            do_open_admin(app);
+        }
+        _ if (CMD_ENC_BASE..CMD_ENC_BASE + 4).contains(&id) => {
+            // Encoding menu (slice R4c, item 29): reinterpret the
+            // document under a standard encoding. The bytes do not
+            // change — only how they decode for display, typing
+            // and search, and what a save writes back.
+            let enc = [
+                encoding::TextEncoding::Utf8,
+                encoding::TextEncoding::Utf16Le,
+                encoding::TextEncoding::Utf16Be,
+                encoding::TextEncoding::Ansi,
+            ][id - CMD_ENC_BASE];
+            app.editor.set_encoding(enc);
+            refresh_menu_checks(app);
+            refresh_status(app);
+            invalidate(app);
+        }
+        _ if (CMD_CODEPAGE_BASE..=CMD_CODEPAGE_BASE + crate::encoding::CodePage::ALL.len())
+            .contains(&id) =>
+        {
+            // Code Pages submenu (slice R4c, item 29): 0 clears
+            // back to the detected standard encoding.
+            let page = if id == CMD_CODEPAGE_BASE {
+                None
+            } else {
+                Some(crate::encoding::CodePage::ALL[id - CMD_CODEPAGE_BASE - 1])
+            };
+            app.editor.set_code_page(page);
+            refresh_menu_checks(app);
+            refresh_status(app);
+            invalidate(app);
+        }
         CMD_JUMP_BACK => {
             jump_history_move(app, false);
         }
@@ -9034,6 +10888,85 @@ fn wrap_move(app: &mut App, up: bool, extend: bool) -> bool {
     true
 }
 
+/// Translate a virtual-key + modifier state into a keybinding
+/// chord (slice R4c, item 7). Keys outside the chord vocabulary
+/// (Backspace, Tab, …) return `None` and keep their hard-wired
+/// handling in [`on_keydown`].
+fn chord_from_vk(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<crate::keybindings::Chord> {
+    use crate::keybindings::{Key, NamedKey};
+    let key = match vk {
+        0x41..=0x5A | 0x30..=0x39 => Key::Char(char::from_u32(vk).unwrap_or('?')),
+        0x70..=0x87 => Key::Function((vk - 0x70 + 1) as u8),
+        0x25 => Key::Named(NamedKey::Left),
+        0x27 => Key::Named(NamedKey::Right),
+        0x26 => Key::Named(NamedKey::Up),
+        0x28 => Key::Named(NamedKey::Down),
+        0x24 => Key::Named(NamedKey::Home),
+        0x23 => Key::Named(NamedKey::End),
+        0x21 => Key::Named(NamedKey::PageUp),
+        0x22 => Key::Named(NamedKey::PageDown),
+        0x2E => Key::Named(NamedKey::Delete),
+        0x2D => Key::Named(NamedKey::Insert),
+        0x1B => Key::Named(NamedKey::Escape),
+        0x0D => Key::Named(NamedKey::Enter),
+        0x20 => Key::Named(NamedKey::Space),
+        0xBB => Key::Char('+'), // VK_OEM_PLUS
+        0xBD => Key::Char('-'), // VK_OEM_MINUS
+        _ => return None,
+    };
+    Some(crate::keybindings::Chord {
+        ctrl,
+        alt,
+        shift,
+        key,
+    })
+}
+
+/// Run one rebindable action by name (slice R4c, item 7): the
+/// keybinding dispatch table. Each arm is exactly the handler the
+/// hard-wired shortcut used to call, so default bindings behave
+/// identically to the pre-keybindings shell.
+fn dispatch_action(app: &mut App, action: &str) {
+    match action {
+        "open" => on_command(app, CMD_OPEN),
+        "save" => on_command(app, CMD_SAVE),
+        "save_as" => on_command(app, CMD_SAVE_AS),
+        "undo" => on_command(app, CMD_UNDO),
+        "redo" => on_command(app, CMD_REDO),
+        "cut" => on_command(app, CMD_CUT),
+        "copy" => on_command(app, CMD_COPY),
+        "paste" => on_command(app, CMD_PASTE),
+        "select_all" => {
+            app.editor.select_all();
+            after_caret_move(app);
+        }
+        "find" => on_command(app, CMD_FIND),
+        "replace" => on_command(app, CMD_REPLACE),
+        "find_next" => on_command(app, CMD_FIND_NEXT),
+        "find_prev" => on_command(app, CMD_FIND_PREV),
+        "toggle_hex" => on_command(app, CMD_MODE_TOGGLE),
+        "guide" => show_help(app),
+        "font_bigger" => on_command(app, CMD_FONT_BIGGER),
+        "font_smaller" => on_command(app, CMD_FONT_SMALLER),
+        "toggle_bookmark" => toggle_bookmark(app),
+        "bookmark_next" => jump_bookmark(app, true),
+        "bookmark_prev" => jump_bookmark(app, false),
+        "jump_back" => jump_history_move(app, false),
+        "jump_forward" => jump_history_move(app, true),
+        "pointer_follow" => {
+            // Ctrl+Enter: pointer following in hex mode (roadmap
+            // item 11 wiring).
+            if app.editor.mode() == EditorMode::Hex {
+                pointer_jump(app);
+            }
+        }
+        "follow_tail" => on_command(app, CMD_FOLLOW_TAIL),
+        "filter" => on_command(app, CMD_FILTER),
+        "clear_filter" => on_command(app, CMD_CLEAR_FILTER),
+        _ => {}
+    }
+}
+
 fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
     let vk = wparam as u32;
     // SAFETY: plain key-state reads (VK_CONTROL = 0x11, VK_SHIFT = 0x10).
@@ -9041,19 +10974,47 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
     let shift = unsafe { GetKeyState(0x10) } as u16 & 0x8000 != 0;
     let alt = unsafe { GetKeyState(0x12) } as u16 & 0x8000 != 0;
     let page = page_rows(app);
-    // Jump history (roadmap item 11 wiring): Alt+Left / Alt+Right
-    // walk it, in every mode.
-    if alt && (vk == 0x25 || vk == 0x27) {
+    // Keybindings (slice R4c, item 7): the merged chord map gets
+    // first claim on every key in its vocabulary. Unbound chords
+    // and keys outside the vocabulary fall through to the
+    // hard-wired navigation handling below, unchanged.
+    let chord = chord_from_vk(vk, ctrl, shift, alt);
+    let action = chord.and_then(|c| app.keybindings.action_for(&c));
+    // Jump history (roadmap item 11 wiring) works in every mode,
+    // including the filter view — as Alt+Left / Alt+Right always
+    // have. The second check preserves the pre-keybindings catch
+    // for Alt+Arrow with extra modifiers held.
+    if let Some(action) = action {
+        if action == "jump_back" || action == "jump_forward" {
+            dispatch_action(app, action);
+            return true;
+        }
+    }
+    if action.is_none() && alt && (vk == 0x25 || vk == 0x27) {
         jump_history_move(app, vk == 0x27);
         return true;
     }
     // The filter view has its own key model: Up/Down walk the row
     // cursor, Esc leaves without moving, and editing keys are
     // swallowed (the view is read-only). A few commands fall
-    // through to the main handling below — Open and Save, F1, and
-    // the find commands, which close the filter first (see the
-    // guard at the top of on_command).
+    // through to the keybinding dispatch — Open and Save, the
+    // Guide, and the find commands, which close the filter first
+    // (see the guard at the top of on_command).
     if app.filter.is_some() {
+        // Esc always leaves the filter, whatever it is bound to.
+        if vk == 0x1B {
+            exit_filter(app);
+            return true;
+        }
+        if let Some(action) = action {
+            if matches!(
+                action,
+                "open" | "save" | "find" | "replace" | "find_next" | "find_prev" | "guide"
+            ) {
+                dispatch_action(app, action);
+                return true;
+            }
+        }
         match vk {
             0x26 => {
                 filter_move_cursor(app, -1);
@@ -9089,22 +11050,18 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
                 invalidate(app);
                 return true;
             }
-            0x1B => {
-                exit_filter(app);
-                return true;
-            }
             0x70 => {
+                // F1 shows the Guide even when the guide action
+                // is unbound — the filter's own key model.
                 show_help(app);
                 return true;
             }
-            0x72 => {
-                // F3 falls through (find closes the filter first).
-            }
-            _ if ctrl && matches!(vk, 0x4F | 0x53 | 0x46 | 0x48) => {
-                // Ctrl+O / Ctrl+S / Ctrl+F / Ctrl+H fall through.
-            }
             _ => return true,
         }
+    }
+    if let Some(action) = action {
+        dispatch_action(app, action);
+        return true;
     }
     match vk {
         0x25 => app.editor.move_left(shift),  // VK_LEFT
@@ -9163,7 +11120,9 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
             return true;
         }
         0x2E => {
-            // VK_DELETE
+            // VK_DELETE: an unbound Delete deletes forward, as
+            // always. (A Delete chord bound to an action was
+            // claimed by the dispatch above.)
             if edit_blocked_by_freeze(app, false, true) {
                 frozen_note(app);
                 return true;
@@ -9171,32 +11130,6 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
             if app.editor.delete_forward().unwrap_or(false) {
                 after_edit(app);
             }
-            return true;
-        }
-        0x70 => {
-            // VK_F1
-            show_help(app);
-            return true;
-        }
-        0x71 => {
-            // VK_F2: Ctrl toggles a bookmark at the caret; Shift
-            // jumps to the previous bookmark, plain F2 to the next
-            // (roadmap item 20).
-            if ctrl {
-                toggle_bookmark(app);
-            } else {
-                jump_bookmark(app, !shift);
-            }
-            return true;
-        }
-        0x72 => {
-            // VK_F3 (Shift+F3: previous match)
-            on_command(app, if shift { CMD_FIND_PREV } else { CMD_FIND_NEXT });
-            return true;
-        }
-        0x75 => {
-            // VK_F6
-            on_command(app, CMD_MODE_TOGGLE);
             return true;
         }
         0x1B => {
@@ -9210,48 +11143,11 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
             }
             return true;
         }
-        _ if ctrl => {
-            match vk {
-                0x41 => app.editor.select_all(),    // Ctrl+A
-                0x43 => on_command(app, CMD_COPY),  // Ctrl+C
-                0x58 => on_command(app, CMD_CUT),   // Ctrl+X
-                0x56 => on_command(app, CMD_PASTE), // Ctrl+V
-                0x5A => on_command(app, CMD_UNDO),  // Ctrl+Z
-                0x59 => on_command(app, CMD_REDO),  // Ctrl+Y
-                0x4F => on_command(app, CMD_OPEN),  // Ctrl+O
-                0x53 => {
-                    // Ctrl+S (Ctrl+Shift+S: Save As)
-                    on_command(app, if shift { CMD_SAVE_AS } else { CMD_SAVE });
-                }
-                0x46 => on_command(app, CMD_FIND),        // Ctrl+F
-                0x48 => on_command(app, CMD_REPLACE),     // Ctrl+H
-                0xBB => on_command(app, CMD_FONT_BIGGER), // Ctrl+'+' (VK_OEM_PLUS)
-                0xBD => on_command(app, CMD_FONT_SMALLER), // Ctrl+'-' (VK_OEM_MINUS)
-                0x0D => {
-                    // Ctrl+Enter: pointer following in hex mode
-                    // (roadmap item 11 wiring).
-                    if app.editor.mode() == EditorMode::Hex {
-                        pointer_jump(app);
-                    }
-                }
-                _ => return false,
-            }
-            // Navigation arms above fall through to the caret update;
-            // command arms have already refreshed what they touch.
-            if matches!(
-                vk,
-                0x25 | 0x27 | 0x26 | 0x28 | 0x24 | 0x23 | 0x21 | 0x22 | 0x41
-            ) {
-                after_caret_move(app);
-            }
-            return true;
-        }
         _ => return false,
     }
     after_caret_move(app);
     true
 }
-
 fn insert_str(app: &mut App, text: &str) {
     if app.editor.insert_text(text).is_ok() {
         after_edit(app);
@@ -9822,6 +11718,17 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
+        WM_RBUTTONUP => {
+            // Right-click on a gutter bookmark marker opens its
+            // annotation editor (slice R4c, item 5). Anywhere else
+            // the right button keeps its default behaviour.
+            if gutter_bookmark_click(app, lparam) {
+                0
+            } else {
+                // SAFETY: unhandled clicks get default processing.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_KEYDOWN => {
             if on_keydown(app, wparam) {
                 0
@@ -9871,6 +11778,21 @@ unsafe extern "system" fn wnd_proc(
                     // on disk, so a document with no file has
                     // nothing to hash.
                     set(file_menu, CMD_FILE_HASHES, app.editor.path().is_some());
+                    // Export Delta Patch needs unsaved edits over
+                    // a file-backed document (slice R4c, item 3);
+                    // Open as Administrator needs a file at all
+                    // (item 33).
+                    set(
+                        file_menu,
+                        CMD_EXPORT_PATCH,
+                        app.editor.is_dirty() && app.editor.path().is_some(),
+                    );
+                    set(file_menu, CMD_OPEN_ADMIN, app.editor.path().is_some());
+                    let search_menu = GetSubMenu(bar, 2);
+                    // Clear Filter exists only while filtered
+                    // (item 12); Edit Bookmark needs a bookmark.
+                    set(search_menu, CMD_CLEAR_FILTER, app.filter.is_some());
+                    set(search_menu, CMD_BOOKMARK_EDIT, !app.bookmarks.is_empty());
                     set(edit_menu, CMD_UNDO, app.editor.can_undo());
                     set(edit_menu, CMD_SORT_LINES, can_edit && has_selection);
                     set(edit_menu, CMD_DEDUP_LINES, can_edit && has_selection);
@@ -10025,6 +11947,10 @@ unsafe extern "system" fn wnd_proc(
                             }
                         }
                     }
+                    // Background filter build (slice R4c, item
+                    // 13): attach the snapshots the worker has
+                    // published since the last tick.
+                    service_filter_build(app);
                     // Strings pane + entropy strip: start owed
                     // scans and pick up finished ones (both workers
                     // are epoch-guarded on their own generations).
@@ -10496,6 +12422,13 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         startup_eol = detect_eol(&sample);
     }
 
+    // Keybindings (slice R4c, item 7): data/keybindings.json
+    // merged over the defaults. A problem with the file falls back
+    // per action and is surfaced once in the status bar below.
+    let keybindings =
+        crate::keybindings::KeyBindings::load_from(&crate::keybindings::keybindings_path());
+    let keybindings_problem = !keybindings.problems().is_empty();
+
     let theme = Theme::resolve(&settings.theme, settings.accent_override.as_deref());
     // SAFETY: plain GDI factory calls; the app owns the brushes.
     let panel_brush = unsafe { CreateSolidBrush(colorref(theme.panel)) };
@@ -10628,6 +12561,13 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         } else {
             None
         },
+        filter_slot: Arc::new(Mutex::new(None)),
+        filter_gen: 0,
+        keybindings,
+        keybindings_problem,
+        doc_read_only_file: false,
+        encoding_menu: std::ptr::null_mut(),
+        codepage_menu: std::ptr::null_mut(),
     };
     // Per-document tracking for the startup document (bookmarks,
     // external-change baseline, recovery fingerprint): the same
@@ -10697,6 +12637,16 @@ pub fn run_gui(options: &CliOptions) -> i32 {
     unsafe {
         ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
+    }
+
+    // The keybindings problem note (slice R4c, item 7): shown
+    // once at startup; the first caret move clears it like any
+    // status note.
+    // SAFETY: our window; app_ptr resolves the App it owns.
+    let app = unsafe { &mut *app_ptr(hwnd) };
+    if app.keybindings_problem {
+        app.status_note = Some("keybindings.json had problems; defaults used".to_string());
+        refresh_status(app);
     }
 
     // The message loop.
@@ -10811,7 +12761,36 @@ fn register_classes(hinstance: HINSTANCE) -> bool {
         lpszClassName: hash.as_ptr(),
     };
     // SAFETY: as above.
-    (unsafe { RegisterClassW(&hash_class) }) != 0
+    if unsafe { RegisterClassW(&hash_class) } == 0 {
+        return false;
+    }
+    // Slice R4c dialogs: Extract Ranges, Compare With, and the
+    // bookmark annotation editor — same registration shape.
+    let r4c_dialogs: [(&str, WNDPROC); 3] = [
+        (SLICE_CLASS, Some(slice_dialog_proc)),
+        (COMPARE_CLASS, Some(compare_dialog_proc)),
+        (BMEDIT_CLASS, Some(bookmark_edit_proc)),
+    ];
+    for (name, proc_fn) in r4c_dialogs {
+        let class_name = wstr(name);
+        let class = WNDCLASSW {
+            style: 0x2 | 0x1,
+            lpfnWndProc: proc_fn,
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance,
+            hIcon: icon,
+            hCursor: cursor,
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+        };
+        // SAFETY: as above.
+        if unsafe { RegisterClassW(&class) } == 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// The registry path of the Explorer context-menu item (roadmap
@@ -10961,6 +12940,106 @@ pub fn attach_parent_console() {
         windows_sys::Win32::System::Console::AttachConsole(u32::MAX);
         windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
         windows_sys::Win32::System::Console::SetConsoleCP(65001);
+    }
+}
+
+/// Install the Win32 code-page converter the encoding core uses
+/// for the legacy code pages (slice R4c, item 29). Called once
+/// from `crate::cli::run`'s Windows prologue, before any decode
+/// can happen. ISO-8859-1/-15 never reach these functions (the
+/// core converts them with its own table); the double-byte and
+/// Windows pages convert here, where the OS tables live.
+pub fn install_page_converter() {
+    crate::encoding::install_page_converter(crate::encoding::PageConverter {
+        decode_units: win32_decode_units,
+        encode_char: win32_encode_char,
+    });
+}
+
+/// Decode bytes under a Windows code page to UTF-16 units
+/// (`MultiByteToWideChar`): the page's own rules decide character
+/// boundaries; invalid sequences become U+FFFD (the documented
+/// lossy decode behaviour).
+fn win32_decode_units(bytes: &[u8], page: u32) -> Vec<u16> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    // SAFETY: `bytes` is a live byte slice whose length is passed
+    // exactly; the first call only measures (null output, zero
+    // capacity), the second writes into a Vec sized from that
+    // measurement, and its reported length bounds the result.
+    unsafe {
+        let needed = MultiByteToWideChar(
+            page,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        );
+        if needed <= 0 {
+            return Vec::new();
+        }
+        let mut units = vec![0u16; needed as usize];
+        let written = MultiByteToWideChar(
+            page,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            units.as_mut_ptr(),
+            needed,
+        );
+        if written < 0 {
+            return Vec::new();
+        }
+        units.truncate(written as usize);
+        units
+    }
+}
+
+/// Encode one character under a Windows code page
+/// (`WideCharToMultiByte`): `None` when the page has no mapping
+/// for the character (the OS flags that it used a default), which
+/// the core turns into its named encode error — saving never
+/// silently writes a '?' the user did not choose.
+fn win32_encode_char(ch: char, page: u32) -> Option<Vec<u8>> {
+    let mut units = [0u16; 2];
+    let n = ch.encode_utf16(&mut units).len();
+    let mut used_default: i32 = 0;
+    // SAFETY: `units[..n]` holds the character's UTF-16 form and
+    // outlives the call; the first call only measures, the second
+    // writes into a Vec sized from it; `used_default` is a
+    // writable BOOL out-slot read only after success.
+    unsafe {
+        let needed = WideCharToMultiByte(
+            page,
+            0,
+            units.as_ptr(),
+            n as i32,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            &mut used_default,
+        );
+        if needed <= 0 {
+            return None;
+        }
+        let mut bytes = vec![0u8; needed as usize];
+        let written = WideCharToMultiByte(
+            page,
+            0,
+            units.as_ptr(),
+            n as i32,
+            bytes.as_mut_ptr(),
+            needed,
+            std::ptr::null(),
+            &mut used_default,
+        );
+        if written <= 0 || used_default != 0 {
+            return None;
+        }
+        bytes.truncate(written as usize);
+        Some(bytes)
     }
 }
 
@@ -11163,6 +13242,16 @@ mod tests {
             "Matches SHA-1"
         );
         assert_eq!(hash_verdict(&h.md5, Some(&h)), "Matches MD5");
+        // The R4c checksums compare too (displayed uppercase hex,
+        // pasted in any case).
+        assert_eq!(
+            hash_verdict(&format!("{:08X}", h.crc32), Some(&h)),
+            "Matches CRC32"
+        );
+        assert_eq!(
+            hash_verdict(&format!("{:016x}", h.xxhash64), Some(&h)),
+            "Matches xxHash64"
+        );
         assert_eq!(hash_verdict("deadbeef", Some(&h)), "No match");
     }
 
