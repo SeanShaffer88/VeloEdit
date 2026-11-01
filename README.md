@@ -343,19 +343,25 @@ trips, corruption handling, recent-file rules).
 
 ## Screenshots
 
-Screenshots: to be captured from a real run of the graphical editor on
-Windows 11 — the window is compile-verified but has not had its first
-real run yet. No placeholder images are used.
+Real captures from a run of the editor on Windows 11, showing a
+6,007-line log file (333 KB) open in both modes:
+
+![The editor in text mode: dark window, line-number gutter, Text/Hex toggle](docs/screenshots/editor-text-mode.png)
+
+![The editor in hex mode: offset column, hex bytes, ASCII column](docs/screenshots/editor-hex-mode.png)
+
+Still to capture: the find bar with matches highlighted, a light
+theme, and the installer.
 
 ## Known limitations
 
-- The graphical editor window is compile-verified only: it has not yet
-  been run on a real Windows 11 machine, so every part of its runtime
-  behaviour (rendering, input, dialogs, themes, recovery prompts) is
-  unverified until that first run. The same applies to memory-mapped
-  opening and the atomic save's `ReplaceFileW` path. (On this Linux
-  development host the core uses an in-memory backing and a `rename`
-  swap, and those paths are tested.)
+- The graphical editor has been run on a real Windows 11 machine:
+  startup, painting, text and hex modes, the custom scrollbar, and
+  resizing are verified from real captures (see Screenshots).
+  Interactions still being exercised there include typing and saving
+  from the window, the find bar, theme switching, and the recovery
+  prompt; the installers have been built and hash-verified but not
+  yet run through a full install on a real machine.
 - Recovery snapshots cover documents up to 16 MB. Larger documents rely
   on the atomic save alone.
 - Long lines are shown clipped at the window edge (no horizontal
