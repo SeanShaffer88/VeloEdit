@@ -30,10 +30,11 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windows_sys::Win32::Foundation::{
     GlobalFree, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
+use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect,
-    ScreenToClient, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, HBRUSH, HDC, HGDIOBJ,
-    OPAQUE, PAINTSTRUCT, TRANSPARENT,
+    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, FrameRect,
+    InvalidateRect, ScreenToClient, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, HBRUSH, HDC,
+    HGDIOBJ, OPAQUE, PAINTSTRUCT, TRANSPARENT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
@@ -48,7 +49,7 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Controls::{
-    SetScrollInfo, DRAWITEMSTRUCT, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTTOOLINFOW,
+    DRAWITEMSTRUCT, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTTOOLINFOW,
 };
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -79,6 +80,7 @@ const CMD_OPEN: usize = 1001;
 const CMD_SAVE: usize = 1002;
 const CMD_SAVE_AS: usize = 1003;
 const CMD_EXIT: usize = 1004;
+const CMD_SAVE_SELECTION: usize = 1005;
 const CMD_UNDO: usize = 1011;
 const CMD_REDO: usize = 1012;
 const CMD_CUT: usize = 1013;
@@ -92,6 +94,7 @@ const CMD_MODE_HEX: usize = 1022;
 const CMD_MODE_TOGGLE: usize = 1025;
 const CMD_FONT_BIGGER: usize = 1023;
 const CMD_FONT_SMALLER: usize = 1024;
+const CMD_VIEW_RULER: usize = 1026;
 const CMD_GUIDE: usize = 1031;
 const CMD_ABOUT: usize = 1032;
 const CMD_FIND_NEXT: usize = 1041;
@@ -99,9 +102,9 @@ const CMD_FIND_PREV: usize = 1042;
 const CMD_DO_REPLACE: usize = 1043;
 const CMD_DO_REPLACE_ALL: usize = 1044;
 const CMD_FIND_CLOSE: usize = 1045;
-const CMD_THEME_BASE: usize = 3000; // + theme index (18 themes)
-const CMD_ACCENT_BASE: usize = 3100; // 0 = theme default, 1..=8 presets, 9 = Custom…
-const CMD_ACCENT_CUSTOM: usize = CMD_ACCENT_BASE + 9;
+const CMD_THEME_BASE: usize = 3000; // + theme index (20 themes)
+const CMD_ACCENT_BASE: usize = 3100; // 0 = theme default, 1..=11 presets, then Custom…
+const CMD_ACCENT_CUSTOM: usize = CMD_ACCENT_BASE + 1 + ACCENT_PRESETS.len();
 const CMD_RECENT_BASE: usize = 3200; // + recent index (max 8)
 
 const ID_FIND_EDIT: usize = 2001;
@@ -110,11 +113,6 @@ const ID_FIND_COUNT: usize = 2003;
 
 const TIMER_BLINK: usize = 1;
 const TIMER_TICK: usize = 2;
-
-/// Scrollbar resolution: the window scrollbar is a 32-bit control, so a
-/// 64-bit document is mapped onto this many track positions with the
-/// ratio helpers in [`crate::hexview`] (SPEC.md section 3.3).
-const SCROLL_TRACK: i32 = 100_000;
 
 /// Recovery snapshots are only written for documents up to this size;
 /// larger documents rely on the atomic save alone (documented in the
@@ -126,6 +124,12 @@ const TOOLBAR_H: f32 = 30.0;
 const FINDBAR_H: f32 = 34.0;
 const STATUS_H: f32 = 22.0;
 const TEXT_PAD: f32 = 6.0;
+/// Accent strip along the very top of the client area (design mockup).
+const STRIP_H: f32 = 2.0;
+/// Width of the custom-drawn scrollbar track at the editor's right edge.
+const SCROLLBAR_W: f32 = 10.0;
+/// Smallest scrollbar thumb height, so huge files keep a grabbable thumb.
+const SCROLL_MIN_THUMB: f32 = 24.0;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -161,20 +165,89 @@ unsafe fn window_text(hwnd: HWND) -> String {
     }
 }
 
-/// Human-readable byte size for the status bar.
-fn fmt_size(bytes: u64) -> String {
+/// Human-readable byte size for the status bar: exact below 1 KB,
+/// one decimal above (for example `104.2 GB`).
+fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
+    const TB: u64 = GB * 1024;
+    if bytes >= TB {
+        format!("{:.1} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
     } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
+        format!("{:.1} MB", bytes as f64 / MB as f64)
     } else if bytes >= KB {
         format!("{:.1} KB", bytes as f64 / KB as f64)
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Display name for the status bar's right side.
+fn encoding_display(enc: encoding::TextEncoding) -> &'static str {
+    match enc {
+        encoding::TextEncoding::Utf8 => "UTF-8",
+        encoding::TextEncoding::Utf16Le => "UTF-16 LE",
+        encoding::TextEncoding::Utf16Be => "UTF-16 BE",
+        encoding::TextEncoding::Ansi => "ANSI",
+    }
+}
+
+/// Line-ending style of a document sample: CRLF when the sample
+/// contains a CR LF pair, LF otherwise (the default for new files).
+fn detect_eol(sample: &[u8]) -> &'static str {
+    if sample.windows(2).any(|pair| pair == b"\r\n") {
+        "CRLF"
+    } else {
+        "LF"
+    }
+}
+
+/// Scrollbar thumb geometry for the custom-drawn scrollbar: given the
+/// track height (DIPs), the total row count, the visible row count and
+/// the first visible row, return `(thumb_y, thumb_h)` in DIPs from the
+/// track top — or `None` when everything fits and no bar is drawn.
+/// The thumb height is the visible fraction of the track, clamped to
+/// a grabbable minimum; its position is the first-row fraction of the
+/// remaining travel.
+fn scrollbar_geometry(
+    track_h: f32,
+    total_rows: u64,
+    visible_rows: u64,
+    first_row: u64,
+) -> Option<(f32, f32)> {
+    if track_h <= 0.0 || total_rows == 0 || visible_rows >= total_rows {
+        return None;
+    }
+    let thumb_h = (track_h * visible_rows as f32 / total_rows as f32)
+        .max(SCROLL_MIN_THUMB)
+        .min(track_h);
+    let max_first = (total_rows - visible_rows) as f32;
+    let frac = if max_first > 0.0 {
+        (first_row as f32 / max_first).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    Some((frac * (track_h - thumb_h), thumb_h))
+}
+
+/// Inverse of [`scrollbar_geometry`]: the first visible row for a
+/// thumb dragged to `thumb_y` DIPs from the track top.
+fn scrollbar_first_row(track_h: f32, total_rows: u64, visible_rows: u64, thumb_y: f32) -> u64 {
+    if total_rows == 0 || visible_rows >= total_rows {
+        return 0;
+    }
+    let thumb_h = (track_h * visible_rows as f32 / total_rows as f32)
+        .max(SCROLL_MIN_THUMB)
+        .min(track_h.max(0.0));
+    let travel = track_h - thumb_h;
+    if travel <= 0.0 {
+        return 0;
+    }
+    let frac = (thumb_y / travel).clamp(0.0, 1.0);
+    (frac * (total_rows - visible_rows) as f32).round() as u64
 }
 
 /// Theme colour as a GDI COLORREF (0x00BBGGRR) for window chrome.
@@ -218,7 +291,7 @@ to the program while you edit, and offers it back if the program\r\n\
 closes unexpectedly. Larger files rely on the safe save alone.\r\n\
 \r\n\
 THEMES\r\n\
-View ▸ Theme offers 18 built-in colour themes; View ▸ Accent recolours\r\n\
+View ▸ Theme offers 20 built-in colour themes; View ▸ Accent recolours\r\n\
 the highlight colour on top of any theme. Your choices are stored in\r\n\
 the data folder next to the program — VeloEdit is fully portable and\r\n\
 works completely offline.\r\n";
@@ -269,6 +342,7 @@ const D2DERR_RECREATE_TARGET: i32 = 0x8899_000Cu32 as i32;
 const SLOT_RELEASE: usize = 2; // IUnknown::Release — every interface
 const SLOT_D2D_CREATE_HWND_RT: usize = 14; // ID2D1Factory::CreateHwndRenderTarget
 const SLOT_RT_CREATE_SOLID_BRUSH: usize = 8; // ID2D1RenderTarget::CreateSolidColorBrush
+const SLOT_RT_DRAW_RECTANGLE: usize = 16; // ID2D1RenderTarget::DrawRectangle
 const SLOT_RT_FILL_RECTANGLE: usize = 17; // ID2D1RenderTarget::FillRectangle
 const SLOT_RT_DRAW_TEXT: usize = 27; // ID2D1RenderTarget::DrawText
 const SLOT_RT_CLEAR: usize = 47; // ID2D1RenderTarget::Clear
@@ -508,12 +582,22 @@ struct App {
     line_h: f32,
     panel_brush: HBRUSH,
     edit_brush: HBRUSH,
+    line_brush: HBRUSH,
+    accent_brush: HBRUSH,
     toolbar: Vec<HWND>,
     find_controls: Vec<HWND>,
     find_edit: HWND,
     replace_edit: HWND,
     find_count: HWND,
+    find_label: HWND,
+    replace_label: HWND,
     status: HWND,
+    status_right: HWND,
+    /// Line-ending style detected at open ("LF" or "CRLF").
+    eol: &'static str,
+    /// Custom-scrollbar thumb drag: the pointer's DIP offset from the
+    /// thumb's top, while a drag is in progress.
+    scroll_drag: Option<f32>,
     help_hwnd: HWND,
     view_menu: HMENU,
     recent_menu: HMENU,
@@ -830,7 +914,7 @@ fn compute_layout(app: &mut App) -> Layout {
     unsafe { GetClientRect(app.hwnd, &mut client) };
     let width = app.dip(client.right - client.left);
     let height = app.dip(client.bottom - client.top);
-    let top = TOOLBAR_H + if app.find_visible { FINDBAR_H } else { 0.0 };
+    let top = STRIP_H + TOOLBAR_H + if app.find_visible { FINDBAR_H } else { 0.0 };
     let gutter_w = match app.editor.mode() {
         EditorMode::Text => {
             let digits = app.editor.line_count().max(1).to_string().len() as f32;
@@ -860,18 +944,45 @@ fn layout_children(app: &mut App) {
     unsafe { GetClientRect(app.hwnd, &mut client) };
     let (cw, ch) = (client.right - client.left, client.bottom - client.top);
     let toolbar_h = app.px(TOOLBAR_H);
-    // Toolbar buttons: fixed DIP widths in creation order.
-    let widths: [f32; 7] = [58.0, 58.0, 58.0, 58.0, 58.0, 74.0, 92.0];
+    let row_y = app.px(STRIP_H + 3.0);
+    // Toolbar buttons: fixed DIP widths in creation order. The first
+    // six flow from the left; the last two (the Text / Hex mode
+    // toggles) are anchored to the right end of the row.
+    let widths: [f32; 6] = [58.0, 58.0, 58.0, 58.0, 58.0, 74.0];
     let mut x = app.px(4.0);
-    for (i, button) in app.toolbar.iter().enumerate() {
+    for (i, button) in app.toolbar.iter().take(6).enumerate() {
         let w = app.px(widths.get(i).copied().unwrap_or(58.0));
         // SAFETY: all handles are our child windows.
-        unsafe { MoveWindow(*button, x, app.px(3.0), w, toolbar_h - app.px(6.0), 1) };
+        unsafe { MoveWindow(*button, x, row_y, w, toolbar_h - app.px(6.0), 1) };
         x += w + app.px(4.0);
+    }
+    if app.toolbar.len() >= 8 {
+        let mode_w = app.px(52.0);
+        let hex_x = cw - app.px(4.0) - mode_w;
+        let text_x = hex_x - app.px(4.0) - mode_w;
+        // SAFETY: our child windows.
+        unsafe {
+            MoveWindow(
+                app.toolbar[6],
+                text_x,
+                row_y,
+                mode_w,
+                toolbar_h - app.px(6.0),
+                1,
+            );
+            MoveWindow(
+                app.toolbar[7],
+                hex_x,
+                row_y,
+                mode_w,
+                toolbar_h - app.px(6.0),
+                1,
+            );
+        }
     }
     // Find bar (second row when visible).
     if app.find_visible {
-        let y = toolbar_h + app.px(3.0);
+        let y = app.px(STRIP_H) + toolbar_h + app.px(3.0);
         let h = app.px(FINDBAR_H) - app.px(6.0);
         let mut fx = app.px(4.0);
         let place = |app: &App, hwnd: HWND, fx: &mut i32, w_dip: f32| {
@@ -883,13 +994,17 @@ fn layout_children(app: &mut App) {
         let find_edit = app.find_edit;
         let replace_edit = app.replace_edit;
         let find_count = app.find_count;
+        let find_label = app.find_label;
+        let replace_label = app.replace_label;
+        place(app, find_label, &mut fx, 34.0);
         place(app, find_edit, &mut fx, 190.0);
         // Buttons follow in find_controls order after the two edits:
         // [find_edit, prev, next, count, replace_edit, replace, replace_all, close]
-        let order: [(HWND, f32); 6] = [
+        let order: [(HWND, f32); 7] = [
             (app.find_controls[1], 52.0),
             (app.find_controls[2], 52.0),
             (find_count, 96.0),
+            (replace_label, 50.0),
             (replace_edit, 190.0),
             (app.find_controls[5], 68.0),
             (app.find_controls[6], 82.0),
@@ -900,10 +1015,29 @@ fn layout_children(app: &mut App) {
         let close_btn = app.find_controls[7];
         place(app, close_btn, &mut fx, 30.0);
     }
-    // Status strip along the bottom.
+    // Status strip along the bottom: position text on the left, the
+    // document facts (encoding · line endings · size) on the right.
     let status_h = app.px(STATUS_H);
-    // SAFETY: our child window.
-    unsafe { MoveWindow(app.status, 0, ch - status_h, cw, status_h, 1) };
+    let right_w = app.px(340.0).min(cw);
+    // SAFETY: our child windows.
+    unsafe {
+        MoveWindow(
+            app.status,
+            0,
+            ch - status_h,
+            (cw - right_w).max(0),
+            status_h,
+            1,
+        );
+        MoveWindow(
+            app.status_right,
+            cw - right_w,
+            ch - status_h,
+            right_w,
+            status_h,
+            1,
+        );
+    }
 }
 
 fn invalidate(app: &App) {
@@ -913,14 +1047,53 @@ fn invalidate(app: &App) {
 }
 
 // ---------------------------------------------------------------------------
-// Title, status bar, scrollbar
+// Title bar, status bar, custom scrollbar
 // ---------------------------------------------------------------------------
+
+/// Theme the window's title bar through the Desktop Window Manager:
+/// immersive dark mode, the panel colour as the caption background,
+/// the theme text colour for the caption text. Failures are ignored —
+/// the attributes need Windows 10 20H1 / Windows 11 and the window
+/// keeps the system look without them.
+fn apply_titlebar_theme(app: &App) {
+    // DWMWA_USE_IMMERSIVE_DARK_MODE = 20, DWMWA_CAPTION_COLOR = 35,
+    // DWMWA_TEXT_COLOR = 36 (dwmapi.h).
+    let dark: i32 = 1;
+    let caption: COLORREF = colorref(app.theme.panel);
+    let text: COLORREF = colorref(app.theme.text);
+    // SAFETY: our window; each attribute value is a plain 4-byte value
+    // that outlives the call, and the HRESULTs are deliberately unused.
+    unsafe {
+        DwmSetWindowAttribute(
+            app.hwnd,
+            20,
+            &dark as *const i32 as *const c_void,
+            std::mem::size_of::<i32>() as u32,
+        );
+        DwmSetWindowAttribute(
+            app.hwnd,
+            35,
+            &caption as *const COLORREF as *const c_void,
+            std::mem::size_of::<COLORREF>() as u32,
+        );
+        DwmSetWindowAttribute(
+            app.hwnd,
+            36,
+            &text as *const COLORREF as *const c_void,
+            std::mem::size_of::<COLORREF>() as u32,
+        );
+    }
+}
 
 fn refresh_title(app: &App) {
     let mut title = String::from("VeloEdit");
     if let Some(path) = app.editor.path() {
         title.push_str(" \u{2014} ");
-        title.push_str(&path.display().to_string());
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        title.push_str(&name);
     }
     if app.editor.is_dirty() {
         title.push_str(" *");
@@ -932,63 +1105,52 @@ fn refresh_title(app: &App) {
 
 fn refresh_status(app: &mut App) {
     let st = app.editor.status();
-    let mut text = format!(
-        "Ln {}, Col {} \u{00B7} Offset {} \u{00B7} {} \u{00B7} {} \u{00B7} {}",
-        st.line,
-        st.col,
-        st.offset,
-        st.encoding.name(),
-        fmt_size(st.size),
-        app.theme.name,
+    // Left: caret position, plus the selection size when there is one.
+    let mut left = format!(
+        "Ln {} \u{00B7} Col {} \u{00B7} Offset {}",
+        st.line, st.col, st.offset
     );
-    if !st.encoding_confident {
-        text.push_str(" (detected, not certain)");
-    }
     if st.selection_len > 0 {
-        text.push_str(&format!(
-            " \u{00B7} {} selected",
-            fmt_size(st.selection_len)
+        left.push_str(&format!(
+            " \u{00B7} Selection {}",
+            human_size(st.selection_len)
         ));
     }
     if st.read_only {
-        text.push_str(" \u{00B7} Read-only");
+        left.push_str(" \u{00B7} Read-only");
     }
     if st.dirty {
-        text.push_str(" \u{00B7} Unsaved changes");
+        left.push_str(" \u{00B7} Unsaved changes");
     }
-    let wide = wstr(&text);
+    let wide = wstr(&left);
     // SAFETY: our status control plus a NUL-terminated string.
     unsafe { SetWindowTextW(app.status, wide.as_ptr()) };
+    // Right: the document facts.
+    let mut right = format!(
+        "{} \u{00B7} {} \u{00B7} {}",
+        encoding_display(st.encoding),
+        app.eol,
+        human_size(st.size)
+    );
+    if !st.encoding_confident {
+        right.push_str(" (detected, not certain)");
+    }
+    let wide = wstr(&right);
+    // SAFETY: our status control plus a NUL-terminated string.
+    unsafe { SetWindowTextW(app.status_right, wide.as_ptr()) };
 }
 
-fn scrollbar_update(app: &mut App) {
-    let total = match app.editor.mode() {
-        EditorMode::Text => app.editor.line_count(),
-        EditorMode::Hex => hexview::row_count(app.editor.total_len()),
+/// (total rows, first visible row, visible rows) for the current mode
+/// — the numbers the custom scrollbar's geometry helpers work in.
+fn scroll_metrics(app: &mut App) -> (u64, u64, u64) {
+    let (total, first) = match app.editor.mode() {
+        EditorMode::Text => (app.editor.line_count(), app.editor.first_line()),
+        EditorMode::Hex => (
+            hexview::row_count(app.editor.total_len()),
+            app.editor.first_row(),
+        ),
     };
-    let first = match app.editor.mode() {
-        EditorMode::Text => app.editor.first_line(),
-        EditorMode::Hex => app.editor.first_row(),
-    };
-    let page = page_rows(app);
-    let mut info = SCROLLINFO {
-        cbSize: std::mem::size_of::<SCROLLINFO>() as u32,
-        fMask: SIF_RANGE | SIF_PAGE | SIF_POS,
-        nMin: 0,
-        nMax: SCROLL_TRACK - 1,
-        nPage: 0,
-        nPos: 0,
-        nTrackPos: 0,
-    };
-    if total <= page {
-        info.nPage = SCROLL_TRACK as u32; // thumb fills the track: nothing to scroll
-        info.nPos = 0;
-    } else {
-        info.nPage = ((SCROLL_TRACK as u128 * page as u128 / total as u128) as u32).max(1);
-        info.nPos = hexview::thumb_position(first, total, SCROLL_TRACK as u64) as i32;
-    }
-    // SAFETY: our window; `info` outlives the call.
-    unsafe { SetScrollInfo(app.hwnd, SB_VERT, &info, 1) };
+    (total, first, page_rows(app))
 }
 
 // ---------------------------------------------------------------------------
@@ -997,6 +1159,8 @@ fn scrollbar_update(app: &mut App) {
 // ---------------------------------------------------------------------------
 
 type RtFillRect = unsafe extern "system" fn(*mut c_void, *const D2dRectF, *mut c_void);
+type RtDrawRectangle =
+    unsafe extern "system" fn(*mut c_void, *const D2dRectF, *mut c_void, f32, *const c_void);
 type RtDrawText = unsafe extern "system" fn(
     *mut c_void,
     *const u16,
@@ -1013,6 +1177,21 @@ fn fill_rect(fill: RtFillRect, target: *mut c_void, rect: D2dRectF, brush: *mut 
         // SAFETY: `fill` is ID2D1RenderTarget::FillRectangle (slot 17)
         // resolved from the live target; the rect is a plain value.
         unsafe { fill(target, &rect, brush) };
+    }
+}
+
+fn outline_rect(
+    draw_rect: RtDrawRectangle,
+    target: *mut c_void,
+    rect: D2dRectF,
+    brush: *mut c_void,
+) {
+    if !brush.is_null() {
+        // SAFETY: `draw_rect` is ID2D1RenderTarget::DrawRectangle
+        // (slot 16) resolved from the live target; the rect is a plain
+        // value, the stroke width is 1 DIP, and a null stroke style
+        // means a solid stroke.
+        unsafe { draw_rect(target, &rect, brush, 1.0, std::ptr::null()) };
     }
 }
 
@@ -1072,6 +1251,11 @@ fn render(app: &mut App) {
         (((layout.editor_bottom - layout.editor_top) / app.line_h.max(1.0)).ceil() as usize).max(1);
     let selection = app.editor.selection_range();
     let current_match = app.editor.current_match();
+    // Every match start (all matches share the needle's byte length),
+    // plus the numbers the custom scrollbar is drawn from.
+    let all_matches: Vec<u64> = app.editor.matches().to_vec();
+    let match_len = current_match.map(|(s, e)| e - s).unwrap_or(0);
+    let (sb_total, sb_first, sb_page) = scroll_metrics(app);
     let (caret_line, caret_col) = app.editor.line_col_of(app.editor.caret());
     let caret = app.editor.caret();
 
@@ -1095,7 +1279,7 @@ fn render(app: &mut App) {
     let format = app.text_format;
     let table = app.editor.table();
     let enc = app.editor.encoding();
-    // SAFETY: slots 47/48/46 are BeginDraw/EndDraw/Clear per d2d1.h,
+    // SAFETY: slots 48/49/47 are BeginDraw/EndDraw/Clear per d2d1.h,
     // resolved from the live render target.
     let begin: unsafe extern "system" fn(*mut c_void) = unsafe { vfn(target, SLOT_RT_BEGIN_DRAW) };
     let end: unsafe extern "system" fn(*mut c_void, *mut u64, *mut u64) -> i32 =
@@ -1103,6 +1287,7 @@ fn render(app: &mut App) {
     let clear: unsafe extern "system" fn(*mut c_void, *const D2dColorF) =
         unsafe { vfn(target, SLOT_RT_CLEAR) };
     let fill: RtFillRect = unsafe { vfn(target, SLOT_RT_FILL_RECTANGLE) };
+    let draw_rect: RtDrawRectangle = unsafe { vfn(target, SLOT_RT_DRAW_RECTANGLE) };
     let draw: RtDrawText = unsafe { vfn(target, SLOT_RT_DRAW_TEXT) };
 
     // SAFETY: the target is live and not in a draw session; the colour
@@ -1115,6 +1300,18 @@ fn render(app: &mut App) {
     let top = layout.editor_top;
     let bottom = layout.editor_bottom;
     let width = layout.width;
+    // The accent strip along the very top of the client area.
+    fill_rect(
+        fill,
+        target,
+        D2dRectF {
+            left: 0.0,
+            top: 0.0,
+            right: width,
+            bottom: STRIP_H,
+        },
+        brushes.accent,
+    );
     // Gutter background for the editor strip.
     fill_rect(
         fill,
@@ -1141,22 +1338,32 @@ fn render(app: &mut App) {
                 if row.line_no == caret_line {
                     fill_rect(fill, target, row_rect, brushes.current);
                 }
-                // Find-match highlight for the current match.
-                if let Some((ms, me)) = current_match {
-                    if ms >= row.start && ms < row.end {
+                // Find-match highlights: every match overlapping this
+                // row gets the match wash; the current match also gets
+                // an accent outline so it stands out from the rest.
+                if match_len > 0 {
+                    let lo = row.start.saturating_sub(match_len);
+                    let begin = all_matches.partition_point(|&m| m < lo);
+                    for &ms in &all_matches[begin..] {
+                        if ms >= row.end {
+                            break;
+                        }
+                        let me = ms + match_len;
+                        if me <= row.start {
+                            continue;
+                        }
                         let c0 = col_of_byte(table, enc, row.start, ms);
                         let c1 = col_of_byte(table, enc, row.start, me.min(row.end));
-                        fill_rect(
-                            fill,
-                            target,
-                            D2dRectF {
-                                left: layout.gutter_w + TEXT_PAD + c0 * app.char_w,
-                                top: y,
-                                right: layout.gutter_w + TEXT_PAD + c1 * app.char_w,
-                                bottom: y + app.line_h,
-                            },
-                            brushes.match_bg,
-                        );
+                        let rect = D2dRectF {
+                            left: layout.gutter_w + TEXT_PAD + c0 * app.char_w,
+                            top: y,
+                            right: layout.gutter_w + TEXT_PAD + c1 * app.char_w,
+                            bottom: y + app.line_h,
+                        };
+                        fill_rect(fill, target, rect, brushes.match_bg);
+                        if current_match == Some((ms, me)) {
+                            outline_rect(draw_rect, target, rect, brushes.accent);
+                        }
                     }
                 }
                 // Selection highlight.
@@ -1289,6 +1496,13 @@ fn render(app: &mut App) {
                     }
                 }
                 let address = format!("{:016X}", row.address);
+                // The caret row's address takes the accent colour,
+                // mirroring the current line number in text mode.
+                let address_brush = if caret >= row.address && caret < row.address + row.len {
+                    brushes.accent
+                } else {
+                    brushes.muted
+                };
                 draw_text(
                     draw,
                     target,
@@ -1300,7 +1514,7 @@ fn render(app: &mut App) {
                         right: layout.gutter_w,
                         bottom: y + app.line_h,
                     },
-                    brushes.muted,
+                    address_brush,
                 );
                 draw_text(
                     draw,
@@ -1373,6 +1587,53 @@ fn render(app: &mut App) {
                 }
             }
         }
+    }
+
+    // The column ruler (roadmap item 21): a quiet 1-DIP vertical
+    // guideline at the configured character column, text mode only.
+    // It sits on the same x-grid as the caret and the text itself
+    // (gutter + padding + column × character width), and is drawn
+    // only when it falls inside the editor area, clear of the
+    // scrollbar.
+    if app.settings.ruler_column > 0 && matches!(rows, RowData::Text(_)) {
+        let x = layout.gutter_w + TEXT_PAD + app.settings.ruler_column as f32 * app.char_w;
+        if x > layout.gutter_w && x < width - SCROLLBAR_W {
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: x,
+                    top,
+                    right: x + 1.0,
+                    bottom,
+                },
+                brushes.line,
+            );
+        }
+    }
+
+    // The custom scrollbar, drawn over the editor's right edge: a
+    // panel-coloured track with an accent thumb. Only drawn when the
+    // document overflows the visible rows.
+    if let Some((thumb_y, thumb_h)) = scrollbar_geometry(bottom - top, sb_total, sb_page, sb_first)
+    {
+        let track = D2dRectF {
+            left: width - SCROLLBAR_W,
+            top,
+            right: width,
+            bottom,
+        };
+        fill_rect(fill, target, track, brushes.panel);
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                top: top + thumb_y,
+                bottom: top + thumb_y + thumb_h,
+                ..track
+            },
+            brushes.accent,
+        );
     }
 
     // SAFETY: pairs with the BeginDraw above; null tag pointers are
@@ -1671,6 +1932,7 @@ fn open_document(app: &mut App, path: &Path) {
     };
     let sample_len = (mmap.len() as usize).min(64 * 1024);
     let detection = encoding::detect(&mmap.as_slice()[..sample_len]);
+    app.eol = detect_eol(&mmap.as_slice()[..sample_len]);
     let table = if mmap.is_empty() {
         PieceTable::new(0)
     } else {
@@ -1681,6 +1943,12 @@ fn open_document(app: &mut App, path: &Path) {
         detection,
         Some(path.to_path_buf()),
         app.read_only_flag,
+    );
+    // Roadmap item 6: the owner's configured undo limits apply to
+    // every freshly opened document.
+    app.editor.set_undo_limits(
+        app.settings.undo_limit,
+        app.settings.undo_byte_budget_mb * 1024 * 1024,
     );
     app.doc_generation = 0;
     app.open_generation = 0;
@@ -1693,7 +1961,6 @@ fn open_document(app: &mut App, path: &Path) {
     save_settings(app);
     refresh_title(app);
     refresh_status(app);
-    scrollbar_update(app);
     invalidate(app);
 }
 
@@ -1779,13 +2046,41 @@ fn do_save_as(app: &mut App) -> bool {
     }
 }
 
+/// File ▸ Save Selection to File… (roadmap item 35): stream the
+/// selected bytes straight to a file the owner picks — no clipboard
+/// round-trip, so a selection of any size can be exported. The
+/// byte-moving core is `Editor::save_selection_to`; this only wires
+/// the dialog and the error box. The menu item is greyed unless a
+/// selection exists (see WM_INITMENUPOPUP); the guard here is a
+/// second line of defence.
+fn do_save_selection(app: &mut App) {
+    if app.editor.selection_range().is_none() {
+        return;
+    }
+    let Some(path) = file_dialog(app, true, Some("selection.bin")) else {
+        return;
+    };
+    if let Err(err) = app.editor.save_selection_to(&path) {
+        message_box(
+            app.hwnd,
+            &format!("Could not save the selection to {}:\n{err}", path.display()),
+            "VeloEdit",
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Find bar
 // ---------------------------------------------------------------------------
 
 fn show_find_bar(app: &mut App, focus_replace: bool) {
     app.find_visible = true;
-    for hwnd in &app.find_controls {
+    for hwnd in app
+        .find_controls
+        .iter()
+        .chain([&app.find_label, &app.replace_label])
+    {
         // SAFETY: our child windows.
         unsafe { ShowWindow(*hwnd, SW_SHOW) };
     }
@@ -1814,7 +2109,11 @@ fn show_find_bar(app: &mut App, focus_replace: bool) {
 
 fn hide_find_bar(app: &mut App) {
     app.find_visible = false;
-    for hwnd in &app.find_controls {
+    for hwnd in app
+        .find_controls
+        .iter()
+        .chain([&app.find_label, &app.replace_label])
+    {
         // SAFETY: our child windows.
         unsafe { ShowWindow(*hwnd, SW_HIDE) };
     }
@@ -1868,7 +2167,6 @@ fn find_from_bar(app: &mut App, advance: i32) {
     let page = page_rows(app);
     app.editor.ensure_caret_visible(page);
     refresh_status(app);
-    scrollbar_update(app);
     invalidate(app);
 }
 
@@ -1900,7 +2198,6 @@ fn do_replace(app: &mut App, all: bool) {
     }
     refresh_title(app);
     refresh_status(app);
-    scrollbar_update(app);
     invalidate(app);
 }
 
@@ -1927,13 +2224,22 @@ fn apply_theme(app: &mut App) {
         if !app.edit_brush.is_null() {
             DeleteObject(app.edit_brush as HGDIOBJ);
         }
+        if !app.line_brush.is_null() {
+            DeleteObject(app.line_brush as HGDIOBJ);
+        }
+        if !app.accent_brush.is_null() {
+            DeleteObject(app.accent_brush as HGDIOBJ);
+        }
     }
     // SAFETY: CreateSolidBrush is a plain factory call; the brushes
     // are owned by the app and deleted in apply_theme / WM_DESTROY.
     unsafe {
         app.panel_brush = CreateSolidBrush(colorref(app.theme.panel));
         app.edit_brush = CreateSolidBrush(colorref(app.theme.bg));
+        app.line_brush = CreateSolidBrush(colorref(app.theme.line));
+        app.accent_brush = CreateSolidBrush(colorref(app.theme.accent));
     }
+    apply_titlebar_theme(app);
     if let Some(mut brushes) = app.brushes.take() {
         brushes.release_all();
     }
@@ -1956,6 +2262,11 @@ fn apply_theme(app: &mut App) {
     }
     save_settings(app);
     refresh_status(app);
+    // The owner-drawn buttons pick their colours up on repaint.
+    for button in app.toolbar.iter().chain(app.find_controls.iter()) {
+        // SAFETY: our child windows.
+        unsafe { InvalidateRect(*button, std::ptr::null(), 1) };
+    }
     invalidate(app);
 }
 
@@ -2254,21 +2565,27 @@ fn create_children(app: &mut App) {
     };
 
     // Toolbar: owner-drawn buttons (themed in WM_DRAWITEM), ids shared
-    // with the menus.
-    let toolbar_defs: [(usize, &str, &str); 7] = [
+    // with the menus. The first six flow from the left; the Text / Hex
+    // mode toggles are created last and anchored to the right end of
+    // the row by layout_children.
+    let toolbar_defs: [(usize, &str, &str); 6] = [
         (CMD_OPEN, "Open", "Open a file (Ctrl+O)"),
         (CMD_SAVE, "Save", "Save the file (Ctrl+S)"),
         (CMD_UNDO, "Undo", "Undo the last change (Ctrl+Z)"),
         (CMD_REDO, "Redo", "Redo the last undone change (Ctrl+Y)"),
         (CMD_FIND, "Find", "Find text (Ctrl+F)"),
         (CMD_REPLACE, "Replace", "Find and replace (Ctrl+H)"),
-        (
-            CMD_MODE_TOGGLE,
-            "Hex",
-            "Switch between text and hex mode (F6)",
-        ),
     ];
     for (id, label, tip) in toolbar_defs {
+        let button = create_child(app, "Button", label, WS_CHILD | WS_VISIBLE | 0xB, 0, id);
+        app.toolbar.push(button);
+        add_tooltip(tooltip, app.hwnd, button, tip);
+    }
+    let mode_defs: [(usize, &str, &str); 2] = [
+        (CMD_MODE_TEXT, "Text", "Text mode"),
+        (CMD_MODE_HEX, "Hex", "Hex mode (F6 toggles)"),
+    ];
+    for (id, label, tip) in mode_defs {
         let button = create_child(app, "Button", label, WS_CHILD | WS_VISIBLE | 0xB, 0, id);
         app.toolbar.push(button);
         add_tooltip(tooltip, app.hwnd, button, tip);
@@ -2278,18 +2595,13 @@ fn create_children(app: &mut App) {
     // in find_controls is fixed — layout_children indexes into it.
     let edit_style = WS_CHILD | 0x80; // ES_AUTOHSCROLL
     let button_style = WS_CHILD | 0xB; // BS_OWNERDRAW
-    app.find_edit = create_child(app, "Edit", "", edit_style, WS_EX_CLIENTEDGE, ID_FIND_EDIT);
+    app.find_label = create_child(app, "Static", "Find:", WS_CHILD, 0, 0);
+    app.replace_label = create_child(app, "Static", "Replace:", WS_CHILD, 0, 0);
+    app.find_edit = create_child(app, "Edit", "", edit_style, 0, ID_FIND_EDIT);
     let prev = create_child(app, "Button", "Prev", button_style, 0, CMD_FIND_PREV);
     let next = create_child(app, "Button", "Next", button_style, 0, CMD_FIND_NEXT);
     app.find_count = create_child(app, "Static", "", WS_CHILD, 0, ID_FIND_COUNT);
-    app.replace_edit = create_child(
-        app,
-        "Edit",
-        "",
-        edit_style,
-        WS_EX_CLIENTEDGE,
-        ID_REPLACE_EDIT,
-    );
+    app.replace_edit = create_child(app, "Edit", "", edit_style, 0, ID_REPLACE_EDIT);
     let replace = create_child(app, "Button", "Replace", button_style, 0, CMD_DO_REPLACE);
     let replace_all = create_child(
         app,
@@ -2330,8 +2642,11 @@ fn create_children(app: &mut App) {
     subclass_edit(app.find_edit, app.hwnd);
     subclass_edit(app.replace_edit, app.hwnd);
 
-    // Status strip: a static control, themed via WM_CTLCOLORSTATIC.
+    // Status strip: two static controls, themed via WM_CTLCOLORSTATIC
+    // — position on the left, document facts right-aligned (SS_RIGHT
+    // = 0x2).
     app.status = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE, 0, 0);
+    app.status_right = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE | 0x2, 0, 0);
 }
 
 fn menu_item(menu: HMENU, id: usize, text: &str) {
@@ -2361,6 +2676,7 @@ fn build_menus(app: &mut App) {
         menu_item(file, CMD_OPEN, "Open\tCtrl+O");
         menu_item(file, CMD_SAVE, "Save\tCtrl+S");
         menu_item(file, CMD_SAVE_AS, "Save As\u{2026}");
+        menu_item(file, CMD_SAVE_SELECTION, "Save Selection to File\u{2026}");
         app.recent_menu = CreatePopupMenu();
         menu_popup(file, app.recent_menu, "Recent");
         menu_sep(file);
@@ -2378,6 +2694,13 @@ fn build_menus(app: &mut App) {
         menu_item(edit, CMD_REPLACE, "Replace\tCtrl+H");
         menu_sep(edit);
         menu_item(edit, CMD_SELECT_ALL, "Select All\tCtrl+A");
+
+        let search = CreatePopupMenu();
+        menu_item(search, CMD_FIND, "Find\u{2026}\tCtrl+F");
+        menu_item(search, CMD_REPLACE, "Replace\u{2026}\tCtrl+H");
+        menu_sep(search);
+        menu_item(search, CMD_FIND_NEXT, "Find Next\tF3");
+        menu_item(search, CMD_FIND_PREV, "Find Previous\tShift+F3");
 
         let view = CreatePopupMenu();
         app.view_menu = view;
@@ -2400,13 +2723,16 @@ fn build_menus(app: &mut App) {
         menu_sep(view);
         menu_item(view, CMD_FONT_BIGGER, "Font Size +\tCtrl++");
         menu_item(view, CMD_FONT_SMALLER, "Font Size \u{2212}\tCtrl+-");
+        menu_sep(view);
+        menu_item(view, CMD_VIEW_RULER, "Column Ruler");
 
         let help = CreatePopupMenu();
-        menu_item(help, CMD_GUIDE, "Guide\tF1");
+        menu_item(help, CMD_GUIDE, "Built-in Guide\tF1");
         menu_item(help, CMD_ABOUT, "About VeloEdit");
 
         menu_popup(bar, file, "File");
         menu_popup(bar, edit, "Edit");
+        menu_popup(bar, search, "Search");
         menu_popup(bar, view, "View");
         menu_popup(bar, help, "Help");
         SetMenu(app.hwnd, bar);
@@ -2455,18 +2781,23 @@ fn refresh_menu_checks(app: &App) {
             let flags = MF_BYCOMMAND | if id == active_accent { MF_CHECKED } else { 0 };
             CheckMenuItem(app.accent_menu, id as u32, flags);
         }
+        // The column ruler item is checked whenever a column is set
+        // (the item cycles Off → 80 → 120 → Off when chosen).
+        CheckMenuItem(
+            app.view_menu,
+            CMD_VIEW_RULER as u32,
+            MF_BYCOMMAND
+                | if app.settings.ruler_column > 0 {
+                    MF_CHECKED
+                } else {
+                    0
+                },
+        );
     }
-    // The toolbar mode button shows the *other* mode's name as the
-    // action it performs.
-    if let Some(button) = app.toolbar.get(6) {
-        let label = match app.editor.mode() {
-            EditorMode::Text => "Hex",
-            EditorMode::Hex => "Text",
-        };
-        let wide = wstr(label);
-        // SAFETY: our toolbar button.
-        unsafe { SetWindowTextW(*button, wide.as_ptr()) };
-    }
+    // The toolbar's Text / Hex toggle buttons show their state in
+    // their owner-drawn faces; a mode change repaints them via
+    // set_mode, and menu opens repaint nothing, so there is nothing
+    // further to sync here.
 }
 
 // ---------------------------------------------------------------------------
@@ -2580,7 +2911,6 @@ fn after_edit(app: &mut App) {
     app.editor.ensure_caret_visible(page);
     refresh_title(app);
     refresh_status(app);
-    scrollbar_update(app);
     invalidate(app);
 }
 
@@ -2591,7 +2921,11 @@ fn set_mode(app: &mut App, mode: EditorMode) {
     app.editor.set_mode(mode);
     refresh_menu_checks(app);
     refresh_status(app);
-    scrollbar_update(app);
+    // The mode toggle buttons redraw their active state.
+    for button in app.toolbar.iter().skip(6) {
+        // SAFETY: our child windows.
+        unsafe { InvalidateRect(*button, std::ptr::null(), 1) };
+    }
     invalidate(app);
 }
 
@@ -2607,46 +2941,6 @@ fn scroll_by(app: &mut App, delta: i64) {
         }
     }
     invalidate(app);
-}
-
-fn on_vscroll(app: &mut App, wparam: WPARAM) {
-    let code = (wparam & 0xFFFF) as i32;
-    let page = page_rows(app) as i64;
-    // SB_LINEUP=0, SB_LINEDOWN=1, SB_PAGEUP=2, SB_PAGEDOWN=3,
-    // SB_THUMBPOSITION=4, SB_THUMBTRACK=5, SB_TOP=6, SB_BOTTOM=7.
-    match code {
-        0 => scroll_by(app, -1),
-        1 => scroll_by(app, 1),
-        2 => scroll_by(app, -page),
-        3 => scroll_by(app, page),
-        6 => scroll_by(app, i64::MIN / 2),
-        7 => scroll_by(app, i64::MAX / 2),
-        4 | 5 => {
-            // SAFETY: SCROLLINFO is a plain C struct; SIF_TRACKPOS
-            // (0x10) asks for the drag position.
-            let mut info: SCROLLINFO = unsafe { std::mem::zeroed() };
-            info.cbSize = std::mem::size_of::<SCROLLINFO>() as u32;
-            info.fMask = 0x10;
-            // SAFETY: our window; `info` outlives the call.
-            if unsafe { GetScrollInfo(app.hwnd, SB_VERT, &mut info) } != 0 {
-                let total = match app.editor.mode() {
-                    EditorMode::Text => app.editor.line_count(),
-                    EditorMode::Hex => hexview::row_count(app.editor.total_len()),
-                };
-                let first = hexview::offset_for_thumb(
-                    info.nTrackPos.max(0) as u64,
-                    total.max(1),
-                    SCROLL_TRACK as u64,
-                );
-                match app.editor.mode() {
-                    EditorMode::Text => app.editor.set_first_line(first),
-                    EditorMode::Hex => app.editor.set_first_row(first),
-                }
-                invalidate(app);
-            }
-        }
-        _ => {}
-    }
 }
 
 fn on_wheel(app: &mut App, wparam: WPARAM) {
@@ -2719,6 +3013,9 @@ fn on_command(app: &mut App, id: usize) {
         }
         CMD_SAVE_AS => {
             do_save_as(app);
+        }
+        CMD_SAVE_SELECTION => {
+            do_save_selection(app);
         }
         CMD_EXIT => {
             // SAFETY: posting our own close message.
@@ -2804,10 +3101,21 @@ fn on_command(app: &mut App, id: usize) {
                 drop_format(app);
                 ensure_format(app);
                 save_settings(app);
-                scrollbar_update(app);
                 refresh_status(app);
                 invalidate(app);
             }
+        }
+        CMD_VIEW_RULER => {
+            // Cycle Off → 80 → 120 → Off (roadmap item 21), persisted
+            // like every other view choice.
+            app.settings.ruler_column = match app.settings.ruler_column {
+                0 => 80,
+                80 => 120,
+                _ => 0,
+            };
+            save_settings(app);
+            refresh_menu_checks(app);
+            invalidate(app);
         }
         CMD_GUIDE => show_help(app),
         CMD_ABOUT => {
@@ -2909,6 +3217,11 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
         0x70 => {
             // VK_F1
             show_help(app);
+            return true;
+        }
+        0x72 => {
+            // VK_F3 (Shift+F3: previous match)
+            on_command(app, if shift { CMD_FIND_PREV } else { CMD_FIND_NEXT });
             return true;
         }
         0x75 => {
@@ -3069,6 +3382,79 @@ fn on_mouse_down(app: &mut App, lparam: LPARAM, double: bool) {
     invalidate(app);
 }
 
+/// What a press on the custom scrollbar means: a thumb grab (with the
+/// pointer's DIP offset from the thumb's top) or a page step toward
+/// the click.
+enum ScrollHit {
+    Thumb(f32),
+    Page(i64),
+}
+
+/// Hit-test the custom scrollbar for a point in physical pixels.
+fn scrollbar_hit(app: &mut App, x_px: i32, y_px: i32) -> Option<ScrollHit> {
+    let layout = compute_layout(app);
+    let x = app.dip(x_px);
+    let y = app.dip(y_px);
+    if x < layout.width - SCROLLBAR_W || y < layout.editor_top || y >= layout.editor_bottom {
+        return None;
+    }
+    let (total, first, visible) = scroll_metrics(app);
+    let track_h = layout.editor_bottom - layout.editor_top;
+    let (thumb_y, thumb_h) = scrollbar_geometry(track_h, total, visible, first)?;
+    let rel = y - layout.editor_top;
+    if rel < thumb_y {
+        Some(ScrollHit::Page(-(visible as i64)))
+    } else if rel > thumb_y + thumb_h {
+        Some(ScrollHit::Page(visible as i64))
+    } else {
+        Some(ScrollHit::Thumb(rel - thumb_y))
+    }
+}
+
+/// WM_LBUTTONDOWN on the scrollbar: grab the thumb or page toward the
+/// click. Returns true when the press was the scrollbar's.
+fn on_scrollbar_down(app: &mut App, lparam: LPARAM) -> bool {
+    let (x, y) = mouse_xy(lparam);
+    match scrollbar_hit(app, x, y) {
+        None => false,
+        Some(ScrollHit::Page(delta)) => {
+            scroll_by(app, delta);
+            true
+        }
+        Some(ScrollHit::Thumb(grab)) => {
+            app.scroll_drag = Some(grab);
+            // SAFETY: clicking the scrollbar focuses the main window
+            // and captures the mouse for the drag (released on
+            // button up).
+            unsafe { SetFocus(app.hwnd) };
+            // SAFETY: as above.
+            unsafe { SetCapture(app.hwnd) };
+            true
+        }
+    }
+}
+
+/// WM_MOUSEMOVE during a scrollbar thumb drag: convert the pointer
+/// back into a first visible row through the inverse geometry helper
+/// and the same editor scroll setters the wheel uses.
+fn on_scrollbar_move(app: &mut App, lparam: LPARAM) -> bool {
+    let Some(grab) = app.scroll_drag else {
+        return false;
+    };
+    let (_, y_px) = mouse_xy(lparam);
+    let layout = compute_layout(app);
+    let (total, _, visible) = scroll_metrics(app);
+    let track_h = layout.editor_bottom - layout.editor_top;
+    let thumb_y = app.dip(y_px) - layout.editor_top - grab;
+    let first = scrollbar_first_row(track_h, total, visible, thumb_y);
+    match app.editor.mode() {
+        EditorMode::Text => app.editor.set_first_line(first),
+        EditorMode::Hex => app.editor.set_first_row(first),
+    }
+    invalidate(app);
+    true
+}
+
 // ---------------------------------------------------------------------------
 // The window procedure and the entry point
 // ---------------------------------------------------------------------------
@@ -3114,7 +3500,7 @@ unsafe extern "system" fn wnd_proc(
         layout_children(app);
         refresh_title(app);
         refresh_status(app);
-        scrollbar_update(app);
+        apply_titlebar_theme(app);
         return 0;
     }
     if msg == WM_NCDESTROY {
@@ -3163,7 +3549,7 @@ unsafe extern "system" fn wnd_proc(
                     width: ((lparam & 0xFFFF) as u32).max(1),
                     height: (((lparam >> 16) & 0xFFFF) as u32).max(1),
                 };
-                // SAFETY: slot 57 is ID2D1HwndRenderTarget::Resize per
+                // SAFETY: slot 58 is ID2D1HwndRenderTarget::Resize per
                 // d2d1.h; on failure the target is dropped and the next
                 // paint recreates it.
                 let resize: unsafe extern "system" fn(*mut c_void, *const D2dSizeU) -> i32 =
@@ -3174,7 +3560,6 @@ unsafe extern "system" fn wnd_proc(
                 }
             }
             layout_children(app);
-            scrollbar_update(app);
             0
         }
         WM_GETMINMAXINFO => {
@@ -3186,24 +3571,24 @@ unsafe extern "system" fn wnd_proc(
             };
             0
         }
-        WM_VSCROLL => {
-            on_vscroll(app, wparam);
-            0
-        }
         WM_MOUSEWHEEL => {
             on_wheel(app, wparam);
             0
         }
         WM_LBUTTONDOWN => {
-            on_mouse_down(app, lparam, false);
+            if !on_scrollbar_down(app, lparam) {
+                on_mouse_down(app, lparam, false);
+            }
             0
         }
         WM_LBUTTONDBLCLK => {
-            on_mouse_down(app, lparam, true);
+            if !on_scrollbar_down(app, lparam) {
+                on_mouse_down(app, lparam, true);
+            }
             0
         }
         WM_MOUSEMOVE => {
-            if app.dragging {
+            if !on_scrollbar_move(app, lparam) && app.dragging {
                 let (x, y) = mouse_xy(lparam);
                 let offset = pos_to_offset(app, x, y);
                 app.editor.move_caret_to(offset, true);
@@ -3213,7 +3598,11 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_LBUTTONUP => {
-            if app.dragging {
+            if app.scroll_drag.is_some() {
+                app.scroll_drag = None;
+                // SAFETY: pairs with the SetCapture at thumb grab.
+                unsafe { ReleaseCapture() };
+            } else if app.dragging {
                 app.dragging = false;
                 // SAFETY: pairs with the SetCapture at mouse-down.
                 unsafe { ReleaseCapture() };
@@ -3263,6 +3652,7 @@ unsafe extern "system" fn wnd_proc(
                         );
                     };
                     set(file_menu, CMD_SAVE, can_edit);
+                    set(file_menu, CMD_SAVE_SELECTION, has_selection);
                     set(edit_menu, CMD_UNDO, app.editor.can_undo());
                     set(edit_menu, CMD_REDO, app.editor.can_redo());
                     set(edit_menu, CMD_CUT, can_edit && has_selection);
@@ -3295,7 +3685,6 @@ unsafe extern "system" fn wnd_proc(
                         if let Some((epoch, index)) = ready {
                             if epoch == app.index_epoch {
                                 app.editor.attach_line_index(index);
-                                scrollbar_update(app);
                                 invalidate(app);
                             }
                         }
@@ -3336,7 +3725,7 @@ unsafe extern "system" fn wnd_proc(
                 app.dpi = 96;
             }
             if !app.target.is_null() {
-                // SAFETY: slot 50 is ID2D1RenderTarget::SetDpi per
+                // SAFETY: slot 51 is ID2D1RenderTarget::SetDpi per
                 // d2d1.h; the following SetWindowPos triggers WM_SIZE,
                 // which resizes the target.
                 let set_dpi: unsafe extern "system" fn(*mut c_void, f32, f32) =
@@ -3359,7 +3748,6 @@ unsafe extern "system" fn wnd_proc(
                 );
             }
             layout_children(app);
-            scrollbar_update(app);
             invalidate(app);
             0
         }
@@ -3406,6 +3794,11 @@ unsafe extern "system" fn wnd_proc(
             // owner-drawn buttons.
             let dis = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
             let pressed = dis.itemState & 0x1 != 0; // ODS_SELECTED
+                                                    // The mode toggle for the *active* mode is picked out in
+                                                    // the accent colour (text and border), as in the mockup.
+            let active_mode = (dis.CtlID as usize == CMD_MODE_TEXT
+                && app.editor.mode() == EditorMode::Text)
+                || (dis.CtlID as usize == CMD_MODE_HEX && app.editor.mode() == EditorMode::Hex);
             let brush = if pressed {
                 app.edit_brush
             } else {
@@ -3415,8 +3808,24 @@ unsafe extern "system" fn wnd_proc(
             // SAFETY: GDI drawing on the button's own DC.
             unsafe {
                 FillRect(dis.hDC, &rect, brush);
+                FrameRect(
+                    dis.hDC,
+                    &rect,
+                    if active_mode {
+                        app.accent_brush
+                    } else {
+                        app.line_brush
+                    },
+                );
                 SetBkMode(dis.hDC, TRANSPARENT as i32);
-                SetTextColor(dis.hDC, colorref(app.theme.text));
+                SetTextColor(
+                    dis.hDC,
+                    colorref(if active_mode {
+                        app.theme.accent
+                    } else {
+                        app.theme.text
+                    }),
+                );
                 let text = window_text(dis.hwndItem);
                 let mut wide: Vec<u16> = text.encode_utf16().collect();
                 if !wide.is_empty() {
@@ -3444,7 +3853,11 @@ unsafe extern "system" fn wnd_proc(
                 }
                 let layout = compute_layout(app);
                 let y = app.dip(pt.y);
-                if y >= layout.editor_top && y < layout.editor_bottom {
+                let x = app.dip(pt.x);
+                if y >= layout.editor_top
+                    && y < layout.editor_bottom
+                    && x < layout.width - SCROLLBAR_W
+                {
                     // SAFETY: loading the shared I-beam cursor.
                     let cursor = unsafe { LoadCursorW(std::ptr::null_mut(), IDC_IBEAM) };
                     // SAFETY: as above.
@@ -3492,6 +3905,14 @@ unsafe extern "system" fn wnd_proc(
                 if !app.edit_brush.is_null() {
                     DeleteObject(app.edit_brush as HGDIOBJ);
                     app.edit_brush = std::ptr::null_mut();
+                }
+                if !app.line_brush.is_null() {
+                    DeleteObject(app.line_brush as HGDIOBJ);
+                    app.line_brush = std::ptr::null_mut();
+                }
+                if !app.accent_brush.is_null() {
+                    DeleteObject(app.accent_brush as HGDIOBJ);
+                    app.accent_brush = std::ptr::null_mut();
                 }
                 com_release(app.dwrite);
                 app.dwrite = std::ptr::null_mut();
@@ -3545,6 +3966,7 @@ pub fn run_gui(options: &CliOptions) -> i32 {
     // The startup document: an explicit file wins; then a recovery
     // snapshot (skipped in read-only viewing); otherwise a blank page.
     let mut index_source: Option<Arc<MmapFile>> = None;
+    let mut startup_eol = "LF";
     let mut editor = if let Some(file) = &options.file {
         let path = Path::new(file);
         match MmapFile::open(path) {
@@ -3552,6 +3974,7 @@ pub fn run_gui(options: &CliOptions) -> i32 {
                 let mmap = Arc::new(mmap);
                 let sample_len = (mmap.len() as usize).min(64 * 1024);
                 let detection = encoding::detect(&mmap.as_slice()[..sample_len]);
+                startup_eol = detect_eol(&mmap.as_slice()[..sample_len]);
                 let table = if mmap.is_empty() {
                     PieceTable::new(0)
                 } else {
@@ -3583,11 +4006,24 @@ pub fn run_gui(options: &CliOptions) -> i32 {
     if options.mode == CliMode::Hex {
         editor.set_mode(EditorMode::Hex);
     }
+    // Roadmap item 6: the owner's configured undo limits, applied
+    // before any edit can be recorded.
+    editor.set_undo_limits(
+        settings.undo_limit,
+        settings.undo_byte_budget_mb * 1024 * 1024,
+    );
+    if options.file.is_none() {
+        // Recovery snapshot (or a blank page): sample what was loaded.
+        let sample = editor.table().read(0, editor.total_len().min(64 * 1024));
+        startup_eol = detect_eol(&sample);
+    }
 
     let theme = Theme::resolve(&settings.theme, settings.accent_override.as_deref());
-    // SAFETY: plain GDI factory calls; the app owns both brushes.
+    // SAFETY: plain GDI factory calls; the app owns the brushes.
     let panel_brush = unsafe { CreateSolidBrush(colorref(theme.panel)) };
     let edit_brush = unsafe { CreateSolidBrush(colorref(theme.bg)) };
+    let line_brush = unsafe { CreateSolidBrush(colorref(theme.line)) };
+    let accent_brush = unsafe { CreateSolidBrush(colorref(theme.accent)) };
     let app = App {
         hwnd: std::ptr::null_mut(),
         editor,
@@ -3605,12 +4041,19 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         line_h: 18.0,
         panel_brush,
         edit_brush,
+        line_brush,
+        accent_brush,
         toolbar: Vec::new(),
         find_controls: Vec::new(),
         find_edit: std::ptr::null_mut(),
         replace_edit: std::ptr::null_mut(),
         find_count: std::ptr::null_mut(),
+        find_label: std::ptr::null_mut(),
+        replace_label: std::ptr::null_mut(),
         status: std::ptr::null_mut(),
+        status_right: std::ptr::null_mut(),
+        eol: startup_eol,
+        scroll_drag: None,
         help_hwnd: std::ptr::null_mut(),
         view_menu: std::ptr::null_mut(),
         recent_menu: std::ptr::null_mut(),
@@ -3671,7 +4114,7 @@ pub fn run_gui(options: &CliOptions) -> i32 {
             0,
             class.as_ptr(),
             wstr("VeloEdit").as_ptr(),
-            WS_OVERLAPPEDWINDOW | WS_VSCROLL | WS_CLIPCHILDREN,
+            WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             x,
             y,
             w,
@@ -3762,6 +4205,34 @@ fn register_classes(hinstance: HINSTANCE) -> bool {
     (unsafe { RegisterClassW(&help_class) }) != 0
 }
 
+/// Attach to the parent process's console, if it has one.
+///
+/// The binary uses the Windows (GUI) subsystem so the editor window
+/// opens without a console of its own (see src/main.rs). When the
+/// program is instead started from a terminal, the headless tools
+/// still need somewhere to print: attaching to the terminal's console
+/// gives them exactly that. A launch with no parent console (a
+/// double-click) makes the call fail, which is harmless — the result
+/// is ignored either way. Called from `crate::cli::run` before
+/// anything prints.
+///
+/// After attaching, the console code pages are set to UTF-8 (65001,
+/// roadmap item 46) so the headless reports — file names especially —
+/// print correctly in the terminal instead of through the legacy
+/// OEM/ANSI code page.
+pub fn attach_parent_console() {
+    // SAFETY: ATTACH_PARENT_PROCESS (u32::MAX) names the parent
+    // process's console; the call takes no pointers and its failure
+    // is benign by design here. The code-page setters take a plain
+    // integer (65001 = UTF-8) and likewise fail benignly when there
+    // is no console; all three results are ignored on purpose.
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(u32::MAX);
+        windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
+        windows_sys::Win32::System::Console::SetConsoleCP(65001);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3798,5 +4269,55 @@ mod tests {
         assert_eq!(SLOT_RT_SET_DPI, 51);
         assert_eq!(SLOT_RT_RESIZE, 58);
         assert_eq!(SLOT_LAYOUT_GET_METRICS, 60);
+        assert_eq!(SLOT_RT_DRAW_RECTANGLE, 16);
+    }
+
+    /// The custom scrollbar's thumb geometry: hidden when everything
+    /// fits, proportional otherwise, clamped to a grabbable minimum.
+    #[test]
+    fn scrollbar_geometry_covers_the_track() {
+        // Everything fits (or there is nothing): no bar.
+        assert_eq!(scrollbar_geometry(200.0, 10, 10, 0), None);
+        assert_eq!(scrollbar_geometry(200.0, 0, 5, 0), None);
+        // Half the document visible: the thumb is half the track, and
+        // the last page leaves it flush with the bottom.
+        assert_eq!(scrollbar_geometry(200.0, 100, 50, 0), Some((0.0, 100.0)));
+        assert_eq!(scrollbar_geometry(200.0, 100, 50, 25), Some((50.0, 100.0)));
+        assert_eq!(scrollbar_geometry(200.0, 100, 50, 50), Some((100.0, 100.0)));
+        // A huge file: the thumb height clamps to the minimum and it
+        // still reaches the bottom on the last page.
+        let (y, h) = scrollbar_geometry(200.0, 1_000_000, 50, 999_950).expect("bar drawn");
+        assert_eq!(h, SCROLL_MIN_THUMB);
+        assert!((y - (200.0 - SCROLL_MIN_THUMB)).abs() < 0.01);
+    }
+
+    /// Dragging converts a thumb position back to a first row; the
+    /// two helpers must round-trip.
+    #[test]
+    fn scrollbar_first_row_inverts_the_geometry() {
+        for first in [0u64, 25, 50, 75] {
+            let (y, _) = scrollbar_geometry(1000.0, 100, 25, first).expect("bar drawn");
+            assert_eq!(scrollbar_first_row(1000.0, 100, 25, y), first);
+        }
+        // Past either end clamps to the document ends.
+        assert_eq!(scrollbar_first_row(1000.0, 100, 25, -50.0), 0);
+        assert_eq!(scrollbar_first_row(1000.0, 100, 25, 99_999.0), 75);
+        // Nothing to scroll: always the first row.
+        assert_eq!(scrollbar_first_row(1000.0, 10, 25, 500.0), 0);
+    }
+
+    /// The status bar's size format: exact bytes, one decimal above.
+    #[test]
+    fn human_size_formats_like_the_status_bar() {
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(5), "5 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1.0 KB");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(1024 * 1024), "1.0 MB");
+        assert_eq!(human_size(5 * 1024 * 1024 * 1024), "5.0 GB");
+        // The design mockup's file size.
+        let gb104 = (104.2 * 1024.0 * 1024.0 * 1024.0) as u64;
+        assert_eq!(human_size(gb104), "104.2 GB");
     }
 }
