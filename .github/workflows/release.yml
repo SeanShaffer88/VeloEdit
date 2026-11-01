@@ -117,7 +117,7 @@ jobs:
           # (v7), which a WiX v4 tool cannot load (WIX0144).
           wix extension add WixToolset.UI.wixext/4.0.6
           if ($LASTEXITCODE -ne 0) { throw "wix extension add failed with exit code $LASTEXITCODE" }
-          wix build installer\Package.wxs -ext WixToolset.UI.wixext -d "ExePath=$PWD\target\x86_64-pc-windows-msvc\release\VeloEdit.exe" -o "dist\VeloEdit-v$version-x64-Setup.msi"
+          wix build installer\Package.wxs -ext WixToolset.UI.wixext -o "dist\VeloEdit-v$version-x64-Setup.msi"
           if ($LASTEXITCODE -ne 0) { throw "wix build failed with exit code $LASTEXITCODE" }
 
       - name: Generate SHA256SUMS.txt
