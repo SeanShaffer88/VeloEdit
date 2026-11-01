@@ -65,6 +65,11 @@ pub const SAVE_BOM_KEEP: &str = "keep";
 pub const SAVE_BOM_ADD: &str = "add";
 pub const SAVE_BOM_REMOVE: &str = "remove";
 
+/// The accepted `map_window_mb` values (slice R4c, roadmap
+/// item 1): 0 = map the whole file (the default); any other stored
+/// value loads as 0.
+pub const MAP_WINDOW_CHOICES_MB: [u32; 5] = [0, 512, 1024, 2048, 4096];
+
 /// The folder that holds all portable program state: `<exe-dir>/data`.
 /// Falls back to a `data/` folder relative to the working directory
 /// when the executable path cannot be determined (tests, odd launchers)
@@ -155,6 +160,21 @@ pub struct Settings {
     /// Number of top lines pinned by the freeze pane (freeze
     /// pane): 0 = off, otherwise 1..=50.
     pub freeze_lines: u32,
+    /// Memory-mapping window for very large files, in megabytes
+    /// (slice R4c, roadmap item 1): one of
+    /// [`MAP_WINDOW_CHOICES_MB`]; 0 maps the whole file. When set,
+    /// the shell's detection/EOL sampling and other whole-slice
+    /// reads go through remapped views of this size instead of a
+    /// whole-file mapping. Settings-file only in this slice (no
+    /// menu entry) — see PARITY.
+    pub map_window_mb: u32,
+    /// Block-clone fast save (slice R4c, roadmap item 4): when
+    /// true, saving a file-backed document first tries cloning the
+    /// original file's extents into the staging file
+    /// (FSCTL_DUPLICATE_EXTENTS_TO_FILE) and writing only the
+    /// changed hunks; any failure falls back to the normal
+    /// streamed save, noted in the status bar. Off by default.
+    pub fast_save_clone: bool,
     /// Line-ending handling for saves (roadmap item 31): one of
     /// the `SAVE_EOL_*` words; anything else loads as "keep".
     pub save_eol: String,
@@ -188,6 +208,8 @@ impl Default for Settings {
             strings_open: false,
             strings_min_len: 4,
             freeze_lines: 0,
+            map_window_mb: 0,
+            fast_save_clone: false,
             save_eol: SAVE_EOL_KEEP.to_string(),
             save_bom: SAVE_BOM_KEEP.to_string(),
             window: None,
@@ -271,6 +293,11 @@ impl Settings {
             self.strings_min_len
         ));
         out.push_str(&format!("  \"freeze_lines\": {},\n", self.freeze_lines));
+        out.push_str(&format!("  \"map_window_mb\": {},\n", self.map_window_mb));
+        out.push_str(&format!(
+            "  \"fast_save_clone\": {},\n",
+            self.fast_save_clone
+        ));
         out.push_str(&format!(
             "  \"save_eol\": \"{}\",\n",
             json_escape(&self.save_eol)
@@ -379,6 +406,14 @@ impl Settings {
                     let n = parser.integer()?;
                     settings.freeze_lines = (n.clamp(0, 50)) as u32;
                 }
+                "map_window_mb" => {
+                    let n = parser.integer()?;
+                    settings.map_window_mb = match n {
+                        0 | 512 | 1024 | 2048 | 4096 => n as u32,
+                        _ => 0, // anything else means whole-file mapping
+                    };
+                }
+                "fast_save_clone" => settings.fast_save_clone = parser.boolean()?,
                 "save_eol" => {
                     let word = parser.string()?;
                     settings.save_eol = match word.as_str() {
@@ -711,6 +746,8 @@ mod tests {
             strings_open: true,
             strings_min_len: 6,
             freeze_lines: 3,
+            map_window_mb: 1024,
+            fast_save_clone: true,
             save_eol: SAVE_EOL_CRLF.to_string(),
             save_bom: SAVE_BOM_ADD.to_string(),
             window: Some((-120, 40, 1100, 750)),
@@ -782,6 +819,28 @@ mod tests {
         let s = Settings::from_json(r#"{"save_eol":"lf","save_bom":"remove"}"#).unwrap();
         assert_eq!(s.save_eol_choice(), EolChoice::Lf);
         assert_eq!(s.save_bom_choice(), BomChoice::Remove);
+    }
+
+    #[test]
+    fn r4c_keys_round_trip_and_validate() {
+        // The sample sets both new keys to non-default values; the
+        // generic round-trip test proves they survive. Here the
+        // map-window choice validation is pinned down.
+        let s = sample();
+        assert_eq!(s.map_window_mb, 1024);
+        assert!(s.fast_save_clone);
+        for mb in [0, 512, 1024, 2048, 4096] {
+            let s = Settings::from_json(&format!("{{\"map_window_mb\":{mb}}}")).unwrap();
+            assert_eq!(s.map_window_mb, mb);
+        }
+        for mb in [1, 256, 8192, -512] {
+            let s = Settings::from_json(&format!("{{\"map_window_mb\":{mb}}}")).unwrap();
+            assert_eq!(s.map_window_mb, 0, "map_window_mb {mb} must load as 0");
+        }
+        let s = Settings::from_json(r#"{"fast_save_clone":true}"#).unwrap();
+        assert!(s.fast_save_clone);
+        assert_eq!(Settings::default().map_window_mb, 0);
+        assert!(!Settings::default().fast_save_clone);
     }
 
     #[test]
