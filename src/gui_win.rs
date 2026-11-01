@@ -245,32 +245,42 @@ const IID_ID2D1_FACTORY: Guid = Guid {
     data4: [0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07],
 };
 
-/// IID_IDWriteFactory from dwrite.h.
+/// IID_IDWriteFactory from dwrite.h. (The data4 second byte is 0xe8;
+/// an 0xee typo here made DWriteCreateFactory return E_NOINTERFACE in
+/// the first field run while Direct2D started fine — the IID test at
+/// the bottom of this file pins every byte.)
 const IID_IDWRITE_FACTORY: Guid = Guid {
     data1: 0xb859_ee5a,
     data2: 0xd838,
     data3: 0x4b5b,
-    data4: [0xa2, 0xee, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48],
+    data4: [0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48],
 };
 
 const D2DERR_RECREATE_TARGET: i32 = 0x8899_000Cu32 as i32;
 
 // Vtable slots (0-based, IUnknown included), per d2d1.h / dwrite.h.
+// The full tables were re-verified against the SDK-generated winapi
+// layouts after the first field run: the render-target slots from
+// Clear onward and the text-layout GetMetrics slot were off (Clear is
+// preceded by both PushAxisAlignedClip AND PopAxisAlignedClip, and
+// IDWriteTextLayout inherits all 25 IDWriteTextFormat methods plus its
+// own getters before GetMetrics) — those calls would have painted
+// wrongly even once startup succeeded.
 const SLOT_RELEASE: usize = 2; // IUnknown::Release — every interface
 const SLOT_D2D_CREATE_HWND_RT: usize = 14; // ID2D1Factory::CreateHwndRenderTarget
 const SLOT_RT_CREATE_SOLID_BRUSH: usize = 8; // ID2D1RenderTarget::CreateSolidColorBrush
 const SLOT_RT_FILL_RECTANGLE: usize = 17; // ID2D1RenderTarget::FillRectangle
 const SLOT_RT_DRAW_TEXT: usize = 27; // ID2D1RenderTarget::DrawText
-const SLOT_RT_CLEAR: usize = 46; // ID2D1RenderTarget::Clear
-const SLOT_RT_BEGIN_DRAW: usize = 47; // ID2D1RenderTarget::BeginDraw
-const SLOT_RT_END_DRAW: usize = 48; // ID2D1RenderTarget::EndDraw
-const SLOT_RT_SET_DPI: usize = 50; // ID2D1RenderTarget::SetDpi
-const SLOT_RT_RESIZE: usize = 57; // ID2D1HwndRenderTarget::Resize
+const SLOT_RT_CLEAR: usize = 47; // ID2D1RenderTarget::Clear
+const SLOT_RT_BEGIN_DRAW: usize = 48; // ID2D1RenderTarget::BeginDraw
+const SLOT_RT_END_DRAW: usize = 49; // ID2D1RenderTarget::EndDraw
+const SLOT_RT_SET_DPI: usize = 51; // ID2D1RenderTarget::SetDpi
+const SLOT_RT_RESIZE: usize = 58; // ID2D1HwndRenderTarget::Resize
 const SLOT_DW_GET_FONT_COLLECTION: usize = 3; // IDWriteFactory::GetSystemFontCollection
 const SLOT_DW_CREATE_TEXT_FORMAT: usize = 15; // IDWriteFactory::CreateTextFormat
 const SLOT_DW_CREATE_TEXT_LAYOUT: usize = 18; // IDWriteFactory::CreateTextLayout
 const SLOT_FC_FIND_FAMILY_NAME: usize = 5; // IDWriteFontCollection::FindFamilyName
-const SLOT_LAYOUT_GET_METRICS: usize = 45; // IDWriteTextLayout::GetMetrics
+const SLOT_LAYOUT_GET_METRICS: usize = 60; // IDWriteTextLayout::GetMetrics
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -390,29 +400,50 @@ unsafe fn com_release(obj: *mut c_void) {
     }
 }
 
-/// Create the single-threaded Direct2D factory (or null on failure).
-fn d2d_create_factory() -> *mut c_void {
-    let mut factory: *mut c_void = std::ptr::null_mut();
-    // SAFETY: the IID is the documented ID2D1Factory GUID; the options
-    // pointer may be null; `factory` is a writable out-slot. The
-    // returned pointer is checked before use and owned by the caller.
-    let hr = unsafe { D2D1CreateFactory(0, &IID_ID2D1_FACTORY, std::ptr::null(), &mut factory) };
-    if hr < 0 {
-        return std::ptr::null_mut();
+/// Create the Direct2D factory: single-threaded first (the documented
+/// fit for a one-UI-thread app), multi-threaded as a fallback. Returns
+/// the factory (or null) plus the last attempt's HRESULT, so a startup
+/// failure can be reported with its exact code instead of a guess.
+fn d2d_create_factory() -> (*mut c_void, i32) {
+    let mut last_hr = 0;
+    for factory_type in [0u32, 1] {
+        let mut factory: *mut c_void = std::ptr::null_mut();
+        // SAFETY: the IID is the documented ID2D1Factory GUID; the
+        // options pointer may be null; `factory` is a writable
+        // out-slot. The returned pointer is checked before use and
+        // owned by the caller.
+        let hr = unsafe {
+            D2D1CreateFactory(
+                factory_type,
+                &IID_ID2D1_FACTORY,
+                std::ptr::null(),
+                &mut factory,
+            )
+        };
+        last_hr = hr;
+        if hr >= 0 && !factory.is_null() {
+            return (factory, hr);
+        }
     }
-    factory
+    (std::ptr::null_mut(), last_hr)
 }
 
-/// Create the shared DirectWrite factory (or null on failure).
-fn dwrite_create_factory() -> *mut c_void {
-    let mut factory: *mut c_void = std::ptr::null_mut();
-    // SAFETY: the IID is the documented IDWriteFactory GUID; `factory`
-    // is a writable out-slot; the result is checked and owned.
-    let hr = unsafe { DWriteCreateFactory(0, &IID_IDWRITE_FACTORY, &mut factory) };
-    if hr < 0 {
-        return std::ptr::null_mut();
+/// Create the DirectWrite factory: shared first, isolated as a
+/// fallback. Same (pointer, last HRESULT) contract as above.
+fn dwrite_create_factory() -> (*mut c_void, i32) {
+    let mut last_hr = 0;
+    for factory_type in [0u32, 1] {
+        let mut factory: *mut c_void = std::ptr::null_mut();
+        // SAFETY: the IID is the documented IDWriteFactory GUID;
+        // `factory` is a writable out-slot; the result is checked and
+        // owned.
+        let hr = unsafe { DWriteCreateFactory(factory_type, &IID_IDWRITE_FACTORY, &mut factory) };
+        last_hr = hr;
+        if hr >= 0 && !factory.is_null() {
+            return (factory, hr);
+        }
     }
-    factory
+    (std::ptr::null_mut(), last_hr)
 }
 
 // ---------------------------------------------------------------------------
@@ -759,7 +790,7 @@ fn measure_cell(app: &mut App) {
         return;
     }
     let mut metrics = DWriteTextMetrics::default();
-    // SAFETY: slot 45 is IDWriteTextLayout::GetMetrics per dwrite.h;
+    // SAFETY: slot 60 is IDWriteTextLayout::GetMetrics per dwrite.h;
     // `metrics` is a writable struct of exactly the header's layout.
     let get_metrics: unsafe extern "system" fn(*mut c_void, *mut DWriteTextMetrics) -> i32 =
         unsafe { vfn(layout, SLOT_LAYOUT_GET_METRICS) };
@@ -3489,12 +3520,17 @@ pub fn run_gui(options: &CliOptions) -> i32 {
 
     let settings = Settings::load_from(&crate::settings::settings_path());
 
-    let d2d = d2d_create_factory();
-    let dwrite = dwrite_create_factory();
+    let (d2d, d2d_hr) = d2d_create_factory();
+    let (dwrite, dwrite_hr) = dwrite_create_factory();
     if d2d.is_null() || dwrite.is_null() {
+        let report = format!(
+            "VeloEdit could not start Direct2D / DirectWrite, which the editor window needs.\n\nError codes: Direct2D 0x{:08X}, DirectWrite 0x{:08X}\nThe headless tools (VeloEdit --help) still work.",
+            d2d_hr as u32, dwrite_hr as u32
+        );
+        eprintln!("{report}");
         message_box(
             std::ptr::null_mut(),
-            "VeloEdit could not start Direct2D / DirectWrite, which the editor window needs.\nThe headless tools (VeloEdit --help) still work.",
+            &report,
             "VeloEdit",
             MB_OK | MB_ICONERROR,
         );
@@ -3684,6 +3720,13 @@ fn register_classes(hinstance: HINSTANCE) -> bool {
     let style = 0x2 | 0x1 | 0x8;
     // SAFETY: loading the shared arrow cursor for both classes.
     let cursor = unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) };
+    // The program icon: resource id 1, embedded by build.rs from
+    // assets/veloedit.ico; the id is passed as a pointer (the
+    // documented MAKEINTRESOURCEW form). Null if the resource were
+    // somehow absent — the classes then get the default icon; never
+    // fatal.
+    // SAFETY: `hinstance` is our own module handle.
+    let icon = unsafe { LoadIconW(hinstance, 1 as *const u16) };
     let main = wstr(MAIN_CLASS);
     let main_class = WNDCLASSW {
         style,
@@ -3691,7 +3734,7 @@ fn register_classes(hinstance: HINSTANCE) -> bool {
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: hinstance,
-        hIcon: std::ptr::null_mut(),
+        hIcon: icon,
         hCursor: cursor,
         hbrBackground: std::ptr::null_mut(),
         lpszMenuName: std::ptr::null(),
@@ -3709,7 +3752,7 @@ fn register_classes(hinstance: HINSTANCE) -> bool {
         cbClsExtra: 0,
         cbWndExtra: 0,
         hInstance: hinstance,
-        hIcon: std::ptr::null_mut(),
+        hIcon: icon,
         hCursor: cursor,
         hbrBackground: std::ptr::null_mut(),
         lpszMenuName: std::ptr::null(),
@@ -3717,4 +3760,43 @@ fn register_classes(hinstance: HINSTANCE) -> bool {
     };
     // SAFETY: as above.
     (unsafe { RegisterClassW(&help_class) }) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The factory IIDs, byte for byte as the SDK headers define them.
+    /// The first field run failed with E_NOINTERFACE because one
+    /// nibble of the DirectWrite IID was wrong while the Direct2D IID
+    /// was right — pin both so a typo can never ship silently again.
+    #[test]
+    fn factory_iids_match_the_sdk() {
+        assert_eq!(IID_ID2D1_FACTORY.data1, 0x0615_2247);
+        assert_eq!(IID_ID2D1_FACTORY.data2, 0x6f50);
+        assert_eq!(IID_ID2D1_FACTORY.data3, 0x465a);
+        assert_eq!(
+            IID_ID2D1_FACTORY.data4,
+            [0x92, 0x45, 0x11, 0x8b, 0xfd, 0x3b, 0x60, 0x07]
+        );
+        assert_eq!(IID_IDWRITE_FACTORY.data1, 0xb859_ee5a);
+        assert_eq!(IID_IDWRITE_FACTORY.data2, 0xd838);
+        assert_eq!(IID_IDWRITE_FACTORY.data3, 0x4b5b);
+        assert_eq!(
+            IID_IDWRITE_FACTORY.data4,
+            [0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48]
+        );
+    }
+
+    /// The vtable slots that were wrong in v1.0.0, pinned to the
+    /// SDK-verified values (see the constants block comment).
+    #[test]
+    fn vtable_slots_match_the_sdk() {
+        assert_eq!(SLOT_RT_CLEAR, 47);
+        assert_eq!(SLOT_RT_BEGIN_DRAW, 48);
+        assert_eq!(SLOT_RT_END_DRAW, 49);
+        assert_eq!(SLOT_RT_SET_DPI, 51);
+        assert_eq!(SLOT_RT_RESIZE, 58);
+        assert_eq!(SLOT_LAYOUT_GET_METRICS, 60);
+    }
 }
