@@ -321,6 +321,264 @@ impl MmapFile {
     }
 }
 
+/// A windowed read-only mapping (slice R4c, roadmap item 1): the
+/// file and its mapping object stay open, but only one window of
+/// the file is mapped as a view at a time; a read outside the
+/// current window remaps. Used when the owner sets
+/// `map_window_mb` — the whole-file [`MmapFile`] remains the
+/// default and is untouched by this type. The window arithmetic
+/// is the pure [`crate::mapwindow`] core; this type is only the
+/// Win32 surface over it. The truncation caveat in the module
+/// docs applies exactly as it does to the whole-file mapping.
+pub struct WindowedMap {
+    path: std::path::PathBuf,
+    len: u64,
+    /// View size in bytes; 0 at open is normalised to the whole
+    /// file length.
+    window: u64,
+    inner: std::sync::Mutex<WindowedInner>,
+}
+
+struct WindowedInner {
+    file: HANDLE,
+    mapping: HANDLE,
+    /// The current view (`null` until the first read, and for a
+    /// zero-length file, whose mapping is never created).
+    view: *mut c_void,
+    view_offset: u64,
+    view_len: u64,
+}
+
+// SAFETY: all access to the view and handles goes through the
+// Mutex (construction and Drop own the value exclusively), so the
+// raw view pointer is never touched concurrently; the view itself
+// is read-only mapped bytes, and reads copy out under the lock.
+unsafe impl Send for WindowedMap {}
+// SAFETY: as above — `&WindowedMap` reaches the view only through
+// the Mutex, and the bytes behind it are immutable.
+unsafe impl Sync for WindowedMap {}
+
+impl WindowedMap {
+    /// Open `path` for windowed reads with views of `window_bytes`
+    /// (0 = one whole-file view). No view is mapped until the
+    /// first read. A zero-length file opens successfully and reads
+    /// as empty.
+    pub fn open(path: &Path, window_bytes: u64) -> Result<Self, MmapError> {
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: same contract as `MmapFile::open` — NUL-terminated
+        // UTF-16 path outliving the call, result checked before use.
+        let file = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        if file == INVALID_HANDLE_VALUE {
+            return Err(step_error(MmapStep::Open));
+        }
+        let mut size: i64 = 0;
+        // SAFETY: `file` is valid (checked above); `size` outlives the call.
+        let ok = unsafe { GetFileSizeEx(file, &mut size) };
+        if ok == 0 || size < 0 {
+            let err = if ok == 0 {
+                step_error(MmapStep::Size)
+            } else {
+                MmapError {
+                    step: MmapStep::Size,
+                    source: io::Error::new(io::ErrorKind::InvalidData, "file size was negative"),
+                }
+            };
+            // SAFETY: `file` is valid and owned by us; closed once here.
+            unsafe { CloseHandle(file) };
+            return Err(err);
+        }
+        let len = size as u64;
+        if len == 0 {
+            // No mapping can exist for an empty file; reads return 0.
+            // SAFETY: `file` is valid and owned by us; closed once here.
+            unsafe { CloseHandle(file) };
+            return Ok(Self {
+                path: path.to_path_buf(),
+                len: 0,
+                window: 1,
+                inner: std::sync::Mutex::new(WindowedInner {
+                    file: std::ptr::null_mut(),
+                    mapping: std::ptr::null_mut(),
+                    view: std::ptr::null_mut(),
+                    view_offset: 0,
+                    view_len: 0,
+                }),
+            });
+        }
+        // SAFETY: `file` is a valid handle to a non-empty file; size
+        // 0/0 sizes the mapping object to the whole file (views map
+        // subranges of it). Null-checked before use.
+        let mapping = unsafe {
+            CreateFileMappingW(
+                file,
+                std::ptr::null(),
+                PAGE_READONLY,
+                0,
+                0,
+                std::ptr::null(),
+            )
+        };
+        if mapping.is_null() {
+            let err = step_error(MmapStep::Mapping);
+            // SAFETY: `file` is valid and owned by us; closed once here.
+            unsafe { CloseHandle(file) };
+            return Err(err);
+        }
+        Ok(Self {
+            path: path.to_path_buf(),
+            len,
+            window: if window_bytes == 0 { len } else { window_bytes },
+            inner: std::sync::Mutex::new(WindowedInner {
+                file,
+                mapping,
+                view: std::ptr::null_mut(),
+                view_offset: 0,
+                view_len: 0,
+            }),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Make `plan`'s view the current one. Returns false when the
+    /// OS refuses the view (the caller stops the read short rather
+    /// than faulting).
+    fn ensure_view(inner: &mut WindowedInner, plan: crate::mapwindow::WindowPlan) -> bool {
+        if !inner.view.is_null()
+            && inner.view_offset == plan.view_offset
+            && inner.view_len == plan.view_len
+        {
+            return true;
+        }
+        if !inner.view.is_null() {
+            // SAFETY: `view` came from MapViewOfFile on this mapping
+            // and has not been unmapped; this is its one release.
+            let address = MEMORY_MAPPED_VIEW_ADDRESS { Value: inner.view };
+            unsafe { UnmapViewOfFile(address) };
+            inner.view = std::ptr::null_mut();
+            inner.view_len = 0;
+        }
+        // SAFETY: `mapping` is a valid mapping handle owned by this
+        // value; the offset is allocation-granularity aligned and
+        // the length clamped inside the file (the pure planner
+        // guarantees both). Null-checked before it is stored.
+        let view = unsafe {
+            MapViewOfFile(
+                inner.mapping,
+                FILE_MAP_READ,
+                (plan.view_offset >> 32) as u32,
+                (plan.view_offset & 0xFFFF_FFFF) as u32,
+                plan.view_len as usize,
+            )
+        };
+        if view.Value.is_null() {
+            return false;
+        }
+        inner.view = view.Value;
+        inner.view_offset = plan.view_offset;
+        inner.view_len = plan.view_len;
+        true
+    }
+
+    /// Read bytes at `offset` into `out`, remapping windows as the
+    /// read crosses them. Follows the usual read contract: returns
+    /// how many bytes were filled (0 at or past the end, or when a
+    /// view could not be mapped).
+    pub fn read_at(&self, offset: u64, out: &mut [u8]) -> usize {
+        if offset >= self.len || out.is_empty() {
+            return 0;
+        }
+        let want_total = ((self.len - offset).min(out.len() as u64)) as usize;
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut filled = 0usize;
+        while filled < want_total {
+            let pos = offset + filled as u64;
+            let Some(plan) = crate::mapwindow::plan_window(
+                self.len,
+                pos,
+                (want_total - filled) as u64,
+                self.window,
+                crate::mapwindow::WINDOW_ALIGNMENT,
+            ) else {
+                break;
+            };
+            if !Self::ensure_view(&mut inner, plan) {
+                break;
+            }
+            let n = (plan.readable() as usize).min(want_total - filled);
+            if n == 0 {
+                break;
+            }
+            // SAFETY: the view is live (just ensured) and covers
+            // `plan.view_len` bytes; the planner guarantees
+            // `skip + n <= view_len`; `out` is writable for
+            // `filled + n` bytes; the Mutex is held, so the view
+            // cannot be remapped mid-copy; the regions cannot
+            // overlap (a mapped file view vs a caller buffer).
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (inner.view as *const u8).add(plan.skip),
+                    out.as_mut_ptr().add(filled),
+                    n,
+                );
+            }
+            filled += n;
+        }
+        filled
+    }
+}
+
+impl Drop for WindowedMap {
+    fn drop(&mut self) {
+        let inner = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // SAFETY: Drop owns the value exclusively; the view and
+        // handles are released exactly once, view first (the order
+        // the whole-file type uses).
+        unsafe {
+            if !inner.view.is_null() {
+                let address = MEMORY_MAPPED_VIEW_ADDRESS { Value: inner.view };
+                UnmapViewOfFile(address);
+            }
+            if !inner.mapping.is_null() {
+                CloseHandle(inner.mapping);
+            }
+            if !inner.file.is_null() {
+                CloseHandle(inner.file);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +615,33 @@ mod tests {
         assert!(matches!(mmap, MmapFile::Empty));
         assert_eq!(mmap.len(), 0);
         assert_eq!(mmap.as_slice(), b"");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn windowed_map_reads_across_windows() {
+        // A 300 KB pattern read through a 64 KB window forces
+        // several remaps, including mid-read.
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        let path = temp_file("windowed", &data);
+        let map = WindowedMap::open(&path, 65_536).unwrap();
+        assert_eq!(map.len(), data.len() as u64);
+        let mut out = vec![0u8; 1000];
+        assert_eq!(map.read_at(0, &mut out), 1000);
+        assert_eq!(out, data[..1000]);
+        // A read straddling the window alignment edge.
+        assert_eq!(map.read_at(65_000, &mut out), 1000);
+        assert_eq!(out, data[65_000..66_000]);
+        // A bulk read crossing several windows.
+        let mut bulk = vec![0u8; 200_000];
+        assert_eq!(map.read_at(50_000, &mut bulk), 200_000);
+        assert_eq!(bulk, data[50_000..250_000]);
+        // The tail reads short; past-the-end reads nothing.
+        let mut tail = vec![0u8; 500];
+        assert_eq!(map.read_at(299_900, &mut tail), 100);
+        assert_eq!(tail[..100], data[299_900..]);
+        assert_eq!(map.read_at(300_000, &mut tail), 0);
+        drop(map);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
