@@ -18,12 +18,66 @@ release asset naming in the specification.
 - A startup failure now reports the exact Direct2D and DirectWrite
   error codes in its message and on the console, instead of a
   generic note.
+- Launching the editor no longer opens a console window beside
+  it. The command-line tools are unchanged: started from a
+  terminal, they print in that terminal as before.
+
+### Changed
+
+- The editor window now follows the design mockup: a dark themed
+  title bar showing the document's file name, an accent strip along
+  the top of the window, and a Search menu between Edit and View.
+- Toolbar and find-bar buttons are flat and theme-drawn with thin
+  borders; the mode switch is a pair of Text / Hex toggle buttons
+  at the right of the toolbar, with the active mode shown in the
+  accent colour.
+- The find bar has "Find:" and "Replace:" labels and borderless,
+  theme-coloured input fields.
+- The scrollbar is drawn by the editor itself — a slim track with
+  an accent-coloured thumb — instead of the system scrollbar.
+- The status bar shows the caret position and selection size on
+  the left, and the encoding, line-ending style, and file size on
+  the right; sizes above 1 KB use one decimal (for example
+  "104.2 GB").
+- Every find match in view is washed with the match colour and
+  the current match is also outlined in the accent colour; the
+  current line's number (or hex address) uses the accent colour.
+- Command-line exit codes now follow one scheme everywhere:
+  0 = success (for `--find`: at least one match; for `--diff`:
+  files identical), 1 = `--find` found nothing / `--diff` found
+  differences, 2 = usage or I/O error. Previously `--diff` used 3
+  for "files differ", `--find` returned 0 even with no matches,
+  and errors returned 1.
+- When the command-line tools run in a terminal, the console now
+  uses UTF-8, so file names and reports print correctly.
 
 ### Added
 
 - Program icon: the supplied artwork is embedded in the executable
   (Explorer, taskbar, and window icon), and the same icon is used by
   the installer, the uninstaller, and the MSI package.
+- `extract` command: `VeloEdit extract <file> --start <N>
+  --length <M> --out <file>` copies one byte range of a file to
+  another file, streamed in 4 MB chunks. Offsets are decimal or
+  0x-hex; the range is clamped to the file, and a start past the
+  end of the file is an error.
+- File ▸ Save Selection to File… writes the selected bytes
+  straight to a file, streamed in chunks — a selection of any size
+  can be exported, with no clipboard limits.
+- View ▸ Column Ruler cycles a vertical guideline at column 80 or
+  120 (or off), drawn in text mode; the choice is remembered.
+- Two more themes — "High Contrast" (black background, white text,
+  yellow accent) and "E-ink" (paper background, near-black text) —
+  for 20 built-in themes in total. The accent picker gains three
+  colour-blind-safe presets: Okabe Blue, Okabe Orange, Okabe Sky.
+- Saves and save-copy now check the free disk space before any
+  byte is written: when the target's disk has less free than the
+  document's size plus 5%, the save is refused up front with a
+  clear message instead of failing halfway through the write.
+- Undo depth is now configurable in settings: `undo_limit` (steps,
+  default 1024) and `undo_byte_budget_mb` (megabytes of stored
+  changes, default 256). The oldest changes are dropped first when
+  either limit is reached.
 
 ## [1.0.0] — 2026-10-31
 
