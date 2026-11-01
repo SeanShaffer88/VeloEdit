@@ -396,6 +396,15 @@ impl Editor {
         self.history.can_redo()
     }
 
+    /// Replace the undo history with one bounded by the owner's
+    /// configured limits (roadmap item 6: a step limit and a byte
+    /// budget, from `data/settings.json`). Anything already recorded
+    /// is discarded, so the shell calls this on a freshly built
+    /// editor, before any edit is made.
+    pub fn set_undo_limits(&mut self, steps: usize, byte_budget: u64) {
+        self.history = UndoStack::with_limits(steps, byte_budget);
+    }
+
     /// The selected byte range `(start, end)`, or `None` when the
     /// selection is empty (anchor unset or equal to the caret).
     pub fn selection_range(&self) -> Option<(u64, u64)> {
@@ -1416,6 +1425,21 @@ impl Editor {
         Ok(self.finish_save(report))
     }
 
+    /// Stream the current selection straight to a new file at `dest`
+    /// (roadmap item 35), in chunks, with no clipboard involved — a
+    /// selection of any size can be exported. Returns the number of
+    /// bytes written; an empty selection writes an empty file and
+    /// returns 0 (the shell only offers the command when a selection
+    /// exists, so this is just the honest core behaviour).
+    pub fn save_selection_to(&self, dest: &Path) -> std::io::Result<u64> {
+        match self.selection_range() {
+            Some((start, end)) => {
+                crate::save::write_range_to_file(&self.table, start, end - start, dest)
+            }
+            None => crate::save::write_range_to_file(&self.table, 0, 0, dest),
+        }
+    }
+
     fn require_writable_save(&self) -> Result<(), EditorError> {
         if self.read_only {
             return Err(EditorError::ReadOnly);
@@ -1525,6 +1549,46 @@ mod tests {
         assert_eq!(std::fs::read(&src).unwrap(), b"data");
         std::fs::remove_file(&src).ok();
         std::fs::remove_file(&dst).ok();
+    }
+
+    #[test]
+    fn save_selection_writes_exactly_the_selected_bytes() {
+        let dst = temp_path("sel-out.bin");
+        let mut e = ed(b"hello world");
+        for _ in 0..5 {
+            e.move_right(true);
+        }
+        assert_eq!(e.selection_range(), Some((0, 5)));
+        let written = e.save_selection_to(&dst).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"hello");
+        std::fs::remove_file(&dst).ok();
+    }
+
+    #[test]
+    fn save_selection_with_no_selection_writes_an_empty_file() {
+        let dst = temp_path("sel-none.bin");
+        let e = ed(b"hello");
+        let written = e.save_selection_to(&dst).unwrap();
+        assert_eq!(written, 0);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"");
+        std::fs::remove_file(&dst).ok();
+    }
+
+    #[test]
+    fn configured_undo_limits_apply_to_the_editor() {
+        // An 8-byte delta budget: the first insert weighs 4 (2 bytes
+        // after + 2 action bytes), the coalesced second weighs 8 —
+        // together 12 > 8, so the oldest step is trimmed and only the
+        // second insert can be undone.
+        let mut e = ed(b"");
+        e.set_undo_limits(1024, 8);
+        e.insert_text("ab").unwrap();
+        e.insert_text("cd").unwrap();
+        assert_eq!(content(&e), b"abcd");
+        assert!(e.undo());
+        assert_eq!(content(&e), b"ab");
+        assert!(!e.undo());
     }
 
     #[test]
