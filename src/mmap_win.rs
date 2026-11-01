@@ -343,6 +343,10 @@ mod tests {
         let mmap = MmapFile::open(&path).unwrap();
         assert_eq!(mmap.len(), 12);
         assert_eq!(mmap.as_slice(), b"mapped bytes");
+        // Drop the mapping before deleting: on Windows a live mapping
+        // holds the file open without delete sharing, so removing the
+        // directory while it lives fails with ERROR_SHARING_VIOLATION.
+        drop(mmap);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
@@ -372,6 +376,10 @@ mod tests {
         table.insert(5, b" brave new");
         assert_eq!(table.read(0, 99), b"hello brave new world");
         assert!(table.check_invariants());
+        // Drop the table before deleting: it owns the mapping (the
+        // local `mmap` was moved into it), and a live mapping blocks
+        // deletion on Windows (see map_reads_file_bytes).
+        drop(table);
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

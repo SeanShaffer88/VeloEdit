@@ -592,6 +592,10 @@ mod tests {
         let report = table.save_to(&target, &mut history).unwrap();
         assert_eq!(report.bytes_written, 15);
         assert_eq!(std::fs::read(&target).unwrap(), b"hello new world");
+        // After save_to the table's backing is a live mapping of the
+        // target on Windows; drop it before deleting the directory or
+        // Windows refuses with ERROR_SHARING_VIOLATION.
+        drop(table);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -623,6 +627,8 @@ mod tests {
         // And the table keeps working afterwards.
         table.insert(0, b"again ");
         assert_eq!(table.read(0, 99), b"again >> hello new world!");
+        // Drop the table (and its live target mapping) before deleting.
+        drop(table);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
