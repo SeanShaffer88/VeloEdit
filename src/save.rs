@@ -131,6 +131,149 @@ pub struct SaveReport {
     pub staging_removed: bool,
 }
 
+/// Free disk space a save wants to see before it starts streaming:
+/// the document's length plus a twentieth (1.05× in total, roadmap
+/// item 5). Saturates instead of overflowing for absurd lengths.
+pub fn space_needed(file_len: u64) -> u64 {
+    file_len.saturating_add(file_len / 20)
+}
+
+/// Check that the target's directory has at least [`space_needed`]
+/// bytes free, before a single byte is written (roadmap item 5).
+/// Failing halfway through a multi-gigabyte streaming write — after
+/// minutes of work, with the staging file half-written — is the
+/// failure this exists to prevent.
+///
+/// Windows queries `GetDiskFreeSpaceExW`. If the query itself fails
+/// the check is skipped (fail-open): the save then behaves exactly as
+/// it did before this check existed, rather than being blocked by an
+/// API hiccup. Non-Windows builds skip the check entirely.
+fn check_free_space(target: &Path, doc_len: u64) -> Result<(), SaveError> {
+    #[cfg(windows)]
+    {
+        check_free_space_windows(target, doc_len)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (target, doc_len);
+        Ok(())
+    }
+}
+
+/// The Windows half of [`check_free_space`].
+#[cfg(windows)]
+fn check_free_space_windows(target: &Path, doc_len: u64) -> Result<(), SaveError> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let wide: Vec<u16> = dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_available: u64 = 0;
+    // SAFETY: the wide string is NUL-terminated and outlives the call;
+    // the three out-slots are writable u64s. Only the caller-available
+    // figure is read afterwards, and only when the call succeeded.
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        // Query failed: skip the check (see check_free_space).
+        return Ok(());
+    }
+    let needed = space_needed(doc_len);
+    if free_available < needed {
+        return Err(SaveError::new(
+            SaveStep::Staging,
+            io::Error::other(format!(
+                "not enough free disk space to save safely: the document needs about \
+                 {needed} bytes free next to the target, only {free_available} bytes are free"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// Clamp a `[start, start + length)` range to a document of `total`
+/// bytes (roadmap items 35 and 44). Returns `None` when `start` is
+/// beyond the end of the document; a start exactly at the end yields
+/// an empty range; the length is shortened to what actually exists.
+pub fn clamp_range(start: u64, length: u64, total: u64) -> Option<(u64, u64)> {
+    if start > total {
+        return None;
+    }
+    Some((start, length.min(total - start)))
+}
+
+/// Stream `length` bytes of `table` starting at `start` to `out`, in
+/// chunks of at most [`DEFAULT_MAX_CHUNK`] bytes, and return the
+/// number of bytes written. The range is clamped to the document
+/// (see [`clamp_range`]); a start beyond the end of the document is
+/// an error and nothing is written.
+pub fn write_table_range(
+    table: &PieceTable,
+    start: u64,
+    length: u64,
+    out: &mut impl Write,
+) -> io::Result<u64> {
+    let Some((start, length)) = clamp_range(start, length, table.len()) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "range start {start} is beyond the end of the document ({} bytes)",
+                table.len()
+            ),
+        ));
+    };
+    let mut pos = start;
+    let mut remaining = length;
+    while remaining > 0 {
+        let step = remaining.min(DEFAULT_MAX_CHUNK as u64);
+        let chunk = table.read(pos, step);
+        if chunk.is_empty() {
+            break; // defensive: a clamped range always has its bytes
+        }
+        out.write_all(&chunk)?;
+        pos += chunk.len() as u64;
+        remaining -= chunk.len() as u64;
+    }
+    Ok(length - remaining)
+}
+
+/// Stream a byte range of `table` (see [`write_table_range`]) into a
+/// new file at `dest`, replacing any file already there. The range is
+/// validated before the file is created, so an out-of-range request
+/// never truncates an existing file.
+pub fn write_range_to_file(
+    table: &PieceTable,
+    start: u64,
+    length: u64,
+    dest: &Path,
+) -> io::Result<u64> {
+    if clamp_range(start, length, table.len()).is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "range start {start} is beyond the end of the document ({} bytes)",
+                table.len()
+            ),
+        ));
+    }
+    let mut file = File::create(dest)?;
+    let written = write_table_range(table, start, length, &mut file)?;
+    file.flush()?;
+    Ok(written)
+}
+
 /// Build the staging path for `target` (SPEC.md section 5.1 step 1):
 /// same directory, name `<filename>.tmp_velo_<pid>` where `<filename>`
 /// is the target's full file name (extension included).
@@ -282,6 +425,9 @@ pub fn save_atomic(
             ),
         ));
     }
+    // Roadmap item 5: refuse early when the disk plainly cannot hold
+    // the staging file, instead of failing halfway through the write.
+    check_free_space(target, table.len())?;
     let staging = staging_path_for(target);
     let outcome = write_staging(table, &staging, opts.max_chunk)
         .and_then(|written| swap_files(target, &staging).map(|()| written));
@@ -349,6 +495,9 @@ impl PieceTable {
                 ),
             ));
         }
+        // Roadmap item 5: the same early disk-space refusal as
+        // save_atomic, before the staging file is created.
+        check_free_space(target, self.len())?;
         let staging = staging_path_for(target);
 
         // Steps 1–3: staging file, streaming writes, hardware flush. Our
@@ -667,6 +816,66 @@ mod tests {
         assert_eq!(table.append_buffer, append_before);
         assert!(table.check_invariants());
         assert!(!staging_path_for(&target).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // (item 5) The space requirement is the length plus a twentieth,
+    // saturating at the top of the range instead of overflowing.
+    #[test]
+    fn space_needed_is_five_percent_over() {
+        assert_eq!(space_needed(0), 0);
+        assert_eq!(space_needed(19), 19);
+        assert_eq!(space_needed(20), 21);
+        assert_eq!(space_needed(100), 105);
+        assert_eq!(space_needed(1_000_000), 1_050_000);
+        assert_eq!(space_needed(u64::MAX), u64::MAX);
+    }
+
+    // (items 35/44) Range clamping: inside, overhanging, at the end,
+    // and beyond the end.
+    #[test]
+    fn clamp_range_cases() {
+        assert_eq!(clamp_range(0, 10, 100), Some((0, 10)));
+        assert_eq!(clamp_range(90, 50, 100), Some((90, 10)));
+        assert_eq!(clamp_range(100, 50, 100), Some((100, 0)));
+        assert_eq!(clamp_range(101, 50, 100), None);
+        assert_eq!(clamp_range(0, 0, 0), Some((0, 0)));
+        assert_eq!(clamp_range(1, 0, 0), None);
+    }
+
+    // (items 35/44) The range writer streams exactly the document
+    // bytes of the (clamped) range, across piece boundaries.
+    #[test]
+    fn write_table_range_round_trip() {
+        let table = edited_table(); // "hello new world!", multi-piece
+        let mut out: Vec<u8> = Vec::new();
+        let written = write_table_range(&table, 3, 8, &mut out).unwrap();
+        assert_eq!(written, 8);
+        assert_eq!(out, b"lo new w");
+        // An overhanging length clamps to the document end.
+        let mut out: Vec<u8> = Vec::new();
+        let written = write_table_range(&table, 10, 999, &mut out).unwrap();
+        assert_eq!(written, 6);
+        assert_eq!(out, b"world!");
+        // A start beyond the end is an error and writes nothing.
+        let mut out: Vec<u8> = Vec::new();
+        assert!(write_table_range(&table, 17, 1, &mut out).is_err());
+        assert!(out.is_empty());
+    }
+
+    // (item 35) The file form writes the range to disk, and a bad
+    // range leaves an existing destination file untouched.
+    #[test]
+    fn write_range_to_file_round_trip() {
+        let dir = temp_dir("range-file");
+        let dest = dir.join("slice.bin");
+        let table = edited_table();
+        let written = write_range_to_file(&table, 6, 3, &dest).unwrap();
+        assert_eq!(written, 3);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        // Beyond-the-end start: error, and the file keeps its bytes.
+        assert!(write_range_to_file(&table, 100, 1, &dest).is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
