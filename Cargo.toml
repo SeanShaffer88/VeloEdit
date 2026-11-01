@@ -1,6 +1,6 @@
 [package]
 name = "veloedit"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.80"
 authors = ["Sean Shaffer"]
@@ -19,14 +19,46 @@ path = "src/main.rs"
 
 # The ONLY dependency crate allowed (SPEC.md section 1.1: direct windows-sys
 # FFI bindings). It is gated behind cfg(windows) so the platform-independent
-# core in this slice builds and tests on any host. Features are the minimum
-# the later Windows slices need: file/memory-mapping APIs for the mmap piece
-# table (section 2) and the atomic save pipeline (section 5).
+# core builds and tests on any host. Features are the minimum the Windows
+# slices need: file/memory-mapping APIs for the mmap piece table (section 2)
+# and the atomic save pipeline (section 5). Win32_Security is required in
+# windows-sys 0.61 for CreateFileW / CreateFileMappingW (their signatures
+# mention SECURITY_ATTRIBUTES).
+#
+# Slice 4 (the GUI shell) adds, per feature:
+#   Win32_Graphics_Gdi            chrome painting: status strip / find bar /
+#                                 dialogs' colours (never the editor surface,
+#                                 which is Direct2D — see src/gui_win.rs)
+#   Win32_System_DataExchange     clipboard (OpenClipboard & friends)
+#   Win32_System_LibraryLoader    GetModuleHandleW for the window class
+#   Win32_System_Ole              the CF_UNICODETEXT clipboard format constant
+#   Win32_UI_Controls             the tooltip control (TOOLTIPS_CLASS)
+#   Win32_UI_Controls_Dialogs     GetOpenFileNameW / ChooseColorW common dialogs
+#   Win32_UI_HiDpi                Per-Monitor V2 DPI awareness + GetDpiForWindow
+#   Win32_UI_Input_KeyboardAndMouse  virtual-key constants + GetKeyState
+#   Win32_UI_Shell                DragAcceptFiles / DragQueryFileW (drop a file
+#                                 onto the window to open it)
+#   Win32_UI_WindowsAndMessaging  windows, menus, messages, the scrollbar,
+#                                 SystemParametersInfoW (wheel lines)
+# Direct2D / DirectWrite are NOT part of windows-sys 0.61 (its Graphics
+# features stop at Gdi/GdiPlus/Dwm/Hlsl/OpenGL/Printing), so gui_win.rs
+# declares the few COM interfaces it uses by hand — still no other crate.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [profile.release]
