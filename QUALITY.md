@@ -169,14 +169,42 @@ scored from real Windows evidence before any release.
     and builds for the first time in the release workflow), and the
     NSIS installer has not been *run* on Windows.
 
+- Slice 6 — the v1.0.0 release (2026-10-31, owner-confirmed):
+  - Tag `v1.0.0` on the release commit of `main`; release published as
+    Latest (not draft, not pre-release) with the four §6.1 assets:
+    Setup exe (315,283 B), MSI (536,576 B), Portable zip (276,929 B),
+    SHA256SUMS.txt (294 B).
+  - The release workflow needed five fix iterations, each diagnosed
+    from its own run log: (1) four Windows-host tests failed at their
+    cleanup lines because a live memory mapping blocks folder deletion
+    on Windows (fixed in the tests; the product code was exercised
+    successfully by the same run — 149 other checks passed there,
+    including mapping reads and the atomic save on a real Windows
+    host); (2) `makensis` was not on the workflow process's PATH after
+    the Chocolatey install (now resolved by absolute path); (3) the
+    WiX UI extension was fetched unpinned at v7 for a v4 tool
+    (WIX0144; both now pinned to 4.0.6); (4) the folder-only component
+    needed an explicit GUID (WIX0230); (5) payload sources are now
+    anchored with `sys.SOURCEFILEDIR` (WIX0103).
+  - Every asset was verified three ways after the successful run:
+    the hash in the shipped `SHA256SUMS.txt`, GitHub's own asset
+    digest, and an independent re-download hashed locally — all three
+    agree for all three assets. The portable zip was opened: exactly
+    `VeloEdit.exe` (563,712 B), `LICENSE`, and `data/README-data.txt`;
+    the shipped exe imports only Windows system DLLs plus
+    `d2d1.dll`/`DWrite.dll` (static CRT confirmed) and carries the
+    1.0.0 version strings. The MSI's OLE compound-file signature was
+    checked; the Setup exe carries the Nullsoft v3.13 manifest.
+  - CI now runs the full test suite in its Windows job as well, so
+    Windows-host test behaviour is gated on every push, not only at
+    release time.
+
 ## Known gaps (honest list)
 
-- The WiX MSI has never been built anywhere: WiX cannot run on this
-  Linux host, so `installer/Package.wxs` (including its WixUI_Minimal
-  reference and per-user scope) is first exercised by the release
-  workflow on a Windows runner. The NSIS installer is script-proven
-  (it compiles to a correctly named Setup exe) but has never been run
-  on Windows either.
+- The installers have been *built* by the release workflow and their
+  outputs hash-verified, but neither has been *run* on a real Windows
+  machine: the NSIS install/uninstall flow and the MSI install are
+  still Unverified until the owner's machine proves them.
 
 
 - Piece storage is a `Vec`; SPEC §2.2's weight-balanced B-tree is a later
