@@ -1314,6 +1314,12 @@ mod tests {
         assert_eq!(report.bytes_written, 16);
         assert!(!report.fast_clone_used);
         assert_eq!(std::fs::read(&target).unwrap(), b"hello new world!");
+        // After save_to_with_options the table's backing is a live
+        // mapping of the target on Windows; drop it before deleting
+        // the directory or Windows refuses with
+        // ERROR_SHARING_VIOLATION (the same rule the save_to tests
+        // below follow).
+        drop(table);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
