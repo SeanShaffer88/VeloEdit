@@ -28,7 +28,7 @@ is the owner's call — and every Windows-runtime verification.
 | --- | --- | --- |
 | Architecture & foundation | 4 | Frozen module layout in `PROJECT_RULES.md`; original-bytes seam (`OriginalBuffer`) now carries the Windows mmap backing with no API change; the piece Vec carries a Fenwick weight index for O(log N) lookups (R2a) in place of the sketched B-tree, with the trade-off recorded in Known gaps |
 | Correctness (core operations) | 4 | Insert/delete/coalescence, multi-piece reads, undo/redo layout restoration, line checkpoints, hex/scroll math, diff counting, encoding detection/decode/encode, boundary-spanning search, single-undo replace-all, and the atomic save round trips (including both staged failure paths) are all covered by unit tests that exercise the real code paths |
-| Tests | 4 | 190 unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1 + 16 roadmap R2a + 9 roadmap R2b: Fenwick piece-index equivalence against a naive model over random edit scripts, 100k-piece lookups, coalescing, SWAR-vs-scalar and parallel-vs-serial line-index equivalence, SWAR search equivalence, scoped find/replace, masked search, line sort/dedup, scoped find navigation, masked find flow, the file splitter, CLI size parsing and split runs), host gate fully green (see below). Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
+| Tests | 4 | 242 host unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1 + 16 roadmap R2a + 9 roadmap R2b + 37 roadmap R3a: Fenwick piece-index equivalence against a naive model over random edit scripts, 100k-piece lookups, coalescing, SWAR-vs-scalar and parallel-vs-serial line-index equivalence, SWAR search equivalence, scoped find/replace, masked search, line sort/dedup, scoped find navigation, masked find flow, the file splitter, CLI size parsing and split runs, hash known-answer vectors, inspector readings and civil-date conversion, bookmark store round trips and staleness, delta-recovery rebuilds and refusals, save EOL/BOM transforms, windowed find + 15 roadmap R3b-2: GUID, FILETIME and text-preview inspector readings, width-parameterised hex row maths, grouped and big-endian hex formatting and click hit-testing, fit-to-window widths, settings validation for the new hex/save keys, editor hex movement and formatting at row widths 8 and 32, save-with-options transforms), host gate fully green (see below); the Windows-only GUI suite adds layout/formatting/menu/theme-preview tests plus R3b-1's scrollbar-tick bucketing and R3b-2's inspector-rows, hash-verdict and armed-save-suffix tests, and runs in CI. Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
 | Reliability & data safety | 4 | Undo never touches the append buffer; deletes return their removed pieces; `--clean` is guarded to the adjacent `data/` folder and tested. The atomic save safety path (SPEC §5.1) is implemented and covered by host tests for the success, replace, empty, staging-failure and swap-failure cases, with the table provably unchanged after a failed save; its Windows runtime behaviour (real `ReplaceFileW` under a live mapping) is still Unverified — see Known gaps |
 | Performance (SPEC §8 budgets) | Unverified | Host proxies are now measured and recorded in `docs/BENCHMARKS.md` (200 MB diff median 330 ms, find 1073 ms, save-copy 466 ms, `--version` start proxy median 1.07 ms, all Linux host build) — evidence about the core only. Every §8 metric itself (cold start <50 ms, 100 GB open <100 ms, <15 MB idle / <35 MB active, <16 ms frame) is a Windows measurement and remains a target, not a result |
 | Security & privacy | 4 | 100% offline, zero telemetry by construction (no network code at all); crate root is `#![deny(unsafe_code)]` with `unsafe` confined to `src/mmap_win.rs`, `src/gui_win.rs` and the Windows half of `src/save.rs`, every block carrying a `// SAFETY:` comment (PROJECT_RULES.md confinement rule); the only dependency crate is `windows-sys`, gated to `cfg(windows)` |
@@ -620,6 +620,183 @@ scored from real Windows evidence before any release.
     message sequence and are Unverified until the owner's machine
     runs them.
 
+- 2026-11-01, roadmap slice R3a (feature cores: streaming hashes,
+  data inspector readings, per-file bookmarks, delta-log recovery,
+  save-time line-ending/BOM transforms, windowed find), run locally
+  on the development host; NOT published:
+  - Scope split, stated plainly: this slice is the core halves
+    only. `src/hash.rs`, `src/inspector.rs`, `src/bookmarks.rs`
+    and `src/recovery.rs` are new standalone modules (exported
+    from `lib.rs`, with `op_` wrappers for inspect / windowed
+    find / byte-source hashing); the save transforms extend
+    `SaveOptions` (`encoding`, `eol`, `bom` — defaults keep both
+    transforms off); `find_in_window` joins the search module.
+    No window or CLI wiring was touched: the hash dialog, the
+    inspector panel, the bookmark keys, the delta-recovery
+    adoption and the EOL/BOM save controls all land in the R3
+    wiring slice, and the GUI keeps using its snapshot recovery
+    until then.
+  - `cargo fmt --all` + `cargo fmt --all --check` — clean
+    (exit 0)
+  - `cargo test` — **227 passed, 0 failed** (190 before + 37 new:
+    MD5/SHA-1/SHA-256 known-answer vectors — empty, "abc", the
+    56- and 112-byte FIPS messages, and a million 'a' bytes fed
+    in odd-sized chunks; inspector scalar/float readings in both
+    byte orders, short-input gaps, and the days-to-civil
+    conversion at the epoch, leap days, and the 2100 range edge;
+    bookmark toggle ordering, wrap-around navigation, real-file
+    JSON round trips, and stale-stamp record drops; recovery
+    serialize/rebuild round trips recreating edited documents
+    byte-identically, refusals for resized and tampered
+    originals, corrupt-input errors without panics; save
+    transforms — CRLF↔LF across chunk and piece boundaries,
+    mixed-ending normalisation both ways, UTF-16LE/BE unit-width
+    conversion, BOM add/remove for UTF-8 and UTF-16, ANSI no-op,
+    Keep = identity; windowed find concatenating to find-all at
+    window widths 1–7 plus straddler/degenerate windows)
+  - `cargo clippy --all-targets -- -D warnings` (host) — clean
+    (exit 0)
+  - `cargo clippy --target x86_64-pc-windows-gnu --all-targets --
+    -D warnings` — clean (exit 0)
+  - `cargo check --target x86_64-pc-windows-msvc` — passed
+    (exit 0)
+  - `cargo build --release --target x86_64-pc-windows-gnu` —
+    passed (exit 0); `VeloEdit.exe` 765,952 bytes, SHA-256
+    `767746b194ce1d4a12caccc2992a6d803dfb70e80428d38035d8bcc87698a4f9`
+  - Honest status: the cores are unit-tested on the host against
+    published vectors and round trips. Nothing in this slice has
+    a user-visible surface yet, so there is no new Windows
+    runtime behaviour to verify; the fingerprint check in
+    recovery rebuild compares size, modification stamp, and
+    SHA-256 and refuses on any mismatch, which the host tests
+    exercise for size and content changes (a stamp-only change
+    cannot be simulated portably and is covered by the same
+    comparison code path).
+
+- 2026-11-01, roadmap slice R3b-1 (window wiring, part 1: roadmap
+  items 20, 10, 24, 34, 7), run locally on the development host;
+  NOT published:
+  - What landed, all in `src/gui_win.rs`: bookmarks in the window
+    (Ctrl+F2 toggles at the caret and persists the store at once;
+    F2 / Shift+F2 jump next / previous with wrap-around; the
+    file's list loads stamp-guarded at open; accent-square gutter
+    markers in text mode and beside the offset in hex mode);
+    background find-all (a plain find on a document over 4 MB
+    walks `find_in_window` over 4 MB windows on a worker thread
+    into a generation-tagged slot — the line-index thread's epoch
+    discipline — the count reads "Counting…" until the final
+    window lands, next / previous run over the matches known so
+    far, and the first match at or after the caret is selected as
+    soon as it is known; an edit, a document change, a
+    scoped/masked find, or clearing the find cancels it, and the
+    Replace flow forces one synchronous re-run first so it always
+    works on a complete match list); scrollbar ticks (matches in
+    the accent, bookmarks in the text colour, bucketed one per
+    track row by the pure `tick_rows` helper, unit-tested in the
+    Windows-only GUI suite); the external-change notice (the open
+    file's (size, mtime) stamp re-checked on WM_ACTIVATE and
+    immediately before a save; a difference raises a non-modal
+    bar under the toolbar — "This file changed on disk.", Reload /
+    Ignore — Reload goes through the ordinary dirty-document
+    prompt and re-opens with the full per-document setup, Ignore
+    dismisses until the stamp changes again); and delta recovery
+    (file-backed documents write `recovery::capture` to
+    `data/recovery2.bin`, the original's SHA-256 fingerprint
+    computed on a background thread after open; startup checks
+    the delta record first and reports an OriginalChanged skip in
+    plain words; the 16 MB content snapshot remains only for
+    documents with no backing file; a successful save or clean
+    exit clears both forms).
+  - `cargo fmt --all` + `cargo fmt --all --check` — clean
+    (exit 0)
+  - `cargo test` — **227 passed, 0 failed** on the host (the
+    cores are unchanged; the new `tick_rows` bucketing test is
+    Windows-only and runs in CI)
+  - `cargo clippy --all-targets -- -D warnings` (host) — clean
+    (exit 0)
+  - `cargo clippy --target x86_64-pc-windows-gnu --all-targets --
+    -D warnings` — clean (exit 0)
+  - `cargo check --target x86_64-pc-windows-msvc` — passed
+    (exit 0)
+  - `cargo build --release --target x86_64-pc-windows-gnu` —
+    passed (exit 0); `VeloEdit.exe` 841,728 bytes, SHA-256
+    `0b1f04a337ac625b0474ffa70305e15587e00f39c3bf16902fad46ba866b8581`
+  - Honest status: **every GUI behaviour in this slice is
+    compile-verified only; Windows runtime is Unverified** until
+    the program runs on a real Windows 11 machine. Known
+    limitation (also in the README): a document restored from a
+    delta record is memory-backed, so further unsaved edits fall
+    back to the snapshot path — a huge restored document's new
+    edits are not re-captured as a delta; the original record
+    stays until a save or clean exit.
+
+- 2026-11-01, roadmap slice R3b-2 (window wiring, part 2: roadmap
+  items 15, 13, 14, 16, 31, 32, 37), run locally on the
+  development host; NOT published:
+  - What landed: the inspector core gained the GUID, FILETIME
+    (1601-based, sane range to 2100, pre-epoch dates through the
+    same civil conversion) and UTF-8 preview readings, with
+    known-value tests (a stored GUID's byte order, FILETIME 0 =
+    1601-01-01, 2021-01-01 and 1900-01-01 tick values, preview
+    filtering/capping); hex layout became a parameter
+    (`hexview::HexLayout`: row width, group size, big-endian group
+    display) — the row maths gained width-taking variants the
+    classic functions delegate to, formatting/cell/hit-test
+    helpers keep the renderer's and the click maths on one code
+    path, and the editor's hex internals (rows, vertical movement,
+    Home/End, caret visibility) all follow the layout, with
+    equivalence and formatting tests at widths 8/16/32 and groups
+    2/4/8; settings gained validated keys for all of it
+    (`inspector_open`, `hex_cols` with 0 = fit, `hex_group`,
+    `hex_endian`, `save_eol`, `save_bom`) plus a boolean reader
+    for the hand-rolled JSON; the editor gained
+    `save_with_options` / `save_as_with_options` over the R3a
+    pipeline. In the window (`src/gui_win.rs`): View ▸ Data
+    Inspector docks a 280-DIP panel that re-reads the 16 bytes at
+    the caret on every paint (the editor area, scrollbar, ruler
+    and click maths all bound to the shrunken editor edge);
+    View ▸ Hex Columns (8/16/24/32/64/Fit, fit recomputed on
+    resize and when the panel toggles) and View ▸ Hex Grouping
+    (1/2/4/8 + Big-Endian Groups) drive the layout through one
+    sync point on startup, open, resize and menu change; View ▸
+    Relative Offsets + Set Offset Base at Caret show signed
+    address distances from a session-only base the status bar
+    names; File ▸ Save Options radios feed every window save
+    through the options pipeline, and the status bar announces an
+    armed conversion ("· → CRLF", "· +BOM"); File ▸ File Hashes…
+    runs the streaming hash of the file on disk on a worker
+    thread into a slot the modal dialog polls (the Split dialog's
+    pattern), fills the three digests on completion, and checks
+    pasted text against them via the pure `hash_verdict` helper;
+    the menu item is greyed without a file. The built-in guide
+    covers all five features.
+  - `cargo fmt --all` + `cargo fmt --all --check` — clean
+    (exit 0)
+  - `cargo test` — **242 passed, 0 failed** on the host (227
+    before this slice; +15: 4 inspector, 7 hexview, 1 settings,
+    3 editor; the three new shell-helper tests —
+    inspector rows, hash verdict, armed suffix — are Windows-only
+    and run in CI)
+  - `cargo clippy --all-targets -- -D warnings` (host) — clean
+    (exit 0)
+  - `cargo clippy --target x86_64-pc-windows-gnu --all-targets --
+    -D warnings` — clean (exit 0)
+  - `cargo check --target x86_64-pc-windows-msvc` — passed
+    (exit 0)
+  - `cargo build --release --target x86_64-pc-windows-gnu` —
+    passed (exit 0); `VeloEdit.exe` 915,968 bytes, SHA-256
+    `e16283a220c94b0ced21e9065a23c2334eff79fca51361c3c76377f944ff6016`;
+    the binary was string-checked for the new menu and dialog
+    text to prove it is the fresh build
+  - Honest status: **every GUI behaviour in this slice is
+    compile-verified only; Windows runtime is Unverified** until
+    the program runs on a real Windows 11 machine. One
+    mid-implementation correction worth recording: an editor test
+    first asserted Home at an 8-byte row width would return to
+    the previous row's start; the editor was right (the caret
+    after End *is* the next row's start at that width) and the
+    test was fixed, not the code.
+
 ## Known gaps (honest list)
 
 - The installers have been *built* by the release workflow and their
@@ -650,7 +827,11 @@ scored from real Windows evidence before any release.
   of returning an error. Closing this fully would mean denying write
   sharing, which the blueprint's share-mode design does not do; the GUI
   slice may add a file-change watcher so a changed file is re-opened
-  before it is read.
+  before it is read. R3b-1 added a stamp-based notice (checked when
+  the window gains focus and immediately before a save, with a
+  Reload / Ignore bar) — that covers the common editor-versus-editor
+  case, but it is not a watcher: a page already mapped can still
+  fault before the next check runs.
 - Windows runtime behaviour of every kind is Unverified until the program
   runs on a real Windows 11 machine.
 - The Direct2D/DirectWrite COM interfaces are declared by hand (fixed
