@@ -29,6 +29,11 @@ path = "src/main.rs"
 #   Win32_Graphics_Gdi            chrome painting: status strip / find bar /
 #                                 dialogs' colours (never the editor surface,
 #                                 which is Direct2D — see src/gui_win.rs)
+#   Win32_Graphics_Dwm            DwmSetWindowAttribute: the dark title bar
+#                                 (immersive dark mode + caption colours)
+#   Win32_System_Console          AttachConsole: the GUI-subsystem binary
+#                                 borrows the parent terminal for the
+#                                 headless tools' output (see src/cli.rs)
 #   Win32_System_DataExchange     clipboard (OpenClipboard & friends)
 #   Win32_System_LibraryLoader    GetModuleHandleW for the window class
 #   Win32_System_Ole              the CF_UNICODETEXT clipboard format constant
@@ -46,9 +51,11 @@ path = "src/main.rs"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
