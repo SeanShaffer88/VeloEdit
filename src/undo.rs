@@ -60,6 +60,74 @@ pub enum EditAction {
 const _: () = assert!(std::mem::size_of::<EditAction>() == 48);
 const _: () = assert!(std::mem::size_of::<HistoryEntry>() == 104);
 
+/// One range replacement within a multi-range edit (see
+/// [`UndoStack::do_multi_replace`]): the bytes
+/// `[offset, offset + delete_len)` are replaced by `replacement`
+/// (either side may be empty: a pure insertion, a pure
+/// deletion).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeEdit<'a> {
+    pub offset: u64,
+    pub delete_len: u64,
+    pub replacement: &'a [u8],
+}
+
+/// Why a multi-range edit was refused. Nothing is applied when
+/// one comes back: validation runs before any mutation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MultiEditError {
+    /// An edit starts before its predecessor starts.
+    Unsorted { index: usize },
+    /// An edit overlaps its predecessor (including starting at
+    /// the same offset, where the order would be ambiguous).
+    Overlapping { index: usize },
+    /// An edit reaches outside the document.
+    OutOfBounds { index: usize },
+}
+
+impl std::fmt::Display for MultiEditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MultiEditError::Unsorted { index } => {
+                write!(f, "edit {index} starts before the edit before it (edits must be in document order)")
+            }
+            MultiEditError::Overlapping { index } => {
+                write!(f, "edit {index} overlaps the edit before it")
+            }
+            MultiEditError::OutOfBounds { index } => {
+                write!(f, "edit {index} reaches outside the document")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MultiEditError {}
+
+/// Why a rectangular edit was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RectError {
+    /// The line range is outside the supplied line map (or
+    /// reversed).
+    LineRange,
+    /// `col_start` is greater than `col_end`.
+    Columns,
+    /// The constructed range edits were refused (cannot happen
+    /// for a well-formed line map; carried for completeness).
+    Edit(MultiEditError),
+}
+
+impl std::fmt::Display for RectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RectError::LineRange => write!(f, "the line range is outside the document's lines"),
+            RectError::Columns => write!(f, "the column range is reversed"),
+            RectError::Edit(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for RectError {}
+
 /// Internal history record: the logical action plus the exact piece segment
 /// needed to restore the layout in either direction.
 #[derive(Debug)]
@@ -353,6 +421,151 @@ impl UndoStack {
         action
     }
 
+    /// Apply a multi-range edit — many range replacements at
+    /// once — as ONE history entry (the multi-cursor core: every
+    /// cursor's replacement lands together, and one undo takes
+    /// them all back). `edits` must be in document order:
+    /// strictly ascending offsets, non-overlapping. They are
+    /// validated before anything mutates; a refused edit changes
+    /// nothing and records nothing. No-op edits (delete nothing,
+    /// insert nothing) are dropped; if none remain, nothing is
+    /// recorded and `Ok(None)` comes back.
+    pub fn do_multi_replace(
+        &mut self,
+        table: &mut PieceTable,
+        edits: &[RangeEdit],
+    ) -> Result<Option<EditAction>, MultiEditError> {
+        let doc_len = table.len();
+        for (index, edit) in edits.iter().enumerate() {
+            if edit.offset > doc_len || edit.delete_len > doc_len - edit.offset {
+                return Err(MultiEditError::OutOfBounds { index });
+            }
+            if index > 0 {
+                let prev = &edits[index - 1];
+                if edit.offset < prev.offset {
+                    return Err(MultiEditError::Unsorted { index });
+                }
+                if edit.offset == prev.offset || prev.offset + prev.delete_len > edit.offset {
+                    return Err(MultiEditError::Overlapping { index });
+                }
+            }
+        }
+        let edits: Vec<RangeEdit> = edits
+            .iter()
+            .copied()
+            .filter(|e| e.delete_len > 0 || !e.replacement.is_empty())
+            .collect();
+        if edits.is_empty() {
+            return Ok(None);
+        }
+        // A single pure insertion is exactly do_insert's shape.
+        if edits.len() == 1 && edits[0].delete_len == 0 {
+            let edit = edits[0];
+            self.do_insert(table, edit.offset, edit.replacement);
+            return Ok(Some(EditAction::Insert {
+                offset: edit.offset,
+                length: edit.replacement.len() as u64,
+            }));
+        }
+        let first = edits[0].offset;
+        let last = &edits[edits.len() - 1];
+        let last_end = last.offset + last.delete_len;
+        let total_inserted: u64 = edits.iter().map(|e| e.replacement.len() as u64).sum();
+        let count = edits.len();
+        let action = self.do_segment_replace(table, first, last_end, |t| {
+            let mut removed_groups: Vec<Vec<PieceNode>> = Vec::with_capacity(count);
+            // Back to front: edits at higher offsets do not move
+            // the offsets of edits still to be applied.
+            for edit in edits.iter().rev() {
+                let removed = t.delete(edit.offset, edit.delete_len);
+                removed_groups.push(removed);
+                t.insert(edit.offset, edit.replacement);
+            }
+            let previous_pieces: Vec<PieceNode> = removed_groups
+                .into_iter()
+                .rev()
+                .flat_map(|group| group.into_iter())
+                .collect();
+            EditAction::Replace {
+                offset: first,
+                previous_pieces,
+                inserted_length: total_inserted,
+                replacements: count,
+            }
+        });
+        Ok(Some(action))
+    }
+
+    /// Delete the column range `[col_start, col_end)` (byte
+    /// columns, clamped per line) from every line in
+    /// `[first_line, last_line]`, as ONE history entry. Lines
+    /// are addressed through `line_starts` (the byte offset of
+    /// each line's first byte, ascending, as a line index
+    /// reports them); a line's content excludes its `\n`
+    /// terminator, which is never touched. Lines shorter than
+    /// the column range contribute nothing.
+    pub fn do_rect_delete(
+        &mut self,
+        table: &mut PieceTable,
+        line_starts: &[u64],
+        first_line: usize,
+        last_line: usize,
+        col_start: usize,
+        col_end: usize,
+    ) -> Result<Option<EditAction>, RectError> {
+        check_rect_lines(line_starts, first_line, last_line)?;
+        if col_start > col_end {
+            return Err(RectError::Columns);
+        }
+        let mut edits = Vec::new();
+        for line in first_line..=last_line {
+            let (start, end) = line_content_span(table, line_starts, line);
+            let len = end - start;
+            let cs = (col_start as u64).min(len);
+            let ce = (col_end as u64).min(len);
+            if ce > cs {
+                edits.push(RangeEdit {
+                    offset: start + cs,
+                    delete_len: ce - cs,
+                    replacement: &[],
+                });
+            }
+        }
+        self.do_multi_replace(table, &edits)
+            .map_err(RectError::Edit)
+    }
+
+    /// Insert `bytes` at byte column `col` (clamped to each
+    /// line's content length — a shorter line takes the bytes at
+    /// its end, with no padding) on every line in
+    /// `[first_line, last_line]`, as ONE history entry.
+    pub fn do_rect_insert(
+        &mut self,
+        table: &mut PieceTable,
+        line_starts: &[u64],
+        first_line: usize,
+        last_line: usize,
+        col: usize,
+        bytes: &[u8],
+    ) -> Result<Option<EditAction>, RectError> {
+        check_rect_lines(line_starts, first_line, last_line)?;
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let mut edits = Vec::new();
+        for line in first_line..=last_line {
+            let (start, end) = line_content_span(table, line_starts, line);
+            let at = start + (col as u64).min(end - start);
+            edits.push(RangeEdit {
+                offset: at,
+                delete_len: 0,
+                replacement: bytes,
+            });
+        }
+        self.do_multi_replace(table, &edits)
+            .map_err(RectError::Edit)
+    }
+
     /// Undo the most recent edit. Returns `false` when there is nothing to
     /// undo. Restores the piece layout exactly; the append buffer is not
     /// touched (SPEC.md section 5.2).
@@ -397,6 +610,66 @@ impl UndoStack {
             self.undo_bytes -= entry_payload(&dropped);
         }
     }
+}
+
+/// Validate a rectangular edit's line range against the line
+/// map.
+fn check_rect_lines(
+    line_starts: &[u64],
+    first_line: usize,
+    last_line: usize,
+) -> Result<(), RectError> {
+    if first_line > last_line || last_line >= line_starts.len() {
+        return Err(RectError::LineRange);
+    }
+    Ok(())
+}
+
+/// The content span of one line: `[start, end)` excluding the
+/// `\n` terminator (a `\r` before it is content, byte-honestly).
+/// The last line's raw end is the document's length.
+fn line_content_span(table: &PieceTable, line_starts: &[u64], line: usize) -> (u64, u64) {
+    let start = line_starts[line];
+    let raw_end = if line + 1 < line_starts.len() {
+        line_starts[line + 1]
+    } else {
+        table.len()
+    };
+    let end = if raw_end > start && table.byte_at(raw_end - 1) == Some(b'\n') {
+        raw_end - 1
+    } else {
+        raw_end
+    };
+    (start, end)
+}
+
+/// Extract the rectangle covering byte columns
+/// `[col_start, col_end)` of lines `[first_line, last_line]`:
+/// one entry per line, the line's bytes inside the columns —
+/// clamped, so a line shorter than `col_start` contributes an
+/// empty entry and a line ending inside the range contributes
+/// what it has. A pure read; nothing is recorded or changed.
+pub fn rect_extract(
+    table: &PieceTable,
+    line_starts: &[u64],
+    first_line: usize,
+    last_line: usize,
+    col_start: usize,
+    col_end: usize,
+) -> Result<Vec<Vec<u8>>, RectError> {
+    check_rect_lines(line_starts, first_line, last_line)?;
+    if col_start > col_end {
+        return Err(RectError::Columns);
+    }
+    let mut out = Vec::with_capacity(last_line - first_line + 1);
+    for line in first_line..=last_line {
+        let (start, end) = line_content_span(table, line_starts, line);
+        let len = end - start;
+        let cs = (col_start as u64).min(len);
+        let ce = (col_end as u64).min(len);
+        out.push(table.read(start + cs, ce - cs));
+    }
+    Ok(out)
 }
 
 /// Replace `segment_len` pieces starting at `anchor` with `replacement` and
@@ -749,5 +1022,299 @@ mod tests {
                 previous_pieces: removed,
             })
         );
+    }
+
+    // ---- Multi-range + rectangular editing (R5a core) -------
+
+    fn line_starts_of(bytes: &[u8]) -> Vec<u64> {
+        let mut starts = vec![0];
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' && i + 1 < bytes.len() {
+                starts.push((i + 1) as u64);
+            }
+        }
+        starts
+    }
+
+    #[test]
+    fn multi_replace_is_one_undo_entry() {
+        let mut table = PieceTable::from_original(b"hello world, hello moon".to_vec());
+        let layout_before = table.pieces.clone();
+        let mut history = UndoStack::new();
+        let action = history
+            .do_multi_replace(
+                &mut table,
+                &[
+                    RangeEdit {
+                        offset: 0,
+                        delete_len: 5,
+                        replacement: b"bye",
+                    },
+                    RangeEdit {
+                        offset: 13,
+                        delete_len: 5,
+                        replacement: b"bye",
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(text(&table), "bye world, bye moon");
+        match action {
+            Some(EditAction::Replace {
+                replacements: 2,
+                inserted_length: 6,
+                ..
+            }) => {}
+            other => panic!("unexpected action {other:?}"),
+        }
+        assert_eq!(history.undo_len(), 1);
+        assert!(history.apply_undo(&mut table));
+        assert_eq!(text(&table), "hello world, hello moon");
+        assert_eq!(table.pieces, layout_before);
+        assert!(history.apply_redo(&mut table));
+        assert_eq!(text(&table), "bye world, bye moon");
+        assert!(table.check_invariants());
+    }
+
+    #[test]
+    fn multi_insert_at_many_cursors_is_one_entry() {
+        let mut table = PieceTable::from_original(b"a b c".to_vec());
+        let mut history = UndoStack::new();
+        history
+            .do_multi_replace(
+                &mut table,
+                &[
+                    RangeEdit {
+                        offset: 0,
+                        delete_len: 0,
+                        replacement: b">",
+                    },
+                    RangeEdit {
+                        offset: 2,
+                        delete_len: 0,
+                        replacement: b">",
+                    },
+                    RangeEdit {
+                        offset: 4,
+                        delete_len: 0,
+                        replacement: b">",
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(text(&table), ">a >b >c");
+        assert_eq!(history.undo_len(), 1);
+        assert!(history.apply_undo(&mut table));
+        assert_eq!(text(&table), "a b c");
+    }
+
+    #[test]
+    fn multi_replace_validation_refuses_without_mutating() {
+        let mut table = PieceTable::from_original(b"hello world".to_vec());
+        let layout_before = table.pieces.clone();
+        let mut history = UndoStack::new();
+        // Unsorted.
+        assert_eq!(
+            history.do_multi_replace(
+                &mut table,
+                &[
+                    RangeEdit {
+                        offset: 6,
+                        delete_len: 1,
+                        replacement: b"x"
+                    },
+                    RangeEdit {
+                        offset: 2,
+                        delete_len: 1,
+                        replacement: b"x"
+                    },
+                ]
+            ),
+            Err(MultiEditError::Unsorted { index: 1 })
+        );
+        // Overlapping.
+        assert_eq!(
+            history.do_multi_replace(
+                &mut table,
+                &[
+                    RangeEdit {
+                        offset: 0,
+                        delete_len: 5,
+                        replacement: b"x"
+                    },
+                    RangeEdit {
+                        offset: 3,
+                        delete_len: 1,
+                        replacement: b"x"
+                    },
+                ]
+            ),
+            Err(MultiEditError::Overlapping { index: 1 })
+        );
+        // Same start, even for two pure inserts: ambiguous order.
+        assert_eq!(
+            history.do_multi_replace(
+                &mut table,
+                &[
+                    RangeEdit {
+                        offset: 4,
+                        delete_len: 0,
+                        replacement: b"x"
+                    },
+                    RangeEdit {
+                        offset: 4,
+                        delete_len: 0,
+                        replacement: b"y"
+                    },
+                ]
+            ),
+            Err(MultiEditError::Overlapping { index: 1 })
+        );
+        // Out of bounds: start past the end, and a delete running
+        // past the end.
+        assert_eq!(
+            history.do_multi_replace(
+                &mut table,
+                &[RangeEdit {
+                    offset: 12,
+                    delete_len: 0,
+                    replacement: b"x"
+                },]
+            ),
+            Err(MultiEditError::OutOfBounds { index: 0 })
+        );
+        assert_eq!(
+            history.do_multi_replace(
+                &mut table,
+                &[RangeEdit {
+                    offset: 9,
+                    delete_len: 5,
+                    replacement: b"x"
+                },]
+            ),
+            Err(MultiEditError::OutOfBounds { index: 0 })
+        );
+        // Nothing applied, nothing recorded.
+        assert_eq!(text(&table), "hello world");
+        assert_eq!(table.pieces, layout_before);
+        assert!(!history.can_undo());
+    }
+
+    #[test]
+    fn multi_replace_noops_record_nothing() {
+        let mut table = PieceTable::from_original(b"abc".to_vec());
+        let mut history = UndoStack::new();
+        let result = history
+            .do_multi_replace(
+                &mut table,
+                &[RangeEdit {
+                    offset: 1,
+                    delete_len: 0,
+                    replacement: b"",
+                }],
+            )
+            .unwrap();
+        assert_eq!(result, None);
+        assert!(!history.can_undo());
+        // A single pure insert still records the ordinary way.
+        let result = history
+            .do_multi_replace(
+                &mut table,
+                &[RangeEdit {
+                    offset: 3,
+                    delete_len: 0,
+                    replacement: b"d",
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            Some(EditAction::Insert {
+                offset: 3,
+                length: 1
+            })
+        );
+        assert_eq!(text(&table), "abcd");
+        assert!(history.apply_undo(&mut table));
+        assert_eq!(text(&table), "abc");
+    }
+
+    #[test]
+    fn rect_extract_clamps_per_line() {
+        let bytes = b"abc\nde\nfghi\nx";
+        let table = PieceTable::from_original(bytes.to_vec());
+        let starts = line_starts_of(bytes);
+        assert_eq!(starts, vec![0, 4, 7, 12]);
+        let out = rect_extract(&table, &starts, 0, 3, 1, 3).unwrap();
+        assert_eq!(
+            out,
+            vec![b"bc".to_vec(), b"e".to_vec(), b"gh".to_vec(), b"".to_vec()]
+        );
+        // Columns fully past a short line: still one empty entry.
+        let out = rect_extract(&table, &starts, 1, 1, 5, 9).unwrap();
+        assert_eq!(out, vec![Vec::<u8>::new()]);
+    }
+
+    #[test]
+    fn rect_delete_and_insert_are_single_undo_entries() {
+        let bytes = b"abc\nde\nfghi";
+        let starts = line_starts_of(bytes);
+        let mut table = PieceTable::from_original(bytes.to_vec());
+        let layout_before = table.pieces.clone();
+        let mut history = UndoStack::new();
+        history
+            .do_rect_delete(&mut table, &starts, 0, 2, 0, 1)
+            .unwrap();
+        assert_eq!(text(&table), "bc\ne\nghi");
+        assert_eq!(history.undo_len(), 1);
+        assert!(history.apply_undo(&mut table));
+        assert_eq!(text(&table), "abc\nde\nfghi");
+        assert_eq!(table.pieces, layout_before);
+
+        history
+            .do_rect_insert(&mut table, &starts, 0, 2, 1, b">")
+            .unwrap();
+        assert_eq!(text(&table), "a>bc\nd>e\nf>ghi");
+        assert_eq!(history.undo_len(), 1);
+        assert!(history.apply_undo(&mut table));
+        assert_eq!(text(&table), "abc\nde\nfghi");
+        // Insert clamped to a short line's end: no padding.
+        history
+            .do_rect_insert(&mut table, &starts, 1, 1, 9, b"!")
+            .unwrap();
+        assert_eq!(text(&table), "abc\nde!\nfghi");
+        assert!(table.check_invariants());
+    }
+
+    #[test]
+    fn rect_errors_and_empty_column_range() {
+        let bytes = b"abc\ndef";
+        let starts = line_starts_of(bytes);
+        let mut table = PieceTable::from_original(bytes.to_vec());
+        let mut history = UndoStack::new();
+        assert_eq!(
+            history.do_rect_delete(&mut table, &starts, 2, 1, 0, 1),
+            Err(RectError::LineRange)
+        );
+        assert_eq!(
+            history.do_rect_delete(&mut table, &starts, 0, 5, 0, 1),
+            Err(RectError::LineRange)
+        );
+        assert_eq!(
+            history.do_rect_delete(&mut table, &starts, 0, 1, 3, 2),
+            Err(RectError::Columns)
+        );
+        assert_eq!(
+            rect_extract(&table, &starts, 0, 1, 2, 2).unwrap(),
+            vec![Vec::<u8>::new(), Vec::<u8>::new()]
+        );
+        // A zero-width delete is a well-defined no-op.
+        assert_eq!(
+            history
+                .do_rect_delete(&mut table, &starts, 0, 1, 1, 1)
+                .unwrap(),
+            None
+        );
+        assert!(!history.can_undo());
     }
 }
