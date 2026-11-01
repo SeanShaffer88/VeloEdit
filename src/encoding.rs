@@ -427,6 +427,290 @@ pub fn encode_needle(text: &str, enc: TextEncoding) -> Result<Vec<u8>, EncodeErr
     encode(text, enc)
 }
 
+// ---------------------------------------------------------------------------
+// Extended code pages (roadmap item 29, slice R4c)
+// ---------------------------------------------------------------------------
+
+/// An extended code page the owner can choose from the Encoding ▸
+/// Code Pages menu. Detection never picks one of these — pages are
+/// user-chosen only, because a byte sample cannot reliably tell
+/// Shift-JIS from GBK from plain binary.
+///
+/// Conversion goes through the Win32 `MultiByteToWideChar` /
+/// `WideCharToMultiByte` pair (the converter the GUI shell installs
+/// at startup — see [`install_page_converter`]), except the two
+/// ISO-8859 pages, which have small exact tables in pure Rust so the
+/// host test suite covers them end to end.
+///
+/// Page conversion is LOSSY by design, unlike the strict standard
+/// encodings above: decoding replaces a byte sequence the page
+/// cannot read with U+FFFD, and encoding a character the page
+/// cannot represent fails with [`EncodeError`] at the editor edge
+/// (the Win32 call underneath would substitute `'?'`; the shell's
+/// converter reports the failure instead, per character, so the
+/// editor keeps its "never a silent '?'" rule).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodePage {
+    /// Shift-JIS (Windows code page 932).
+    ShiftJis,
+    /// GBK (Windows code page 936).
+    Gbk,
+    /// EUC-KR (Windows code page 949).
+    EucKr,
+    /// ISO-8859-1 (Windows code page 28591).
+    Iso88591,
+    /// ISO-8859-15 (Windows code page 28605).
+    Iso885915,
+    /// Windows-1250 (Central European).
+    Windows1250,
+    /// Windows-1251 (Cyrillic).
+    Windows1251,
+}
+
+impl CodePage {
+    /// Every page, in menu order.
+    pub const ALL: [CodePage; 7] = [
+        CodePage::ShiftJis,
+        CodePage::Gbk,
+        CodePage::EucKr,
+        CodePage::Iso88591,
+        CodePage::Iso885915,
+        CodePage::Windows1250,
+        CodePage::Windows1251,
+    ];
+
+    /// The Windows code-page identifier `MultiByteToWideChar` takes.
+    pub fn windows_id(self) -> u32 {
+        match self {
+            CodePage::ShiftJis => 932,
+            CodePage::Gbk => 936,
+            CodePage::EucKr => 949,
+            CodePage::Iso88591 => 28591,
+            CodePage::Iso885915 => 28605,
+            CodePage::Windows1250 => 1250,
+            CodePage::Windows1251 => 1251,
+        }
+    }
+
+    /// Short label for the status bar: `"CP932"` and friends.
+    pub fn label(self) -> &'static str {
+        match self {
+            CodePage::ShiftJis => "CP932",
+            CodePage::Gbk => "CP936",
+            CodePage::EucKr => "CP949",
+            CodePage::Iso88591 => "CP28591",
+            CodePage::Iso885915 => "CP28605",
+            CodePage::Windows1250 => "CP1250",
+            CodePage::Windows1251 => "CP1251",
+        }
+    }
+
+    /// Menu display name: the common name plus the page number.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            CodePage::ShiftJis => "Shift-JIS (932)",
+            CodePage::Gbk => "GBK (936)",
+            CodePage::EucKr => "EUC-KR (949)",
+            CodePage::Iso88591 => "ISO-8859-1 (28591)",
+            CodePage::Iso885915 => "ISO-8859-15 (28605)",
+            CodePage::Windows1250 => "Windows-1250",
+            CodePage::Windows1251 => "Windows-1251",
+        }
+    }
+
+    /// True when this page converts through the pure-Rust tables
+    /// (the ISO-8859 pair) rather than the installed Win32 converter.
+    fn is_table_page(self) -> bool {
+        matches!(self, CodePage::Iso88591 | CodePage::Iso885915)
+    }
+}
+
+/// The codec a document is currently viewed and edited through:
+/// one of the detected standard encodings, or an owner-chosen
+/// extended code page (roadmap item 29). The piece table always
+/// stores bytes; the codec only decides how bytes become text at
+/// the display / typing edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextCodec {
+    Standard(TextEncoding),
+    Page(CodePage),
+}
+
+impl TextCodec {
+    /// The save-transform unit width for this codec: 2 for the
+    /// UTF-16 pair, 1 for everything else (the code pages are
+    /// byte-oriented; in the double-byte pages a line-ending byte
+    /// never appears inside a multi-byte character, so the 1-byte
+    /// transform stays exact).
+    pub fn unit_width(self) -> usize {
+        match self {
+            TextCodec::Standard(TextEncoding::Utf16Le | TextEncoding::Utf16Be) => 2,
+            _ => 1,
+        }
+    }
+}
+
+/// The platform page converter the Windows shell installs at
+/// startup: byte ↔ UTF-16-unit conversion for one Windows code
+/// page, backed by `MultiByteToWideChar` / `WideCharToMultiByte`.
+/// It lives behind a hook so this module stays platform-neutral
+/// and unsafe-free; the functions themselves live in the shell
+/// (one of the crate's sanctioned unsafe modules).
+#[derive(Clone, Copy)]
+pub struct PageConverter {
+    /// Decode bytes in page `page_id` to UTF-16 units, lossily:
+    /// sequences the page cannot read become U+FFFD.
+    pub decode_units: fn(&[u8], u32) -> Vec<u16>,
+    /// Encode ONE character in page `page_id`; `None` when the
+    /// page cannot represent it.
+    pub encode_char: fn(char, u32) -> Option<Vec<u8>>,
+}
+
+static PAGE_CONVERTER: std::sync::OnceLock<PageConverter> = std::sync::OnceLock::new();
+
+/// Install the platform page converter (called once by the Windows
+/// shell before any window or headless command runs; later calls
+/// are ignored).
+pub fn install_page_converter(converter: PageConverter) {
+    let _ = PAGE_CONVERTER.set(converter);
+}
+
+/// The installed page converter, if any.
+pub fn page_converter() -> Option<&'static PageConverter> {
+    PAGE_CONVERTER.get()
+}
+
+/// ISO-8859-15's eight departures from ISO-8859-1: byte → character.
+/// The other 248 bytes are the Latin-1 code point of the same value.
+const ISO_8859_15_SPECIALS: [(u8, char); 8] = [
+    (0xA4, '\u{20AC}'), // € (Latin-1 has ¤)
+    (0xA6, '\u{0160}'), // Š (Latin-1 has ¦)
+    (0xA8, '\u{0161}'), // š (Latin-1 has ¨)
+    (0xB4, '\u{017D}'), // Ž (Latin-1 has ´)
+    (0xB8, '\u{017E}'), // ž (Latin-1 has ¸)
+    (0xBC, '\u{0152}'), // Œ (Latin-1 has ¼)
+    (0xBD, '\u{0153}'), // œ (Latin-1 has ½)
+    (0xBE, '\u{0178}'), // Ÿ (Latin-1 has ¾)
+];
+
+/// The character for one byte under an ISO-8859 table page.
+fn decode_byte_iso(byte: u8, page: CodePage) -> char {
+    if page == CodePage::Iso885915 {
+        if let Some(&(_, ch)) = ISO_8859_15_SPECIALS.iter().find(|&&(b, _)| b == byte) {
+            return ch;
+        }
+    }
+    byte as char
+}
+
+/// The byte for a character under an ISO-8859 table page, or
+/// `None` when the page cannot represent it. Exact inverse of
+/// [`decode_byte_iso`] — note this makes the eight Latin-1
+/// characters ISO-8859-15 displaced (¤ ¦ ¨ ´ ¸ ¼ ½ ¾)
+/// unrepresentable in that page, which is the standard's own rule.
+fn encode_char_iso(ch: char, page: CodePage) -> Option<u8> {
+    if page == CodePage::Iso885915 {
+        if let Some(&(byte, _)) = ISO_8859_15_SPECIALS.iter().find(|&&(_, c)| c == ch) {
+            return Some(byte);
+        }
+        // The displaced Latin-1 characters have no 8859-15 byte.
+        if matches!(
+            ch,
+            '\u{00A4}'
+                | '\u{00A6}'
+                | '\u{00A8}'
+                | '\u{00B4}'
+                | '\u{00B8}'
+                | '\u{00BC}'
+                | '\u{00BD}'
+                | '\u{00BE}'
+        ) {
+            return None;
+        }
+    }
+    let cp = ch as u32;
+    if cp <= 0xFF {
+        Some(cp as u8)
+    } else {
+        None
+    }
+}
+
+/// Decode bytes under a code page, lossily (see [`CodePage`]).
+/// The ISO-8859 pages decode through their exact tables; the
+/// remaining pages go through the installed Win32 converter. With
+/// no converter installed (a non-Windows host build — the product
+/// itself always installs one at startup) the Win32 pages fall
+/// back to the ISO-8859-1 byte mapping so behaviour stays total
+/// and documented rather than failing.
+pub fn decode_page_lossy(bytes: &[u8], page: CodePage) -> String {
+    if page.is_table_page() {
+        return bytes.iter().map(|&b| decode_byte_iso(b, page)).collect();
+    }
+    match page_converter() {
+        Some(converter) => {
+            let units = (converter.decode_units)(bytes, page.windows_id());
+            String::from_utf16_lossy(&units)
+        }
+        None => bytes.iter().map(|&b| b as char).collect(),
+    }
+}
+
+/// Encode text under a code page. Fails with [`EncodeError`] for
+/// the first character the page cannot represent — never a silent
+/// `'?'`. The ISO-8859 pages encode through their exact tables;
+/// the remaining pages go through the installed Win32 converter
+/// one character at a time (so the error names the character, and
+/// no document-sized conversion is ever built here — encoding
+/// serves typed text and search needles, which are short). With
+/// no converter installed the Win32 pages accept only the
+/// ISO-8859-1 range (the documented host-build fallback).
+pub fn encode_page(text: &str, page: CodePage) -> Result<Vec<u8>, EncodeError> {
+    let mut out = Vec::with_capacity(text.len());
+    for (position, ch) in text.char_indices() {
+        let encoded = if page.is_table_page() {
+            encode_char_iso(ch, page).map(|b| vec![b])
+        } else {
+            match page_converter() {
+                Some(converter) => (converter.encode_char)(ch, page.windows_id()),
+                None => {
+                    let cp = ch as u32;
+                    if cp <= 0xFF {
+                        Some(vec![cp as u8])
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        match encoded {
+            Some(bytes) => out.extend_from_slice(&bytes),
+            None => {
+                return Err(EncodeError {
+                    position,
+                    ch,
+                    message: format!(
+                        "character '{ch}' (U+{:04X}) cannot be represented in {}",
+                        ch as u32,
+                        page.display_name()
+                    ),
+                })
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Encode text through a [`TextCodec`]: the strict standard
+/// [`encode`] for the detected encodings, [`encode_page`] for an
+/// owner-chosen page.
+pub fn encode_codec(text: &str, codec: TextCodec) -> Result<Vec<u8>, EncodeError> {
+    match codec {
+        TextCodec::Standard(enc) => encode(text, enc),
+        TextCodec::Page(page) => encode_page(text, page),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +923,102 @@ mod tests {
         assert_eq!(bom_bytes(TextEncoding::Ansi), &[] as &[u8]);
         let bytes = encode("Hi", TextEncoding::Utf16Le).unwrap();
         assert_eq!(bytes, [0x48, 0x00, 0x69, 0x00]); // no FF FE prefix
+    }
+
+    // ---- Extended code pages (roadmap item 29) ----
+
+    #[test]
+    fn code_page_ids_and_labels() {
+        assert_eq!(CodePage::ALL.len(), 7);
+        assert_eq!(CodePage::ShiftJis.windows_id(), 932);
+        assert_eq!(CodePage::Gbk.windows_id(), 936);
+        assert_eq!(CodePage::EucKr.windows_id(), 949);
+        assert_eq!(CodePage::Iso88591.windows_id(), 28591);
+        assert_eq!(CodePage::Iso885915.windows_id(), 28605);
+        assert_eq!(CodePage::Windows1250.windows_id(), 1250);
+        assert_eq!(CodePage::Windows1251.windows_id(), 1251);
+        assert_eq!(CodePage::ShiftJis.label(), "CP932");
+        assert_eq!(CodePage::Windows1251.label(), "CP1251");
+        assert_eq!(CodePage::Iso88591.display_name(), "ISO-8859-1 (28591)");
+    }
+
+    #[test]
+    fn iso88591_round_trip_all_256_bytes() {
+        // The pure-Rust table page, end to end on the host: byte =
+        // code point, so all 256 values round-trip exactly.
+        let all: Vec<u8> = (0u8..=255).collect();
+        let text = decode_page_lossy(&all, CodePage::Iso88591);
+        assert_eq!(text.chars().count(), 256);
+        assert_eq!(encode_page(&text, CodePage::Iso88591).unwrap(), all);
+        assert_eq!(decode_page_lossy(&[0xE9], CodePage::Iso88591), "é");
+        // A character past Latin-1 is an EncodeError, never a '?'.
+        let err = encode_page("a\u{4E2D}", CodePage::Iso88591).unwrap_err();
+        assert_eq!(err.ch, '\u{4E2D}');
+        assert_eq!(err.position, 1);
+    }
+
+    #[test]
+    fn iso885915_swaps_eight_positions() {
+        // The eight special positions decode to their 8859-15
+        // characters and encode back; everything else is Latin-1.
+        for (byte, ch) in ISO_8859_15_SPECIALS {
+            assert_eq!(
+                decode_page_lossy(&[byte], CodePage::Iso885915),
+                ch.to_string()
+            );
+            assert_eq!(
+                encode_page(&ch.to_string(), CodePage::Iso885915).unwrap(),
+                [byte]
+            );
+            // And those same bytes are the plain Latin-1 characters
+            // under ISO-8859-1.
+            assert_eq!(
+                decode_page_lossy(&[byte], CodePage::Iso88591),
+                (byte as char).to_string()
+            );
+        }
+        // The displaced Latin-1 characters cannot be encoded in
+        // 8859-15 at all (the standard's own rule).
+        assert!(encode_page("\u{00A4}", CodePage::Iso885915).is_err());
+        assert!(encode_page("\u{00BC}", CodePage::Iso885915).is_err());
+        // € exists in both pages but at different bytes.
+        assert_eq!(encode_page("€", CodePage::Iso885915).unwrap(), [0xA4]);
+        assert!(encode_page("€", CodePage::Iso88591).is_err());
+        // Ordinary Latin-1 still round-trips through 8859-15.
+        let text = decode_page_lossy(&[0x41, 0xE9, 0xFF], CodePage::Iso885915);
+        assert_eq!(text, "Aéÿ");
+        assert_eq!(
+            encode_page(&text, CodePage::Iso885915).unwrap(),
+            [0x41, 0xE9, 0xFF]
+        );
+    }
+
+    #[test]
+    fn win32_pages_without_a_converter_use_the_documented_fallback() {
+        // Host builds install no converter: decode falls back to
+        // the ISO-8859-1 byte mapping and encode accepts only that
+        // range. (On Windows the shell installs the real converter
+        // at startup; see gui_win.)
+        if page_converter().is_some() {
+            return; // another test process state: nothing to pin here
+        }
+        assert_eq!(decode_page_lossy(&[0x41, 0xE9], CodePage::ShiftJis), "Aé");
+        assert_eq!(encode_page("Aé", CodePage::Gbk).unwrap(), [0x41, 0xE9]);
+        assert!(encode_page("\u{4E2D}", CodePage::EucKr).is_err());
+    }
+
+    #[test]
+    fn encode_codec_dispatches_by_variant() {
+        assert_eq!(
+            encode_codec("ab", TextCodec::Standard(TextEncoding::Utf16Le)).unwrap(),
+            [0x61, 0x00, 0x62, 0x00]
+        );
+        assert_eq!(
+            encode_codec("é", TextCodec::Page(CodePage::Iso88591)).unwrap(),
+            [0xE9]
+        );
+        assert_eq!(TextCodec::Standard(TextEncoding::Utf16Be).unit_width(), 2);
+        assert_eq!(TextCodec::Page(CodePage::ShiftJis).unit_width(), 1);
     }
 
     #[test]
