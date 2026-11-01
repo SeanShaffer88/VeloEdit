@@ -34,6 +34,10 @@
 //! * **Scoped forms** ([`find_in_range`], [`count_in_range`],
 //!   [`replace_all_in_range`], roadmap item 11) report or replace only
 //!   matches lying fully inside `[start, end)`.
+//! * **Windowed form** ([`find_in_window`], roadmap item 10) reports
+//!   the matches *starting* inside `[start, end)` so a background
+//!   worker can populate results window by window; concatenated over
+//!   consecutive windows it equals [`find_all`].
 //! * **Masked search** ([`MaskedPattern`], [`find_masked_all`], roadmap
 //!   item 12) matches byte patterns with per-nibble wildcards.
 //! * Scanning is **word-parallel** (roadmap item 8): candidate
@@ -133,6 +137,80 @@ pub fn find_next(
     collect_matches(table, needle, options, from_offset, table.len(), false, 1)
         .into_iter()
         .next()
+}
+
+/// Find every occurrence of `needle` whose **start** lies inside the
+/// window `[start, end)` (roadmap item 10, incremental find-all core).
+///
+/// This is the windowed form a background worker drives piece by
+/// piece: it scans only the window plus the `needle.len() - 1` bytes
+/// past its end, and returns the matches that *start* in the window —
+/// a match straddling the window's right edge is reported here (its
+/// start is inside), while one straddling the left edge belongs to
+/// the previous window. Concatenating the results over consecutive
+/// windows `[0, w)`, `[w, 2w)`, … therefore reproduces
+/// [`find_all`]'s list exactly, overlaps included — a property the
+/// tests assert. `options.max_results` is ignored: each window
+/// reports all of its matches and the caller enforces any overall
+/// cap, the same split [`count_in_range`] uses.
+pub fn find_in_window(
+    table: &PieceTable,
+    needle: &[u8],
+    options: &SearchOptions,
+    start: u64,
+    end: u64,
+) -> Vec<u64> {
+    let n = needle.len();
+    if n == 0 || start >= end || start >= table.len() {
+        return Vec::new();
+    }
+    let folded_needle: Vec<u8> = if options.case_insensitive {
+        needle.iter().map(|b| b.to_ascii_lowercase()).collect()
+    } else {
+        needle.to_vec()
+    };
+    // A match starting at `end - 1` reaches at most `n - 1` bytes
+    // past the window; nothing beyond that can start in the window.
+    let scan_end = end.saturating_add(n as u64 - 1).min(table.len());
+
+    let mut results: Vec<u64> = Vec::new();
+    // The same tail-carry scheme as collect_matches, but the first
+    // window begins exactly at `start` (bytes before it are never
+    // read: a match starting before `start` is not this window's).
+    let mut tail: Vec<u8> = Vec::new();
+    let mut tail_start: u64 = start;
+    let mut slice_pos: u64 = 0;
+    for slice in table.iter_slices() {
+        let slice = slice.as_ref();
+        let slice_end = slice_pos + slice.len() as u64;
+        // The part of this slice overlapping [start, scan_end).
+        let lo = start.max(slice_pos);
+        let hi = scan_end.min(slice_end);
+        if lo < hi {
+            let part = &slice[(lo - slice_pos) as usize..(hi - slice_pos) as usize];
+            let mut window: Vec<u8> = Vec::with_capacity(tail.len() + part.len());
+            window.extend_from_slice(&tail);
+            window.extend_from_slice(part);
+            let window_start = tail_start;
+            if window.len() >= n {
+                for i in window_matches(&window, &folded_needle, options.case_insensitive) {
+                    let absolute = window_start + i as u64;
+                    if absolute >= start && absolute < end {
+                        results.push(absolute);
+                    }
+                }
+            }
+            let window_end = window_start + window.len() as u64;
+            let keep = (n - 1).min(window.len());
+            tail = window[window.len() - keep..].to_vec();
+            tail_start = window_end - keep as u64;
+        }
+        slice_pos = slice_end;
+        if slice_pos >= scan_end {
+            break;
+        }
+    }
+    results
 }
 
 /// The shared streaming matcher behind [`find_all`] and [`find_next`].
@@ -1058,5 +1136,72 @@ mod tests {
         assert!(history.apply_undo(&mut table));
         assert_eq!(table.pieces, layout_before);
         assert_eq!(text(&table), "abEFcd");
+    }
+
+    /// (Item 10 core) Driving [`find_in_window`] over consecutive
+    /// windows must reproduce [`find_all`] exactly, for every
+    /// window size — matches are partitioned by their start, and
+    /// straddlers at either edge are counted exactly once.
+    #[test]
+    fn windowed_find_concatenates_to_find_all() {
+        // A multi-piece document with overlapping matches ("aa" in
+        // "aaaaa"), a needle spanning pieces, and matches near both
+        // ends: pieces "aa" | "aa" | "aXaaYaa".
+        let mut table = PieceTable::from_original(b"aaaa".to_vec());
+        table.insert(4, b"aXaaYaa");
+        let doc = text(&table);
+        assert_eq!(doc, "aaaaaXaaYaa");
+        for (needle, options) in [
+            (b"aa".as_ref(), sensitive()),
+            (b"aaa".as_ref(), sensitive()),
+            (b"aXa".as_ref(), sensitive()),
+            (
+                b"AA".as_ref(),
+                SearchOptions {
+                    case_insensitive: true,
+                    max_results: None,
+                },
+            ),
+        ] {
+            let all = find_all(&table, needle, &options);
+            assert!(!all.is_empty());
+            for width in 1..=7u64 {
+                let mut joined: Vec<u64> = Vec::new();
+                let mut start = 0u64;
+                while start < table.len() {
+                    let end = (start + width).min(table.len());
+                    joined.extend(find_in_window(&table, needle, &options, start, end));
+                    start = end;
+                }
+                assert_eq!(joined, all, "needle {needle:?} width {width}");
+                // One window covering the document also agrees.
+                assert_eq!(
+                    find_in_window(&table, needle, &options, 0, table.len()),
+                    all,
+                    "needle {needle:?} single window"
+                );
+            }
+        }
+    }
+
+    /// (Item 10 core) A match straddling a window edge belongs to
+    /// the window its start falls in; degenerate windows and
+    /// needles report nothing.
+    #[test]
+    fn windowed_find_edge_cases() {
+        let table = PieceTable::from_original(b"0123456789".to_vec());
+        // "345" starts at 3 and straddles the [0, 4) / [4, 10) edge.
+        assert_eq!(find_in_window(&table, b"345", &sensitive(), 0, 4), vec![3]);
+        assert!(find_in_window(&table, b"345", &sensitive(), 4, 10).is_empty());
+        // A window ending exactly at a match start excludes it; a
+        // window starting there includes it.
+        assert!(find_in_window(&table, b"34", &sensitive(), 0, 3).is_empty());
+        assert_eq!(find_in_window(&table, b"34", &sensitive(), 3, 5), vec![3]);
+        // Degenerate requests.
+        assert!(find_in_window(&table, b"34", &sensitive(), 5, 5).is_empty());
+        assert!(find_in_window(&table, b"34", &sensitive(), 10, 20).is_empty());
+        assert!(find_in_window(&table, b"", &sensitive(), 0, 10).is_empty());
+        // A window end past the document end is fine.
+        assert_eq!(find_in_window(&table, b"89", &sensitive(), 8, 999), vec![8]);
     }
 }
