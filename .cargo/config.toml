@@ -1,0 +1,5 @@
+# Static CRT for MSVC builds (SPEC.md section 1.1: statically linked against
+# the C/C++ runtime, /MT, no redistributables). Scoped to the msvc target
+# only; the windows-gnu target and host builds are unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
