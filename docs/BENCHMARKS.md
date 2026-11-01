@@ -45,6 +45,29 @@ the exact Windows measurement the specification requires.
 | Atomic save integrity | Zero data corruption | **Unverified on Windows** | On Windows 11: hard-abort simulation (killing the process, `SIGKILL`-equivalent) during a save, then verifying the target is either the complete old file or the complete new one. On this host, the save pipeline's success, replace, zero-length, staging-failure and swap-failure cases are covered by unit tests, and the Unix-hard-abort case is not among them |
 | Idle CPU | < 0.1 % (SPEC §1.1) | **Unverified** | On Windows 11: Task Manager / performance counters on the idle GUI process |
 
+## The benchmark harness (roadmap item 50)
+
+`scripts/Run-Benchmarks.ps1` automates the measurements above so
+they can be repeated on any Windows machine: it creates a sparse
+test file with `fsutil` at a `-SizeGB` parameter (default 1), plants
+a few text markers, then times with a stopwatch — cold launch to
+`--help`, a `--find` over the file, a `--save-copy`, and an
+`extract` — reporting each process's peak working set as a plain
+table. Two cautions are built into the script's own header: the
+sparse fixture costs almost no disk, but the save-copy step writes a
+*real* full-size copy, so the disk needs about `-SizeGB` of free
+space for the run; and the numbers are evidence for this file, not a
+pass/fail gate.
+
+`.github/workflows/benchmarks.yml` is **manual only**
+(`workflow_dispatch`): it runs the same gate as the release
+workflow, builds the release executable, runs the harness at 1 GB
+on `windows-latest`, and uploads the table as a build artifact.
+The 10 GB and 100 GB runs are local, on a suitable machine (a
+GitHub runner's disk is not the place for a 100 GB save-copy). The
+§8 metrics in the table above keep their individual statuses —
+the harness is how the Windows numbers will be produced.
+
 ## Packaging artifact proofs (Slice 5, this machine)
 
 These prove the packaging scripts produce correctly shaped artifacts.
