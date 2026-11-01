@@ -125,6 +125,43 @@ pub fn op_find_next(
     search::find_next(table, needle, from_offset, options)
 }
 
+/// Operation: find every occurrence of `needle` lying fully inside
+/// `[start, end)` (roadmap item 11, scoped search core).
+pub fn op_find_in_range(
+    table: &PieceTable,
+    needle: &[u8],
+    options: &search::SearchOptions,
+    start: u64,
+    end: u64,
+) -> Vec<u64> {
+    search::find_in_range(table, needle, options, start, end)
+}
+
+/// Operation: replace every non-overlapping occurrence of `needle`
+/// lying fully inside `[start, end)`, as one undoable history entry
+/// (roadmap item 11).
+pub fn op_replace_all_in_range(
+    table: &mut PieceTable,
+    history: &mut UndoStack,
+    needle: &[u8],
+    replacement: &[u8],
+    options: &search::SearchOptions,
+    start: u64,
+    end: u64,
+) -> search::ReplaceReport {
+    search::replace_all_in_range(table, history, needle, replacement, options, start, end)
+}
+
+/// Operation: find every occurrence of a masked byte pattern
+/// (`"4A ?? FF"`, roadmap item 12), streaming over the piece table.
+pub fn op_find_masked(
+    table: &PieceTable,
+    pattern: &search::MaskedPattern,
+    max_results: Option<usize>,
+) -> Vec<u64> {
+    search::find_masked_all(table, pattern, max_results)
+}
+
 /// Operation: replace the `needle_len` bytes at `offset` with
 /// `replacement`, recorded as a single undoable history entry. Returns
 /// the recorded action, or `None` when the request was a no-op.
@@ -149,6 +186,17 @@ pub fn op_replace_all(
     options: &search::SearchOptions,
 ) -> search::ReplaceReport {
     search::replace_all(table, history, needle, replacement, options)
+}
+
+/// Operation: split a file into fixed-size parts, streamed (roadmap
+/// item 36). Parts land in `out_dir` as `<name>.part001`, … and are
+/// returned in order.
+pub fn op_split_file(
+    src: &std::path::Path,
+    part_size: u64,
+    out_dir: &std::path::Path,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    save::split_file(src, part_size, out_dir)
 }
 
 /// Operation: save the document over its file atomically (SPEC.md
