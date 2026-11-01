@@ -96,6 +96,16 @@ pub struct SaveOptions {
     pub eol: EolChoice,
     /// Byte-order-mark transform (roadmap item 32).
     pub bom: BomChoice,
+    /// Block-clone fast save (slice R4c, roadmap item 4): when
+    /// true, an in-place save of a mapped document first tries
+    /// building the staging file by cloning the original file's
+    /// extents and writing only the changed hunks
+    /// (`write_staging_clone`); any failure falls back to the
+    /// normal streamed write with no error shown. Only honoured
+    /// by [`PieceTable::save_to_with_options`] (the in-place
+    /// path) with both transforms `Keep`; `save_atomic` always
+    /// streams. Ignored elsewhere.
+    pub fast_clone: bool,
 }
 
 impl Default for SaveOptions {
@@ -105,6 +115,7 @@ impl Default for SaveOptions {
             encoding: TextEncoding::Utf8,
             eol: EolChoice::Keep,
             bom: BomChoice::Keep,
+            fast_clone: false,
         }
     }
 }
@@ -177,6 +188,47 @@ pub struct SaveReport {
     /// True when the staging path no longer exists after the save (the
     /// normal case: the swap moved it over the target).
     pub staging_removed: bool,
+    /// True when the staging file was built by the block-clone
+    /// fast path (see [`SaveOptions::fast_clone`]). False for every
+    /// normal streamed save, including a fast-save request that
+    /// fell back.
+    pub fast_clone_used: bool,
+}
+
+/// The Windows `FILE_ATTRIBUTE_READONLY` bit value.
+pub const FILE_ATTRIBUTE_READONLY_BIT: u32 = 0x0000_0001;
+
+/// True when a Windows file-attributes word marks the file
+/// read-only (slice R4c, roadmap item 33, "protected files"). The
+/// pure half of the shell's protected-file detection, split out so
+/// the host suite can pin it down.
+pub fn attr_is_read_only(file_attributes: u32) -> bool {
+    file_attributes & FILE_ATTRIBUTE_READONLY_BIT != 0
+}
+
+/// True when the file at `path` is marked read-only. Uses the
+/// cross-platform permissions flag, cross-checked on Windows
+/// against the raw attribute bit (the two can disagree for
+/// directory-like entries; either one marking the file read-only
+/// is enough to treat it as protected). A missing or unreadable
+/// file is not "read-only" — it is an ordinary open error, which
+/// the caller reports separately.
+pub fn path_is_read_only(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if metadata.permissions().readonly() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        attr_is_read_only(metadata.file_attributes())
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Free disk space a save wants to see before it starts streaming:
@@ -650,6 +702,191 @@ fn write_staging(table: &PieceTable, staging: &Path, opts: &SaveOptions) -> Resu
     Ok(written)
 }
 
+/// Block-clone staging build (slice R4c, roadmap item 4): build
+/// the staging file by cloning the original file's extents and
+/// writing only the changed hunks, instead of streaming the whole
+/// document. The hunk list is the delta patch core's
+/// ([`crate::patch::build_patch`]): regions between hunks are
+/// byte-identical to the original by construction, so they are
+/// cloned from it with `FSCTL_DUPLICATE_EXTENTS_TO_FILE` (the
+/// filesystem shares the underlying clusters — copy-on-write — so
+/// almost nothing is physically written); hunk replacements are
+/// written from the patch bytes. The result then finishes through
+/// the exact same flush + atomic swap as a normal save.
+///
+/// Contract: ANY failure returns `None` and removes the staging
+/// file, and the caller falls back to the normal streamed
+/// [`write_staging`] — no error is ever surfaced from this path.
+/// Windows only; the non-Windows form always returns `None`.
+#[cfg(not(windows))]
+fn write_staging_clone(_table: &PieceTable, _staging: &Path, _source: &Path) -> Option<u64> {
+    None
+}
+
+/// Windows form of [`write_staging_clone`].
+#[cfg(windows)]
+fn write_staging_clone(table: &PieceTable, staging: &Path, source: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Ioctl::{
+        DUPLICATE_EXTENTS_DATA, FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    // The delta over the on-disk original: hunks plus the
+    // unchanged spans between them (the spans are what gets
+    // cloned). The original is read through a plain file here —
+    // the table's own mapping stays untouched.
+    let mut source_file = File::open(source).ok()?;
+    let patch = crate::patch::build_patch(
+        table.original_file_size,
+        |offset, out| {
+            if source_file.seek(SeekFrom::Start(offset)).is_err() {
+                return 0;
+            }
+            source_file.read(out).unwrap_or(0)
+        },
+        table,
+    )
+    .ok()?;
+    drop(source_file);
+
+    let mut staging_file = File::create(staging).ok()?;
+    // Pre-size the staging file to the result length: extent
+    // cloning fills ranges of an existing file.
+    if staging_file.set_len(patch.result_len).is_err() {
+        drop(staging_file);
+        let _ = std::fs::remove_file(staging);
+        return None;
+    }
+
+    // A dedicated read handle on the source: the clone call names
+    // the source by handle.
+    let wide: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives
+    // the call; the remaining arguments are plain values / null
+    // pointers CreateFileW permits. The handle is checked before
+    // any use and closed exactly once below.
+    let source_handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if source_handle == INVALID_HANDLE_VALUE {
+        drop(staging_file);
+        let _ = std::fs::remove_file(staging);
+        return None;
+    }
+
+    let staging_handle = staging_file.as_raw_handle() as HANDLE;
+    // Clone one unchanged span of `len` bytes from the source at
+    // `src_off` to the staging file at `dst_off`.
+    let clone_span = |src_off: u64, dst_off: u64, len: u64| -> bool {
+        let mut remaining = len;
+        let mut s = src_off;
+        let mut d = dst_off;
+        while remaining > 0 {
+            let count = remaining.min(i64::MAX as u64);
+            let data = DUPLICATE_EXTENTS_DATA {
+                FileHandle: source_handle,
+                SourceFileOffset: s as i64,
+                TargetFileOffset: d as i64,
+                ByteCount: count as i64,
+            };
+            let mut returned: u32 = 0;
+            // SAFETY: `staging_handle` is the live staging file's
+            // handle; `data` is a valid input struct that outlives
+            // the call; no output buffer or overlapped structure
+            // is used (the handle is synchronous). The result is
+            // checked before anything relies on it.
+            let ok = unsafe {
+                DeviceIoControl(
+                    staging_handle,
+                    FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                    &data as *const DUPLICATE_EXTENTS_DATA as *const std::ffi::c_void,
+                    std::mem::size_of::<DUPLICATE_EXTENTS_DATA>() as u32,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return false;
+            }
+            s += count;
+            d += count;
+            remaining -= count;
+        }
+        true
+    };
+
+    // Walk the result in order: clone each unchanged span, write
+    // each hunk's replacement bytes at its result position. The
+    // patch's hunks are in ascending original-offset order (the
+    // patch builder's cursor never moves backwards), so the
+    // unchanged span before a hunk is
+    // `[orig_pos, hunk.original_offset)`.
+    let mut built = true;
+    let mut result_pos: u64 = 0;
+    let mut orig_pos: u64 = 0;
+    for hunk in &patch.hunks {
+        let unchanged = hunk.original_offset.saturating_sub(orig_pos);
+        if unchanged > 0 && !clone_span(orig_pos, result_pos, unchanged) {
+            built = false;
+            break;
+        }
+        result_pos += unchanged;
+        if !hunk.replacement.is_empty() {
+            if staging_file.seek(SeekFrom::Start(result_pos)).is_err()
+                || staging_file.write_all(&hunk.replacement).is_err()
+            {
+                built = false;
+                break;
+            }
+            result_pos += hunk.replacement.len() as u64;
+        }
+        orig_pos = hunk.original_offset + hunk.original_length;
+    }
+    if built {
+        let tail = table.original_file_size.saturating_sub(orig_pos);
+        if tail > 0 && !clone_span(orig_pos, result_pos, tail) {
+            built = false;
+        } else {
+            result_pos += tail;
+        }
+    }
+    if built && (result_pos != patch.result_len || flush_file(&staging_file).is_err()) {
+        built = false;
+    }
+
+    // SAFETY: `source_handle` was opened by us above and is closed
+    // exactly once, here, on every path past its creation.
+    unsafe { CloseHandle(source_handle) };
+    drop(staging_file);
+    if built {
+        Some(patch.result_len)
+    } else {
+        let _ = std::fs::remove_file(staging);
+        None
+    }
+}
+
 /// Flush an open file's data through the drive cache to disk: on Windows
 /// this is `FlushFileBuffers` (SPEC.md section 5.1 step 3); elsewhere
 /// `File::sync_all` is the equivalent.
@@ -775,6 +1012,9 @@ pub fn save_atomic(
         Ok(written) => Ok(SaveReport {
             bytes_written: written,
             staging_removed: !staging.exists(),
+            // save_atomic always streams (the block-clone fast path
+            // lives on the in-place save_to_with_options route).
+            fast_clone_used: false,
         }),
         Err(err) => {
             // Best-effort cleanup: never leave a staging file behind on
@@ -840,14 +1080,43 @@ impl PieceTable {
         check_free_space(target, self.len())?;
         let staging = staging_path_for(target);
 
+        // Block-clone fast save (slice R4c, item 4): when asked
+        // for, and only with both transforms Keep (the clone
+        // builder assembles raw document bytes), try building the
+        // staging file from cloned extents + changed hunks first.
+        // The clone source is the file the mapped backing points
+        // at; memory/length-only backings have nothing to clone.
+        // Any failure quietly falls through to the streamed write.
+        let mut fast_clone_used = false;
+        let clone_written =
+            if opts.fast_clone && opts.eol == EolChoice::Keep && opts.bom == BomChoice::Keep {
+                // Peek at the backing's path without disturbing it:
+                // detach and immediately put the same buffer back.
+                let detached = self.detach_original();
+                let source = detached.mapped_path().map(|path| path.to_path_buf());
+                self.replace_original(detached);
+                match source {
+                    Some(source) => write_staging_clone(self, &staging, &source),
+                    None => None,
+                }
+            } else {
+                None
+            };
+
         // Steps 1–3: staging file, streaming writes, hardware flush. Our
         // own backing is still attached here: streaming reads from it.
-        let written = match write_staging(self, &staging, opts) {
-            Ok(written) => written,
-            Err(err) => {
-                let _ = std::fs::remove_file(&staging);
-                return Err(err);
+        let written = match clone_written {
+            Some(written) => {
+                fast_clone_used = true;
+                written
             }
+            None => match write_staging(self, &staging, opts) {
+                Ok(written) => written,
+                Err(err) => {
+                    let _ = std::fs::remove_file(&staging);
+                    return Err(err);
+                }
+            },
         };
 
         // Step 4: close our own handlers/mappings to the target before
@@ -897,6 +1166,7 @@ impl PieceTable {
                 Ok(SaveReport {
                     bytes_written: written,
                     staging_removed: !staging.exists(),
+                    fast_clone_used,
                 })
             }
             Err(source) => {
@@ -982,6 +1252,69 @@ mod tests {
             name,
             format!("Filename.ext.tmp_velo_{}", std::process::id())
         );
+    }
+
+    // (R4c, item 33) The read-only attribute bit test.
+    #[test]
+    fn attr_read_only_bit_is_the_windows_value() {
+        assert!(attr_is_read_only(FILE_ATTRIBUTE_READONLY_BIT));
+        assert!(attr_is_read_only(0x0000_0001 | 0x0000_0020)); // + archive
+        assert!(!attr_is_read_only(0));
+        assert!(!attr_is_read_only(0x0000_0020)); // archive only
+        assert!(!attr_is_read_only(0x0000_0010)); // directory only
+    }
+
+    // (R4c, item 33) A real file flagged read-only reports as
+    // such; a normal file and a missing file do not.
+    // (The allow: restoring writability so the temp dir can be
+    // removed is the point of the second set_readonly call;
+    // clippy's Unix world-writable concern does not apply to a
+    // test fixture that is deleted immediately after.)
+    #[allow(clippy::permissions_set_readonly_false)]
+    #[test]
+    fn path_read_only_follows_the_files_flag() {
+        let dir = temp_dir("readonly-flag");
+        let target = dir.join("guarded.txt");
+        std::fs::write(&target, b"content").unwrap();
+        assert!(!path_is_read_only(&target));
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms).unwrap();
+        assert!(path_is_read_only(&target));
+        // Restore writability so the temp dir cleans up everywhere.
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(&target, perms).unwrap();
+        assert!(!path_is_read_only(&target));
+        assert!(!path_is_read_only(&dir.join("missing.txt")));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // (R4c, item 4) With fast_clone requested, a save still
+    // produces the exact document bytes — on the host (and for a
+    // memory-backed table anywhere) the clone path declines and
+    // the normal streamed save runs, reporting fast_clone_used =
+    // false. The Windows clone success path needs a mapped
+    // backing on a clone-capable volume, so it is exercised by
+    // field testing, not here.
+    #[test]
+    fn fast_clone_request_falls_back_to_a_correct_save() {
+        let dir = temp_dir("fast-clone-fallback");
+        let target = dir.join("doc.txt");
+        std::fs::write(&target, b"hello world").unwrap();
+        let mut table = edited_table();
+        let mut history = UndoStack::new();
+        let opts = SaveOptions {
+            fast_clone: true,
+            ..SaveOptions::default()
+        };
+        let report = table
+            .save_to_with_options(&target, &mut history, &opts)
+            .unwrap();
+        assert_eq!(report.bytes_written, 16);
+        assert!(!report.fast_clone_used);
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello new world!");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     // (a) Save an edited multi-piece document; the saved bytes are the
