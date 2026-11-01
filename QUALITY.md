@@ -976,6 +976,230 @@ scored from real Windows evidence before any release.
     is Unverified** until the owner opens a huge file on
     a real Windows 11 machine and times it.
 
+- 2026-11-01, architectural audit pass (six zero-overhead Rust
+  patterns, audit-first: checklists and evidence before any change,
+  changes only where the audit proved a case). Nothing in this pass
+  changes user-visible behaviour, so CHANGELOG.md has no entry for
+  it — every change is internal (compile-time layout pins, hot-loop
+  allocation reuse, one dead error path removed).
+
+  **Pattern 1 — ZST capability tokens: audited, nothing changed.**
+  Examined: `Editor.index: Option<LineIndex>` +
+  `Editor.index_dirty_from: Option<u64>` (`src/editor.rs`), the
+  staged-build states inside `LineIndex` / `LineIndexBuilder`
+  (`src/line_index.rs`: `complete: bool`, `indexed_bytes`,
+  `LineIndexBuilder.stopped`), the save pipeline's streaming state
+  (`SaveTransform.pending_cr` / `unit_hold`, `src/save.rs`), and
+  every boolean parameter on internal core functions. Findings: no
+  loose runtime flag is passed between internal functions anywhere
+  in the core — the only bool parameters are the caret API's
+  `extend_selection` family and `SearchOptions`-style inputs, which
+  are user-level choices, not state verification. Each audited
+  state lives in exactly one owner: partial-vs-complete is
+  `LineIndex`'s own data (derived by `LineIndexBuilder::snapshot`,
+  never passed in), edit invalidation is `Editor`'s
+  `index_dirty_from` (an `Option<u64>`, already a sum type: clean,
+  or dirty-from-offset), and all transitions run through three
+  `Editor` methods (`ensure_index`, `attach_line_index`,
+  `after_mutation`). Every consumer that presents totals gates on
+  `is_complete()` (e.g. `editor.rs` line-count gate). Verdict: the
+  invalid states a capability token would kill are already
+  unrepresentable or centrally guarded; a typestate split of
+  `LineIndex` would rewrite the editor/GUI index surface to defend
+  against a bug class the audit found no instance of. No change.
+
+  **Pattern 2 — scoped/arena allocation: audited; three genuine
+  repeated allocations removed, no arena introduced.** Path by
+  path: the SWAR counters (`count_byte_swar`, `window_matches`)
+  allocate nothing — slices in, values out. The save pipeline's
+  Keep/Keep path streams borrowed piece slices with zero per-chunk
+  allocation, and its transform path already reuses one output
+  buffer with `clear()` per chunk (`write_staging`); the split
+  path likewise reuses one buffer. Sort/dedup materialise their
+  range exactly once under a tested 64 MB refusal cap — a cold,
+  user-invoked operation, not a hot loop. Three real finds:
+  (a) `LineIndexBuilder::advance` allocated up to eight fresh
+  64 KB block buffers plus a block list and a result list for
+  *every round* of *every* stage — roughly three allocations per
+  512 KB scanned, ~20,000 allocations for a 1 GB one-shot build.
+  The builder now keeps a scratch pool (`scratch_buffers`,
+  `scratch_blocks`, `scratch_results`) recycled between rounds;
+  the staged/serial/one-shot checkpoint equivalence tests pin
+  identical output. (b) `PieceTable::rebuild_weights` — called by
+  every structural mutation — collected the piece lengths into a
+  throwaway `Vec<u64>` before building the Fenwick tree;
+  `build_fenwick` now consumes an iterator, so all three call
+  sites allocate nothing beyond the tree itself. (c) The three
+  streaming search scans (`collect_matches`, `find_in_window`,
+  `find_masked_all`) allocated a fresh scan window (tail + slice)
+  per piece, plus a fresh candidate list per piece in the masked
+  scan; the window (and the masked scan's `starts` list) is now
+  hoisted out of the slice loop and refilled with `clear()`.
+  Disclosed, deliberately unchanged: `PieceTable::read` allocates
+  by API contract (its callers want an owned `Vec`; the
+  zero-allocation `read_into` exists beside it), `coalesce` and
+  `delete` allocate a replacement piece list per call (structural,
+  once per edit, not per byte), `snapshot()` clones the checkpoint
+  list by definition, and the scoped-thread round in `advance`
+  still collects ≤ 8 join handles per round (bounded, trivially
+  small next to the 64 KB buffers). A hand-rolled bump arena was
+  considered and rejected: every retained fix is plain buffer
+  reuse inside one function or one builder — an arena type would
+  add a lifetime discipline the code does not need. Bench (host
+  proxies, ignored release benches, 1 GB in-memory source, this
+  machine): before — full build 2,003.5 ms, staged full build
+  983.1 ms, head prefix 3.48 ms, editor staged open 36.95 ms;
+  after — full build 898.7 ms, staged full build 994.5 ms
+  (flat, inside run-to-run variance), head prefix 3.16 ms,
+  editor staged open 3.46 ms. Single runs, variance visible in
+  the spread; the claim made is only "no regression, and the
+  one-shot path that shares the pooled code is faster".
+
+  **Pattern 3 — `const` layout assertions: applied.** Measured
+  first (identical field layouts probed out-of-tree, then pinned
+  in-tree — the pins themselves are the proof, since a wrong value
+  would fail this build): `PieceNode` = 24 B / align 8 and the
+  Fenwick weight = one `u64` per piece, pinned in
+  `src/piece_table.rs` — together they are the entire per-piece
+  memory the SPEC section 8 active-memory budget (< 35 MB) is
+  spent against. `LineCheckpoint` = 24 B / align 8, pinned in
+  `src/line_index.rs` — one checkpoint per 64 KB of source, so a
+  complete index costs exactly source_len / 64 KB × 24 B.
+  `EditAction` = 48 B and `HistoryEntry` = 104 B, pinned in
+  `src/undo.rs` — the records the history step limit (1,024) and
+  stored-delta byte budget (default 256 MB) are spent against.
+  The `MaskedPattern` element `(u8, u8)` = 2 B, pinned in
+  `src/search.rs` (a tuple cannot carry `#[repr(transparent)]`;
+  the pin states the same flat two-bytes-per-pattern-byte
+  guarantee). One honest observation the arithmetic surfaces, not
+  a doc contradiction (no document states a per-checkpoint size):
+  a fully-built index over a 100 GB source holds ~1.6 M
+  checkpoints ≈ 39 MB in this record shape — the SPEC section 8
+  active-memory figure remains **Unverified** on Windows (see
+  `docs/BENCHMARKS.md`) and this observation is now on record
+  beside it.
+
+  **Pattern 4 — transparent newtypes for offsets: AUDIT ONLY,
+  decision recorded here.** The raw flows: byte offsets and line
+  numbers are both `u64` end to end. 54 public signatures across
+  the core modules (`piece_table` 8, `line_index` 9, `search` 6,
+  `editor` 20, `save` 5, `undo` 4, `recovery` 1, `hash` 1)
+  mention `u64`; six search entry points return offset lists as
+  `Vec<u64>` / `Option<u64>`; the public struct fields carrying
+  raw offsets include `PieceNode.source_offset` / `length`,
+  `LineCheckpoint.byte_offset` / `line_number` (two different
+  units in one record — the strongest single argument for
+  newtypes), and `EditAction`'s offset/length fields. Past those
+  signatures, `gui_win.rs` (~7,900 lines, Windows-only) and
+  `cli.rs` thread the same `u64`s through dozens of call sites
+  each. Nothing in the audit found a *swapped-units bug* — no
+  place where a line number was used as a byte offset or vice
+  versa; the confusion risk is real but unrealised, and field
+  names (`byte_offset`, `line_number`) currently carry the
+  distinction. Recommendation: PARTIALLY ADOPT in a dedicated
+  future slice, core-only — introduce `ByteOffset` / `LineNumber`
+  `#[repr(transparent)]` newtypes in `line_index` and
+  `piece_table` (where the two units meet in one record), convert
+  the core's internal flows, and keep the editor's public API in
+  raw `u64` until the shell can be converted in the same slice,
+  so the crate never carries a half-wrapped boundary. Estimated
+  blast radius: ~10 core files' signatures for the partial form
+  (the 54 signatures above plus internals), versus every offset
+  call site in `gui_win.rs` + `cli.rs` for the full form — the
+  full form should not be attempted without a Windows machine in
+  the loop, since the shell cannot be exercised from here. NOT
+  done in this pass, by instruction and by judgement.
+
+  **Pattern 5 — infallible stripping: applied where genuine.**
+  One dead error path removed: `format_unix_millis`
+  (`src/inspector.rs`) unwrapped `strip_suffix(" UTC")` with
+  `.expect(...)`; the suffix is guaranteed by
+  `format_unix_seconds`' format string (same module, NO_READING
+  case returned earlier), so the strip is now a `unwrap_or`
+  fallback that returns the string unmodified on the unreachable
+  path — identical output on every reachable input, no panic
+  path. Every other non-test `.unwrap()` / `.expect()` in the
+  crate was inventoried and stays, each with its justification:
+  (i) fixed-size slice→array conversions
+  (`try_into().expect("8 bytes")` and kin in `hash.rs`,
+  `search.rs`, `line_index.rs`, `inspector.rs`, `recovery.rs`)
+  — the lengths are exact by construction (`chunks_exact`, fixed
+  block indexing, a length-checked `take`); the `expect` *is* the
+  proof-carrying form, and no unwrap-free safe spelling exists.
+  (ii) `diff_bytes`' `.expect("comparing in-memory slices cannot
+  fail")` — `io::Cursor` reads are infallible in fact but
+  `io::Error` is inhabited, so an `Infallible` pipeline would
+  mean duplicating the chunk engine; the expect documents the
+  invariant at the one call site. (iii) `Editor`'s
+  `.expect("index present")` (four sites) and
+  `.expect("counted newlines are present")` — postconditions of
+  `ensure_index()` / a counted scan in the same method.
+  (iv) `PieceTable::insert`'s `.expect("offset < total_length
+  has a piece")` — the same shape, guarded by the assert two
+  statements above. (v) `UndoStack`'s three
+  `.expect("coalesce implies the snapshot was taken")` and
+  `.expect("len > 1")` — option/queue states established by the
+  branch that takes them, in the same function. (vi) The
+  line-index worker's `join().expect("line-index worker
+  panicked")` — deliberate policy: a panicked scan worker must
+  fail the build loudly, not yield a silently truncated index.
+  (vii) `bookmarks.rs`' `.expect("just pushed")` — same-statement
+  invariant. (viii) `theme.rs`' default-theme lookup — a
+  compile-time table containing the key by construction.
+  (ix) `gui_win.rs`' five `.expect("checked above")`-style sites —
+  each guarded by the check its message names, in the same
+  function; the shell's lock discipline needs no unwraps at all:
+  every `Mutex` slot access uses `if let Ok(...)`, `.ok()`, or
+  `try_lock`, so a poisoned slot degrades to a skipped update
+  instead of a panic (the poisoned-lock policy for this codebase,
+  applied consistently). (x) `save.rs`' `.expect("mapped backing
+  has a path")` — the `Mapped` variant carries its path by
+  construction. False positive worth recording: the many
+  `parser.expect(...)` / `self.expect(...)` calls in
+  `bookmarks.rs` and `settings.rs` are a hand-written JSON
+  parser's own `expect(char) -> Result` method — fallible
+  parsing, not panics. No trait implementation in the crate
+  returns a dummy error: the genuine error types (`EditorError`,
+  `SaveError`, `io::Result`, parse `Result<_, String>`) all carry
+  reachable failure paths (disk, permissions, malformed input)
+  and were left exactly as they are.
+
+  **Pattern 6 — cache-line alignment: audited, nothing changed.**
+  Examined: the four shared worker slots in `src/gui_win.rs` —
+  `index_slot`, `find_slot`, `fingerprint_slot` (all
+  `Arc<Mutex<Option<…>>>`) and the hash dialog's slot — plus the
+  epoch counters (`index_epoch`, `doc_epoch`) and a crate-wide
+  search for atomics (there are none: no `Atomic*` type appears
+  anywhere in `src/`). Each slot is an independent heap allocation
+  behind its own `Arc`, so no two mutated fields share a struct,
+  let alone a cache line. Cadence is the deciding evidence: the
+  index worker publishes one snapshot per 32 MB scanned, the find
+  worker's results are picked up on the window's 200 ms tick, and
+  the fingerprint and hash slots are each written once per
+  document/operation. The epoch counters are mutated only on the
+  UI thread. Nothing is written by two threads at a cadence where
+  false sharing could cost a measurable cycle; `#[repr(align(64))]`
+  padding would add bytes to defeat a sharing pattern that does
+  not exist. Verdict: no change; revisit only if a future design
+  introduces a genuinely hot cross-thread counter or queue.
+
+  - Gate (this pass, true exit codes): `cargo fmt --all --
+    --check` — clean (0). `cargo test` — **249 passed, 0 failed,
+    2 ignored** (0). `cargo clippy --all-targets -- -D warnings`
+    (host) — clean (0). `cargo clippy --target
+    x86_64-pc-windows-gnu --all-targets -- -D warnings` — clean
+    (0). `cargo check --target x86_64-pc-windows-msvc` — passed
+    (0). `cargo build --release --target x86_64-pc-windows-gnu`
+    — passed (0); `VeloEdit.exe` 930,304 bytes, SHA-256
+    `6424aff403776266a5ecdd6ea635df3ac7961b35bbe16b168c083c124769a53d`
+    (previous build 927,744 bytes / `06c7b690…`; the size and hash
+    differ, proving this is the fresh build).
+  - Honest status: core changes are verified by the host test
+    suite (including the staged/serial index equivalence and the
+    search naive-equivalence tests). No GUI code changed in this
+    pass. Windows runtime remains **Unverified** for everything
+    the §8 table lists, exactly as before.
+
 ## Known gaps (honest list)
 
 - The installers have been *built* by the release workflow and their
