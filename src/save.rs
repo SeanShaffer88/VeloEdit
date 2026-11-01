@@ -274,6 +274,91 @@ pub fn write_range_to_file(
     Ok(written)
 }
 
+/// Largest number of parts [`split_file`] will produce: a split is a
+/// convenience for moving a file around, not a sharding scheme, so an
+/// absurd part count is a mistake to refuse, not a job to start.
+pub const MAX_SPLIT_PARTS: u64 = 10_000;
+
+/// How many parts a file of `file_len` bytes makes at `part_size`
+/// bytes each (roadmap item 36). An empty file still makes one (empty)
+/// part, so a split always produces something copyable.
+fn split_part_count(file_len: u64, part_size: u64) -> u64 {
+    debug_assert!(part_size > 0);
+    if file_len == 0 {
+        1
+    } else {
+        file_len.div_ceil(part_size)
+    }
+}
+
+/// The file name of part `index` (1-based) of a split of `file_name`
+/// (roadmap item 36): `<name>.part001`, `.part002`, … — at least three
+/// digits, growing (`.part10000`) when the part count needs more, so
+/// the names always sort in part order.
+fn split_part_name(file_name: &str, index: u64, count: u64) -> String {
+    let width = ((count.max(1).to_string().len()).max(3)).max(index.to_string().len());
+    format!("{file_name}.part{index:0width$}")
+}
+
+/// Split the file at `src` into parts of at most `part_size` bytes in
+/// `out_dir` (created when missing), streamed in chunks of at most
+/// [`DEFAULT_MAX_CHUNK`] bytes — the source is never loaded whole
+/// (roadmap item 36). Parts are named `<name>.part001`, `.part002`, …
+/// (see [`split_part_name`]) and returned in order; joining them back
+/// in that order reproduces the source byte for byte.
+///
+/// Refusals, all before anything is written: `part_size` of 0, and a
+/// part count above [`MAX_SPLIT_PARTS`]. An empty source produces a
+/// single empty part.
+pub fn split_file(src: &Path, part_size: u64, out_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    if part_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the part size must be greater than zero",
+        ));
+    }
+    let file_len = std::fs::metadata(src)?.len();
+    let count = split_part_count(file_len, part_size);
+    if count > MAX_SPLIT_PARTS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "splitting {} bytes into {part_size}-byte parts would make {count} parts; \
+                 the limit is {MAX_SPLIT_PARTS} — use a larger part size",
+                file_len
+            ),
+        ));
+    }
+    let file_name = src
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "veloedit".to_string());
+    std::fs::create_dir_all(out_dir)?;
+
+    let mut input = File::open(src)?;
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(count as usize);
+    let mut buffer = vec![0u8; DEFAULT_MAX_CHUNK];
+    for index in 1..=count {
+        let path = out_dir.join(split_part_name(&file_name, index, count));
+        let mut part = File::create(&path)?;
+        // This part's share: a full part_size, except the last part,
+        // which takes whatever is left (0 for an empty source).
+        let mut remaining = part_size.min(file_len - (index - 1) * part_size);
+        while remaining > 0 {
+            let want = remaining.min(buffer.len() as u64) as usize;
+            let read = std::io::Read::read(&mut input, &mut buffer[..want])?;
+            if read == 0 {
+                break; // the source shrank mid-split; the parts hold what exists
+            }
+            part.write_all(&buffer[..read])?;
+            remaining -= read as u64;
+        }
+        part.flush()?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
 /// Build the staging path for `target` (SPEC.md section 5.1 step 1):
 /// same directory, name `<filename>.tmp_velo_<pid>` where `<filename>`
 /// is the target's full file name (extension included).
@@ -876,6 +961,85 @@ mod tests {
         // Beyond-the-end start: error, and the file keeps its bytes.
         assert!(write_range_to_file(&table, 100, 1, &dest).is_err());
         assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // (item 36) Split names: three digits minimum, growing past 999.
+    #[test]
+    fn split_part_names_are_zero_padded_and_sortable() {
+        assert_eq!(split_part_name("big.bin", 1, 3), "big.bin.part001");
+        assert_eq!(split_part_name("big.bin", 12, 300), "big.bin.part012");
+        assert_eq!(
+            split_part_name("big.bin", 10_000, 10_000),
+            "big.bin.part10000"
+        );
+        assert_eq!(split_part_count(0, 5), 1);
+        assert_eq!(split_part_count(10, 5), 2);
+        assert_eq!(split_part_count(11, 5), 3);
+    }
+
+    // (item 36) Splitting streams the source into ordered parts whose
+    // join is the source byte for byte, last part short.
+    #[test]
+    fn split_file_round_trip() {
+        let dir = temp_dir("split-basic");
+        let src = dir.join("data.bin");
+        let data: Vec<u8> = (0u8..=255).cycle().take(1030).collect();
+        std::fs::write(&src, &data).unwrap();
+        let out = dir.join("parts");
+        let paths = split_file(&src, 100, &out).unwrap();
+        assert_eq!(paths.len(), 11); // ceil(1030 / 100)
+        assert_eq!(
+            paths[0].file_name().unwrap().to_string_lossy(),
+            "data.bin.part001"
+        );
+        assert_eq!(
+            paths[10].file_name().unwrap().to_string_lossy(),
+            "data.bin.part011"
+        );
+        let mut joined: Vec<u8> = Vec::new();
+        for (i, path) in paths.iter().enumerate() {
+            let bytes = std::fs::read(path).unwrap();
+            assert_eq!(bytes.len(), if i < 10 { 100 } else { 30 });
+            joined.extend_from_slice(&bytes);
+        }
+        assert_eq!(joined, data);
+        // The source is untouched.
+        assert_eq!(std::fs::read(&src).unwrap(), data);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // (item 36) An exact multiple makes no trailing empty part, and an
+    // empty source makes exactly one empty part.
+    #[test]
+    fn split_file_exact_multiple_and_empty_source() {
+        let dir = temp_dir("split-edges");
+        let src = dir.join("even.bin");
+        std::fs::write(&src, vec![7u8; 300]).unwrap();
+        let paths = split_file(&src, 100, &dir.join("a")).unwrap();
+        assert_eq!(paths.len(), 3);
+        let empty = dir.join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        let paths = split_file(&empty, 100, &dir.join("b")).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(std::fs::read(&paths[0]).unwrap(), Vec::<u8>::new());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // (item 36) Refusals happen before anything is written: a zero
+    // part size, and a part count past the limit.
+    #[test]
+    fn split_file_refusals_write_nothing() {
+        let dir = temp_dir("split-refuse");
+        let src = dir.join("many.bin");
+        std::fs::write(&src, vec![1u8; 20_000]).unwrap();
+        let out = dir.join("parts");
+        let err = split_file(&src, 0, &out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // 20,000 one-byte parts is past the 10,000 limit.
+        let err = split_file(&src, 1, &out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(!out.exists(), "a refused split creates nothing");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
