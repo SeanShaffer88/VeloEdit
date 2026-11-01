@@ -47,6 +47,14 @@ release asset naming in the specification.
   save-copy, and extract with peak memory, and a manual-only
   GitHub workflow runs it at 1 GB on a Windows runner and uploads
   the table.
+- Ctrl+mouse-wheel zoom: holding Ctrl and rolling the mouse wheel
+  steps the font size up or down (the same steps, limits, and
+  saving as View ▸ Font Size); a plain wheel scrolls as before.
+- Live theme and accent preview: moving through the View ▸ Theme
+  and View ▸ Accent menus (mouse or keyboard) previews each
+  highlighted choice in the window without saving it — clicking
+  keeps the choice, closing the menu without a click puts the
+  previous theme and accent back.
 
 ### Changed
 
