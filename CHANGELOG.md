@@ -1,14 +1,12 @@
 # Changelog
 
 All notable changes to VeloEdit are recorded here. Versions follow the
-release asset naming in the specification once releases begin; no release
-has been published yet.
+release asset naming in the specification.
 
-## [1.0.0] — Unreleased
+## [1.0.0] — 2026-10-31
 
 The 1.0.0 build: the editing core, the headless tools, the graphical
-editor window, and the packaging scripts. (The release date is added
-when the release is published.)
+editor window, and the packaging scripts.
 
 ### Added
 
