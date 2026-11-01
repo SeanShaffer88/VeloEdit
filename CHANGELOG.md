@@ -148,6 +148,73 @@ release asset naming in the specification.
   compare box reports which digest a pasted checksum matches, or
   "No match". When the document has unsaved changes the dialog
   says it is hashing the file on disk.
+- Two more checksums in the hash core: CRC32 (IEEE) and xxHash64
+  (seed 0), also written by hand and streaming through the same
+  windowed interface as the digests, so the File Hashes results
+  gain both values when the dialog surface is extended.
+- Ghost Tail core: when the open file grows on disk, the document
+  can now extend its view of the original file to the new length
+  and resume line indexing from where the earlier build stopped,
+  keeping the caret, selection and scroll position — no reload.
+  A file that shrank or changed size-for-size never takes this
+  path; it stays with the external-change notice. Only an
+  unedited document may grow this way. The window's follow
+  watcher arrives in a later slice.
+- Log filter core: the model behind filter mode — given a literal
+  or masked search, the ordered list of matching lines with their
+  byte ranges and two-way mapping between filtered rows and
+  full-file lines/offsets, for one-click jumps back into the full
+  file. On a still-building (partial) line index the filter
+  covers only the indexed prefix and reports that it is
+  incomplete. The filter window arrives in a later slice.
+- Multi-range slicing core: carve several ranges out of a
+  document into one streamed output — a spec like
+  `1,000,000-1,050,000; L100-L200` mixes byte ranges (both ends
+  included) and 1-based line ranges, resolves lines through the
+  index, and writes the ranges in order in bounded chunks.
+  Reversed, out-of-range, overlapping or out-of-order specs are
+  refused with an explicit reason before anything is written.
+  The command/window surface arrives in a later slice.
+- Zero-run insert core: the piece table gains a true zeroes
+  region — inserting a zero run stores no bytes, yet every read
+  path (editor, find, save, extract) yields `0x00` for the run,
+  a run next to a run extends it in place, and undo restores the
+  previous layout exactly.
+- Delta patch core: export the difference between a document's
+  original file and its edited state as a compact binary patch
+  (`VELOPAT1` format: a magic header, the original and result
+  lengths, and an ordered hunk list — original offset, original
+  length, replacement bytes; unchanged spans are referenced,
+  never copied), parse it back with full validation, and apply
+  it to the original to reproduce the document byte for byte.
+  The export/apply surface arrives in a later slice.
+- Strings core: scan a document for printable ASCII runs and
+  UTF-16LE runs (minimum length in characters, default 4),
+  returning each run's byte offset, byte length and a capped
+  text preview — windowed, so the file is never loaded whole.
+  The strings pane arrives in a later slice.
+- Entropy core: Shannon entropy per block over a document
+  (block size a parameter, default 4096 bytes), returning one
+  value per block in the range 0.0 to 8.0 — the data behind an
+  entropy strip. The strip arrives in a later slice.
+- Pointer-following core: at a byte offset, the stored value
+  read as a 32- or 64-bit integer in both byte orders, each
+  marked when it lands inside the document (a plausible jump
+  target); plus a jump-history stack (push on jump, back /
+  forward, capped at 128 entries) the window will own. The
+  jump surface arrives in a later slice.
+- Time-delta core: parse the timestamp at the start of a log
+  line (ISO 8601 with `T` or space separator, and time-of-day
+  only, each with an optional 1–3 digit fraction; invalid dates
+  and times are rejected) and compute the millisecond delta
+  between consecutive lines. The delta gutter arrives in a
+  later slice.
+- Delimiter grid core: detect a delimited file's delimiter
+  (comma, tab, semicolon, pipe) by consistency scoring over a
+  sample of lines, and split a line into column byte ranges —
+  with CSV quoting (double-quote escapes) applied to comma
+  files only, as documented in the core. The grid mode arrives
+  in a later slice.
 
 ### Changed
 
