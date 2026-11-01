@@ -9,7 +9,7 @@
 //!
 //! The palettes are VeloEdit's own token values written in the style of
 //! the named classic editor themes — no theme file from any other
-//! program is copied or loaded. There are exactly 18 built-ins; the first
+//! program is copied or loaded. There are exactly 20 built-ins; the first
 //! is **Obsidian**, the SPEC.md section 4.1 palette verbatim, and it is
 //! the default.
 //!
@@ -195,7 +195,7 @@ const fn c(r: u8, g: u8, b: u8) -> Rgba {
 /// The default theme name (SPEC.md section 4.1).
 pub const DEFAULT_THEME_NAME: &str = "Obsidian";
 
-/// All 18 built-in themes, in menu order. Obsidian (the default) first,
+/// All 20 built-in themes, in menu order. Obsidian (the default) first,
 /// then the one light theme from the owner's theme spec, then the
 /// classics in the order the owner named them.
 pub fn builtins() -> Vec<Theme> {
@@ -383,6 +383,33 @@ pub fn builtins() -> Vec<Theme> {
             c(0xFF, 0xCF, 0x00),
             c(0x00, 0xAF, 0xAF),
         ),
+        // High Contrast (roadmap item 26) — maximum legibility: pure
+        // black canvas and panels, pure white text, a yellow accent,
+        // greys for the quieter tokens. Nothing here relies on subtle
+        // shade differences.
+        build(
+            "High Contrast",
+            c(0x00, 0x00, 0x00),
+            c(0x00, 0x00, 0x00),
+            c(0xFF, 0xFF, 0xFF),
+            c(0xC0, 0xC0, 0xC0),
+            c(0x80, 0x80, 0x80),
+            c(0xFF, 0xFF, 0x00),
+            c(0xFF, 0xFF, 0xFF),
+        ),
+        // E-ink (roadmap item 27) — a paper page for e-ink displays
+        // and tired eyes: warm off-white canvas, near-black text, one
+        // restrained dark accent, low-contrast boundary lines.
+        build(
+            "E-ink",
+            c(0xF5, 0xF1, 0xE8),
+            c(0xED, 0xE7, 0xDA),
+            c(0x1C, 0x1A, 0x17),
+            c(0x6B, 0x64, 0x55),
+            c(0xD8, 0xD0, 0xBE),
+            c(0x2F, 0x45, 0x5E),
+            c(0xA8, 0x8A, 0x5A),
+        ),
     ]
 }
 
@@ -447,7 +474,8 @@ impl Rgba {
 
 /// Preset accent swatches offered next to "Theme default" and the
 /// custom colour picker: (display name, hex). Crimson is the SPEC.md
-/// section 4.1 accent and the default.
+/// section 4.1 accent and the default. The last three are the
+/// colour-blind-safe Okabe–Ito hues (roadmap items 26/27).
 pub const ACCENT_PRESETS: &[(&str, &str)] = &[
     ("Crimson", "#E02424"),
     ("Blue", "#2F7CF6"),
@@ -457,6 +485,9 @@ pub const ACCENT_PRESETS: &[(&str, &str)] = &[
     ("Purple", "#8E44AD"),
     ("Pink", "#E75480"),
     ("Gold", "#C9A227"),
+    ("Okabe Blue", "#0072B2"),
+    ("Okabe Orange", "#E69F00"),
+    ("Okabe Sky", "#56B4E9"),
 ];
 
 #[cfg(test)]
@@ -464,15 +495,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exactly_18_builtins_with_unique_names() {
+    fn exactly_20_builtins_with_unique_names() {
         let all = builtins();
-        assert_eq!(all.len(), 18);
+        assert_eq!(all.len(), 20);
         let mut seen: Vec<&str> = all.iter().map(|t| t.name).collect();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), 18, "theme names must be unique");
+        assert_eq!(seen.len(), 20, "theme names must be unique");
         assert_eq!(all[0].name, "Obsidian");
-        assert_eq!(names().len(), 18);
+        assert_eq!(names().len(), 20);
+    }
+
+    #[test]
+    fn high_contrast_and_eink_are_the_documented_palettes() {
+        let hc = by_name("High Contrast").unwrap();
+        assert_eq!(hc.bg, Rgba::from_hex("#000000").unwrap());
+        assert_eq!(hc.panel, Rgba::from_hex("#000000").unwrap());
+        assert_eq!(hc.text, Rgba::from_hex("#FFFFFF").unwrap());
+        assert_eq!(hc.accent, Rgba::from_hex("#FFFF00").unwrap());
+        let eink = by_name("E-ink").unwrap();
+        assert_eq!(eink.bg, Rgba::from_hex("#F5F1E8").unwrap());
+        assert_eq!(eink.text, Rgba::from_hex("#1C1A17").unwrap());
+        assert_eq!(eink.accent, Rgba::from_hex("#2F455E").unwrap());
     }
 
     #[test]
@@ -636,10 +680,13 @@ mod tests {
 
     #[test]
     fn accent_presets_are_valid_and_include_crimson() {
-        assert_eq!(ACCENT_PRESETS.len(), 8);
+        assert_eq!(ACCENT_PRESETS.len(), 11);
         for (_, hex) in ACCENT_PRESETS {
             assert!(Rgba::from_hex(hex).is_some(), "{hex}");
         }
         assert_eq!(ACCENT_PRESETS[0], ("Crimson", "#E02424"));
+        assert_eq!(ACCENT_PRESETS[8], ("Okabe Blue", "#0072B2"));
+        assert_eq!(ACCENT_PRESETS[9], ("Okabe Orange", "#E69F00"));
+        assert_eq!(ACCENT_PRESETS[10], ("Okabe Sky", "#56B4E9"));
     }
 }
