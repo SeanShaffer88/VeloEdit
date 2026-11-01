@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  VeloEdit — WiX v4 package script (SPEC §6.1)
+
+  Produces: VeloEdit-v1.0.0-x64-Setup.msi
+
+  Per-user package (Scope="perUser"): installs to
+  %LOCALAPPDATA%\Programs\VeloEdit, needs no administrator rights, and
+  registers under HKCU. Upgrades are MajorUpgrade: a newer version replaces
+  the older one in one step.
+
+  GUIDS — NEVER CHANGE THE UPGRADECODE. It is the identity every future
+  VeloEdit MSI uses to recognise and upgrade earlier installs.
+    UpgradeCode:  A38C6BC4-F086-4855-A7E6-8706BCA8F987
+    ProductCode below is for 1.0.0 only; generate a fresh one per release.
+
+  This file is built ONLY on a Windows machine (the release workflow does
+  it; WiX cannot build an MSI on Linux). Exact build commands:
+
+    dotnet tool install --global wix --version 4.*
+    wix extension add WixToolset.UI.wixext
+    wix build installer\Package.wxs -ext WixToolset.UI.wixext ^
+        -d ExePath=target\x86_64-pc-windows-msvc\release\VeloEdit.exe ^
+        -o VeloEdit-v1.0.0-x64-Setup.msi
+
+  ExePath defaults to the repo-relative MSVC release build so a plain
+  `wix build installer\Package.wxs` works after `cargo build --release
+  --target x86_64-pc-windows-msvc`.
+
+  The payload exe must be staged in the data-adjacent layout: the package
+  creates an empty data\ folder next to the program for portable settings.
+-->
+<?define ExePath = "..\target\x86_64-pc-windows-msvc\release\VeloEdit.exe" ?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="VeloEdit"
+           Manufacturer="Sean Shaffer"
+           Version="1.0.0"
+           Scope="perUser"
+           UpgradeCode="A38C6BC4-F086-4855-A7E6-8706BCA8F987"
+           ProductCode="8FC92B0B-AB7D-493C-A144-DBB59B5EA70F">
+    <SummaryInformation Description="VeloEdit 1.0.0 — zero-dependency, portable binary and large-file editor" />
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of VeloEdit is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- The one UI reference: minimal wizard from the UI extension. -->
+    <ui:WixUI Id="WixUI_Minimal" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="VeloEdit">
+          <Directory Id="DataFolder" Name="data" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppShortcutFolder" Name="VeloEdit" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="*">
+        <File Id="VeloEditExe"
+              Source="$(var.ExePath)"
+              KeyPath="yes" />
+      </Component>
+      <Component Id="LicenseFile" Guid="*">
+        <File Id="LicenseTxt"
+              Source="..\LICENSE"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Empty data folder: a component with CreateFolder so the installer
+         creates (and on uninstall removes) the folder itself; its contents
+         are the user's and are left alone. -->
+    <Component Id="DataFolderComponent" Directory="DataFolder" Guid="*">
+      <CreateFolder />
+      <RemoveFolder Id="RemoveDataFolder" On="uninstall" />
+    </Component>
+
+    <Component Id="ApplicationShortcut" Directory="AppShortcutFolder" Guid="*">
+      <Shortcut Id="StartMenuShortcut"
+                Name="VeloEdit"
+                Description="Binary and large-file editor"
+                Target="[INSTALLFOLDER]VeloEdit.exe"
+                WorkingDirectory="INSTALLFOLDER" />
+      <RemoveFolder Id="RemoveAppShortcutFolder" On="uninstall" />
+      <RegistryValue Root="HKCU"
+                     Key="Software\VeloEdit"
+                     Name="installed"
+                     Type="integer"
+                     Value="1"
+                     KeyPath="yes" />
+    </Component>
+
+    <Feature Id="MainFeature" Title="VeloEdit" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="DataFolderComponent" />
+      <ComponentRef Id="ApplicationShortcut" />
+    </Feature>
+  </Package>
+</Wix>
