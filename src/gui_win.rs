@@ -287,6 +287,7 @@ Ctrl+O open · Ctrl+S save · Ctrl+Z undo · Ctrl+Y redo\r\n\
 Ctrl+X / Ctrl+C / Ctrl+V cut, copy, paste · Ctrl+A select all\r\n\
 Ctrl+F find · Ctrl+H find and replace · F6 switch text/hex\r\n\
 F1 this guide · Esc closes the find bar\r\n\
+Ctrl+mouse wheel makes the text bigger or smaller\r\n\
 Arrows, Home, End, Page Up and Page Down move the caret; hold Shift\r\n\
 to select while you move. You can also drop a file onto the window\r\n\
 to open it.\r\n\
@@ -314,7 +315,9 @@ it is off until you turn it on, and turning it off removes it.\r\n\
 \r\n\
 THEMES\r\n\
 View ▸ Theme offers 20 built-in colour themes; View ▸ Accent recolours\r\n\
-the highlight colour on top of any theme. Your choices are stored in\r\n\
+the highlight colour on top of any theme. Moving through those menus\r\n\
+previews each choice in the window — click to keep it, or close the\r\n\
+menu to go back to what you had. Your choices are stored in\r\n\
 the data folder next to the program — VeloEdit is fully portable and\r\n\
 works completely offline.\r\n";
 
@@ -598,6 +601,22 @@ enum FindKind {
     Masked,
 }
 
+/// A live theme/accent menu preview in progress (see WM_MENUSELECT):
+/// the committed (theme, accent) snapshot taken when the first
+/// previewable item of a menu session is highlighted, plus the
+/// (theme, accent) pair the session is currently showing. One backup
+/// covers the whole session, even when the user moves straight from
+/// the Theme menu into the Accent menu. Previewing never writes
+/// settings; a click commits through the ordinary command path,
+/// which discards the backup, and closing the menu without a click
+/// restores the snapshot.
+struct MenuPreview {
+    committed_theme: String,
+    committed_accent: Option<String>,
+    theme: String,
+    accent: Option<String>,
+}
+
 struct App {
     hwnd: HWND,
     editor: Editor,
@@ -656,6 +675,12 @@ struct App {
     caret_on: bool,
     dragging: bool,
     wheel_rem: i32,
+    /// Ctrl+wheel zoom accumulator (same 120-unit notch maths as
+    /// `wheel_rem`, but separate: partial scroll and zoom remainders
+    /// must never mix).
+    wheel_zoom_rem: i32,
+    /// The live theme/accent menu preview session, if one is active.
+    menu_preview: Option<MenuPreview>,
     pending_high_surrogate: Option<u16>,
     hex_nibble: Option<u8>,
     index_slot: Arc<Mutex<Option<(u64, LineIndex)>>>,
@@ -2690,11 +2715,23 @@ fn save_settings(app: &App) {
     let _ = app.settings.save_to(&path);
 }
 
-/// Apply a new resolved theme: GDI chrome brushes are recreated, the
-/// Direct2D brushes are dropped (recreated against the live target on
-/// the next paint), and the choice is persisted.
+/// Apply the committed theme/accent from settings and persist the
+/// choice. This is the path every theme/accent command takes.
 fn apply_theme(app: &mut App) {
-    app.theme = Theme::resolve(&app.settings.theme, app.settings.accent_override.as_deref());
+    let theme = app.settings.theme.clone();
+    let accent = app.settings.accent_override.clone();
+    apply_theme_visual(app, &theme, accent.as_deref());
+    save_settings(app);
+}
+
+/// The visual half of a theme change: resolve (theme, accent) and
+/// rebuild everything derived from it — GDI chrome brushes are
+/// recreated, the Direct2D brushes are dropped (recreated against
+/// the live target on the next paint), the title bar recolours. It
+/// never reads or writes settings, so the menu live preview
+/// (WM_MENUSELECT) can show a choice without committing it.
+fn apply_theme_visual(app: &mut App, theme_name: &str, accent: Option<&str>) {
+    app.theme = Theme::resolve(theme_name, accent);
     // SAFETY: the GDI brushes are owned by the app; DeleteObject on a
     // brush not currently selected into any DC is safe.
     unsafe {
@@ -2740,7 +2777,6 @@ fn apply_theme(app: &mut App) {
             accent: make_brush(target, t.accent),
         });
     }
-    save_settings(app);
     refresh_status(app);
     // The owner-drawn buttons pick their colours up on repaint.
     for button in app.toolbar.iter().chain(app.find_controls.iter()) {
@@ -2748,6 +2784,88 @@ fn apply_theme(app: &mut App) {
         unsafe { InvalidateRect(*button, std::ptr::null(), 1) };
     }
     invalidate(app);
+}
+
+/// Begin the menu preview session if none is active, snapshotting
+/// the committed (theme, accent) from settings. Previewing only ever
+/// changes `app.theme`, never settings, so the snapshot is simply
+/// what settings still hold; one snapshot covers the whole session,
+/// across both the Theme and the Accent menus.
+fn menu_preview_begin(app: &mut App) -> &mut MenuPreview {
+    if app.menu_preview.is_none() {
+        app.menu_preview = Some(MenuPreview {
+            committed_theme: app.settings.theme.clone(),
+            committed_accent: app.settings.accent_override.clone(),
+            theme: app.settings.theme.clone(),
+            accent: app.settings.accent_override.clone(),
+        });
+    }
+    app.menu_preview.as_mut().expect("set above")
+}
+
+/// End a menu preview without a choice: put the committed
+/// (theme, accent) back on screen and resync the menu check marks
+/// (they are drawn from the committed settings, so this also undoes
+/// anything the preview session might have left inconsistent).
+/// A no-op when no preview is active — in particular after a click
+/// committed a choice, because the command path discards the backup.
+fn restore_menu_preview(app: &mut App) {
+    if let Some(preview) = app.menu_preview.take() {
+        apply_theme_visual(
+            app,
+            &preview.committed_theme,
+            preview.committed_accent.as_deref(),
+        );
+        refresh_menu_checks(app);
+    }
+}
+
+/// WM_MENUSELECT: as the user highlights items in the Theme or
+/// Accent menu (mouse or keyboard — MENUSELECT covers both), preview
+/// the highlighted choice in the window without persisting it. The
+/// Custom… accent item has no preview: clicking it keeps its dialog
+/// behaviour, as before.
+fn on_menu_select(app: &mut App, wparam: WPARAM, lparam: LPARAM) {
+    let menu = lparam as HMENU;
+    let is_theme = menu == app.theme_menu;
+    if !is_theme && menu != app.accent_menu {
+        return;
+    }
+    let flags = (wparam >> 16) as u16;
+    // 0x0010 is MF_POPUP (the low word is a position, not a command
+    // id) and 0x2000 is MF_SYSMENU; neither names a previewable item.
+    if flags & 0x0010 != 0 || flags & 0x2000 != 0 {
+        return;
+    }
+    let id = wparam & 0xFFFF;
+    // Work out the (theme, accent) pair to show, folding the
+    // highlighted item into the session's current preview pair —
+    // so a theme preview keeps the accent already in effect (a
+    // previewed one, or the committed one) and vice versa.
+    let pair = {
+        if is_theme {
+            let names = crate::theme::names();
+            if !(CMD_THEME_BASE..CMD_THEME_BASE + names.len()).contains(&id) {
+                return;
+            }
+            let preview = menu_preview_begin(app);
+            preview.theme = names[id - CMD_THEME_BASE].to_string();
+            Some((preview.theme.clone(), preview.accent.clone()))
+        } else if id == CMD_ACCENT_BASE {
+            let preview = menu_preview_begin(app);
+            preview.accent = None;
+            Some((preview.theme.clone(), preview.accent.clone()))
+        } else if (CMD_ACCENT_BASE + 1..CMD_ACCENT_BASE + 1 + ACCENT_PRESETS.len()).contains(&id) {
+            let preview = menu_preview_begin(app);
+            preview.accent = Some(ACCENT_PRESETS[id - CMD_ACCENT_BASE - 1].1.to_string());
+            Some((preview.theme.clone(), preview.accent.clone()))
+        } else {
+            None // Custom…: no preview.
+        }
+    };
+    if let Some((theme, accent)) = pair {
+        apply_theme_visual(app, &theme, accent.as_deref());
+    }
 }
 
 fn rebuild_recent_menu(app: &App) {
@@ -3465,6 +3583,24 @@ fn scroll_by(app: &mut App, delta: i64) {
 
 fn on_wheel(app: &mut App, wparam: WPARAM) {
     let delta = ((wparam >> 16) as u16) as i16 as i32;
+    // Ctrl+wheel zooms the font instead of scrolling: MK_CONTROL
+    // (0x0008) rides in the message's low word. Zoom steps go
+    // through the Font Bigger / Font Smaller commands themselves,
+    // so clamping and persistence are exactly the menu behaviour;
+    // a separate accumulator keeps partial zoom and scroll
+    // remainders from mixing.
+    if wparam & 0xFFFF & 0x0008 != 0 {
+        app.wheel_zoom_rem += delta;
+        while app.wheel_zoom_rem >= 120 {
+            on_command(app, CMD_FONT_BIGGER);
+            app.wheel_zoom_rem -= 120;
+        }
+        while app.wheel_zoom_rem <= -120 {
+            on_command(app, CMD_FONT_SMALLER);
+            app.wheel_zoom_rem += 120;
+        }
+        return;
+    }
     let mut lines: u32 = 3;
     // SAFETY: SPI_GETWHEELSCROLLLINES (104) writes one u32 through the
     // pointer; a failure leaves the default of 3.
@@ -3720,17 +3856,22 @@ fn on_command(app: &mut App, id: usize) {
             );
         }
         _ if (CMD_THEME_BASE..CMD_THEME_BASE + crate::theme::names().len()).contains(&id) => {
+            // A click commits: any menu-preview backup is discarded
+            // (WM_EXITMENULOOP then has nothing to restore).
+            app.menu_preview = None;
             let name = crate::theme::names()[id - CMD_THEME_BASE];
             app.settings.theme = name.to_string();
             apply_theme(app);
             refresh_menu_checks(app);
         }
         _ if id == CMD_ACCENT_BASE => {
+            app.menu_preview = None;
             app.settings.accent_override = None;
             apply_theme(app);
             refresh_menu_checks(app);
         }
         _ if (CMD_ACCENT_BASE + 1..CMD_ACCENT_BASE + 1 + ACCENT_PRESETS.len()).contains(&id) => {
+            app.menu_preview = None;
             let (_, hex) = ACCENT_PRESETS[id - CMD_ACCENT_BASE - 1];
             app.settings.accent_override = Some(hex.to_string());
             apply_theme(app);
@@ -3738,9 +3879,15 @@ fn on_command(app: &mut App, id: usize) {
         }
         _ if id == CMD_ACCENT_CUSTOM => {
             if let Some(color) = choose_accent_color(app, app.theme.accent) {
+                app.menu_preview = None;
                 app.settings.accent_override = Some(color.to_hex());
                 apply_theme(app);
                 refresh_menu_checks(app);
+            } else {
+                // Dialog cancelled: if a preview was still in flight
+                // (the menu loop may not have sent WM_EXITMENULOOP
+                // yet), put the committed look back.
+                restore_menu_preview(app);
             }
         }
         _ if (CMD_RECENT_BASE..CMD_RECENT_BASE + 8).contains(&id) => {
@@ -4254,6 +4401,25 @@ unsafe extern "system" fn wnd_proc(
             }
             0
         }
+        WM_MENUSELECT => {
+            on_menu_select(app, wparam, lparam);
+            0
+        }
+        WM_EXITMENULOOP => {
+            // The menu session is over. If a theme/accent preview
+            // was never committed by a click (Esc, a click
+            // elsewhere), restore the committed look.
+            restore_menu_preview(app);
+            0
+        }
+        WM_CANCELMODE => {
+            // Same dismissal path as WM_EXITMENULOOP for the
+            // preview; default handling performs the actual cancel
+            // of the internal mode (menu, capture, scrolling).
+            restore_menu_preview(app);
+            // SAFETY: default handling for the message itself.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_TIMER => {
             match wparam {
                 TIMER_BLINK => {
@@ -4658,6 +4824,8 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         caret_on: true,
         dragging: false,
         wheel_rem: 0,
+        wheel_zoom_rem: 0,
+        menu_preview: None,
         pending_high_surrogate: None,
         hex_nibble: None,
         index_slot: Arc::new(Mutex::new(None)),
