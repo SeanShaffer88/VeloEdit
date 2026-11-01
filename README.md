@@ -26,6 +26,9 @@ on a real Windows 11 machine — see "Known limitations".
 
 Working in this build:
 
+- **Its own program icon** — the VeloEdit icon is embedded in the
+  program file and used by the installer, shown in Explorer, on the
+  taskbar, and in the window.
 - **Piece-table editing core** — inserts and deletes rearrange a list of
   small pieces pointing at the original bytes and an append-only buffer;
   file data itself is never copied or shifted while editing.

@@ -3,6 +3,28 @@
 All notable changes to VeloEdit are recorded here. Versions follow the
 release asset naming in the specification.
 
+## [1.0.1] — Unreleased
+
+### Fixed
+
+- The editor window failed to start (error 0x80004002): one byte of
+  the DirectWrite factory identifier was wrong, so DirectWrite
+  refused the startup request while Direct2D started normally. The
+  window now opens, paints, and resizes correctly.
+- Six internal Direct2D / DirectWrite call addresses (clear, begin
+  frame, end frame, set DPI, resize, text measuring) were corrected
+  to the values in the Windows SDK headers; they would have painted
+  wrongly even once startup succeeded.
+- A startup failure now reports the exact Direct2D and DirectWrite
+  error codes in its message and on the console, instead of a
+  generic note.
+
+### Added
+
+- Program icon: the supplied artwork is embedded in the executable
+  (Explorer, taskbar, and window icon), and the same icon is used by
+  the installer, the uninstaller, and the MSI package.
+
 ## [1.0.0] — 2026-10-31
 
 The 1.0.0 build: the editing core, the headless tools, the graphical

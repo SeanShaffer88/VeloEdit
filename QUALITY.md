@@ -199,6 +199,49 @@ scored from real Windows evidence before any release.
     Windows-host test behaviour is gated on every push, not only at
     release time.
 
+- Post-release addition — program icon (2026-10-31):
+  - The icon artwork was supplied by the owner (a stylized V on a
+    dark rounded square, 1024x1024 JPEG, kept at
+    `assets/icon-source.jpg`). `assets/veloedit.ico` was generated
+    from it with the nine standard sizes (16 to 256 px), and a root
+    `build.rs` embeds it into the executable by compiling
+    `assets/veloedit.rc` (icon id 1): `rc.exe` on MSVC targets,
+    MinGW windres on GNU targets, a no-op everywhere else. The same
+    icon is wired into the NSIS installer/uninstaller and the WiX
+    MSI (Add/Remove Programs entry and Start Menu shortcut).
+  - Evidence here: the GNU link path is proven locally. The windres
+    build's executable grew from 552,448 to 659,968 bytes, and its
+    .rsrc section lists RT_ICON with nine entries (one per size)
+    plus RT_GROUP_ICON at id 1. The updated NSIS script compiles
+    with the icon defines (Setup exe 590,787 bytes, up from 398,798
+    for the icon-less proof build). The MSVC resource compile
+    (rc.exe) is first exercised by CI, and how the icon looks on a
+    real Windows desktop is Unverified until the owner's machine
+    shows it.
+
+- v1.0.1 fix record (2026-10-31) — the first field run of v1.0.0
+  failed at startup on the owner's machine:
+  - Root cause: one byte of the DirectWrite factory IID was wrong
+    (data4 second byte 0xEE instead of the SDK's 0xE8), so
+    DWriteCreateFactory returned E_NOINTERFACE (0x80004002) while
+    the Direct2D factory (whose IID was correct) returned S_OK.
+    The startup code swallowed the HRESULT; it now reports both
+    factory codes in the error message and tries both factory
+    types before giving up. Regression tests pin both IIDs byte
+    for byte and the corrected vtable slots (they run in the
+    Windows CI test job).
+  - A full audit of the hand-declared vtable slots against the
+    SDK-generated layouts found six more wrong: ID2D1RenderTarget
+    Clear 46→47, BeginDraw 47→48, EndDraw 48→49, SetDpi 50→51,
+    ID2D1HwndRenderTarget Resize 57→58, IDWriteTextLayout
+    GetMetrics 45→60. They would have broken painting even after
+    the IID fix.
+  - Field verification (owner's machine, 2026-10-31): the fixed
+    build opens, paints the Obsidian theme, shows menus, toolbar,
+    and status bar, and redraws correctly when maximized. Deeper
+    interaction (typing, opening a file's contents, find bar,
+    theme switching) is still being exercised by the owner.
+
 ## Known gaps (honest list)
 
 - The installers have been *built* by the release workflow and their
