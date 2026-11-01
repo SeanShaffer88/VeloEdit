@@ -14,6 +14,15 @@
 //! default, per the spec), so the document is never materialised in
 //! memory, however large it is.
 //!
+//! Save-time transforms (roadmap items 31/32): [`SaveOptions`] can
+//! also ask for the line endings to be normalised
+//! ([`EolChoice::Lf`] / [`EolChoice::Crlf`]) and for the byte-order
+//! mark to be added or removed ([`BomChoice`]), applied as a
+//! streaming transform over the same chunks — correct across chunk
+//! and piece boundaries, in the document encoding's unit width.
+//! The default `Keep` / `Keep` is a byte-identical pass-through:
+//! the staging writer takes its original code path, untouched.
+//!
 //! [`PieceTable::save_to`] adds the spec's step 6 on top of
 //! [`save_atomic`]: after a successful swap it closes *our own* mapping
 //! of the target (closed before the swap — step 4 — via
@@ -39,11 +48,38 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+use crate::encoding::TextEncoding;
 use crate::piece_table::{OriginalBuffer, PieceTable};
 use crate::undo::UndoStack;
 
 /// Default streaming chunk size: the 4 MB blocks of SPEC.md section 5.1.
 pub const DEFAULT_MAX_CHUNK: usize = 4 * 1024 * 1024;
+
+/// Line-ending handling for a save (roadmap item 31).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EolChoice {
+    /// Write line endings exactly as they are in the document.
+    Keep,
+    /// Normalise every line ending (CRLF, lone CR, lone LF) to LF.
+    Lf,
+    /// Normalise every line ending to CRLF.
+    Crlf,
+}
+
+/// Byte-order-mark handling for a save (roadmap item 32).
+/// The mark in question is the one for the save's encoding
+/// ([`crate::encoding::bom_bytes`]); ANSI has none, so both actions
+/// are no-ops there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BomChoice {
+    /// Leave the start of the document exactly as it is.
+    Keep,
+    /// Ensure the document starts with the encoding's BOM
+    /// (added when missing, never doubled).
+    Add,
+    /// Remove the encoding's BOM when the document starts with it.
+    Remove,
+}
 
 /// Options for the save operations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,12 +87,24 @@ pub struct SaveOptions {
     /// Largest single write issued while streaming the staging file.
     /// Must be greater than zero.
     pub max_chunk: usize,
+    /// The document's encoding: the unit width the line-ending
+    /// transform works in (1 byte for UTF-8/ANSI, 2 for UTF-16)
+    /// and the encoding whose BOM [`BomChoice`] refers to.
+    /// Irrelevant when both transforms are `Keep`.
+    pub encoding: TextEncoding,
+    /// Line-ending transform (roadmap item 31).
+    pub eol: EolChoice,
+    /// Byte-order-mark transform (roadmap item 32).
+    pub bom: BomChoice,
 }
 
 impl Default for SaveOptions {
     fn default() -> Self {
         Self {
             max_chunk: DEFAULT_MAX_CHUNK,
+            encoding: TextEncoding::Utf8,
+            eol: EolChoice::Keep,
+            bom: BomChoice::Keep,
         }
     }
 }
@@ -374,18 +422,225 @@ pub fn staging_path_for(target: &Path) -> PathBuf {
     }
 }
 
+/// The streaming line-ending / BOM transform (roadmap items 31/32),
+/// fed the document in arbitrary chunks and emitting transformed
+/// bytes into `out`.
+///
+/// Two boundary hazards are designed for:
+///
+/// * A `\r` at the end of a chunk is *held* (as `pending_cr`) until
+///   the next unit is known — emitted alone, it would turn a CRLF
+///   pair split across chunks into two line endings.
+/// * For UTF-16, a unit itself can straddle a chunk boundary; the
+///   partial unit waits in `unit_hold` for its other byte.
+///
+/// The BOM decision similarly holds the first bytes until enough
+/// have arrived to tell whether the document already starts with
+/// the encoding's mark.
+struct SaveTransform {
+    /// Unit width of the encoding (1 or 2 bytes).
+    width: usize,
+    /// The CR and LF unit patterns (`[0x0D]` / `[0x0A]` in 1-byte
+    /// encodings, the endian forms in UTF-16).
+    cr: [u8; 2],
+    lf: [u8; 2],
+    /// True when normalising to CRLF, false for LF. Meaningless
+    /// when `convert_eol` is false.
+    to_crlf: bool,
+    convert_eol: bool,
+    /// The encoding's BOM bytes (empty for ANSI).
+    bom: &'static [u8],
+    bom_mode: BomChoice,
+    /// False while the first `bom.len()` bytes are still being
+    /// collected in `held`.
+    bom_decided: bool,
+    held: Vec<u8>,
+    /// A partial UTF-16 unit (0 or 1 bytes between feeds).
+    unit_hold: Vec<u8>,
+    /// A CR unit was seen and its ending not yet emitted.
+    pending_cr: bool,
+}
+
+impl SaveTransform {
+    fn new(opts: &SaveOptions) -> Self {
+        let (width, cr, lf) = match opts.encoding {
+            TextEncoding::Utf8 | TextEncoding::Ansi => (1, [0x0D, 0], [0x0A, 0]),
+            TextEncoding::Utf16Le => (2, [0x0D, 0x00], [0x0A, 0x00]),
+            TextEncoding::Utf16Be => (2, [0x00, 0x0D], [0x00, 0x0A]),
+        };
+        let bom = crate::encoding::bom_bytes(opts.encoding);
+        Self {
+            width,
+            cr,
+            lf,
+            to_crlf: opts.eol == EolChoice::Crlf,
+            convert_eol: opts.eol != EolChoice::Keep,
+            bom,
+            bom_mode: opts.bom,
+            // Nothing to decide when keeping the head as-is, or
+            // when the encoding has no BOM at all.
+            bom_decided: opts.bom == BomChoice::Keep || bom.is_empty(),
+            held: Vec::new(),
+            unit_hold: Vec::new(),
+            pending_cr: false,
+        }
+    }
+
+    /// Feed one chunk of the document; transformed bytes are
+    /// appended to `out` (previous content of `out` is kept).
+    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        if !self.bom_decided {
+            self.held.extend_from_slice(input);
+            if self.held.len() < self.bom.len() {
+                return;
+            }
+            let held = std::mem::take(&mut self.held);
+            self.decide_bom(&held, out);
+            return;
+        }
+        self.feed_body(input, out);
+    }
+
+    /// End of input: settle a still-open BOM decision (the whole
+    /// document was shorter than the BOM) and flush the held CR /
+    /// partial unit.
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        if !self.bom_decided {
+            let held = std::mem::take(&mut self.held);
+            // `held` is shorter than the BOM, so the document does
+            // not start with it: Remove passes it through as
+            // content; Add prepends the mark first.
+            if self.bom_mode == BomChoice::Add {
+                out.extend_from_slice(self.bom);
+            }
+            self.bom_decided = true;
+            self.feed_body(&held, out);
+        }
+        if self.pending_cr {
+            self.pending_cr = false;
+            self.emit_ending(out);
+        }
+        // A trailing partial unit (only possible for a malformed
+        // odd-length UTF-16 document) passes through untouched.
+        out.extend_from_slice(&self.unit_hold);
+        self.unit_hold.clear();
+    }
+
+    /// Apply the BOM choice to the collected head bytes, then run
+    /// them through the line-ending body transform.
+    fn decide_bom(&mut self, held: &[u8], out: &mut Vec<u8>) {
+        self.bom_decided = true;
+        match self.bom_mode {
+            BomChoice::Keep => self.feed_body(held, out),
+            BomChoice::Remove => {
+                if held.starts_with(self.bom) {
+                    self.feed_body(&held[self.bom.len()..], out);
+                } else {
+                    self.feed_body(held, out);
+                }
+            }
+            BomChoice::Add => {
+                if held.starts_with(self.bom) {
+                    self.feed_body(held, out);
+                } else {
+                    // The mark goes out directly: it contains no
+                    // line-ending units, and for UTF-16 it is
+                    // exactly one unit wide, so alignment holds.
+                    out.extend_from_slice(self.bom);
+                    self.feed_body(held, out);
+                }
+            }
+        }
+    }
+
+    /// The line-ending body transform over document bytes (the BOM
+    /// region has already been dealt with by the caller).
+    fn feed_body(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        if !self.convert_eol {
+            out.extend_from_slice(input);
+            return;
+        }
+        self.unit_hold.extend_from_slice(input);
+        let width = self.width;
+        let mut processed = 0usize;
+        while self.unit_hold.len() - processed >= width {
+            let mut unit = [0u8; 2];
+            unit[..width].copy_from_slice(&self.unit_hold[processed..processed + width]);
+            processed += width;
+            self.emit_unit(&unit, out);
+        }
+        self.unit_hold.drain(..processed);
+    }
+
+    /// Emit the target line ending.
+    fn emit_ending(&self, out: &mut Vec<u8>) {
+        if self.to_crlf {
+            out.extend_from_slice(&self.cr[..self.width]);
+        }
+        out.extend_from_slice(&self.lf[..self.width]);
+    }
+
+    /// Process one complete unit, honouring a held CR.
+    fn emit_unit(&mut self, unit: &[u8; 2], out: &mut Vec<u8>) {
+        let unit = &unit[..self.width];
+        if self.pending_cr {
+            self.pending_cr = false;
+            if unit == &self.lf[..self.width] {
+                // CR LF pair: one line ending, both units consumed.
+                self.emit_ending(out);
+                return;
+            }
+            // A lone CR: its ending comes out before this unit.
+            self.emit_ending(out);
+        }
+        if unit == &self.cr[..self.width] {
+            self.pending_cr = true;
+        } else if unit == &self.lf[..self.width] {
+            self.emit_ending(out);
+        } else {
+            out.extend_from_slice(unit);
+        }
+    }
+}
+
 /// Stream the whole document into the staging file at `staging` in
-/// chunks of at most `max_chunk` bytes, flush it to disk, and close it.
-/// Returns the number of bytes written.
-fn write_staging(table: &PieceTable, staging: &Path, max_chunk: usize) -> Result<u64, SaveError> {
-    debug_assert!(max_chunk > 0);
+/// chunks of at most `opts.max_chunk` bytes, applying the save
+/// transforms `opts` asks for, flush it to disk, and close it.
+/// Returns the number of bytes written (the transformed length when
+/// a transform is active).
+fn write_staging(table: &PieceTable, staging: &Path, opts: &SaveOptions) -> Result<u64, SaveError> {
+    debug_assert!(opts.max_chunk > 0);
     let mut file = File::create(staging).map_err(|e| SaveError::new(SaveStep::Staging, e))?;
     let mut written: u64 = 0;
-    for slice in table.iter_slices() {
-        for chunk in slice.chunks(max_chunk) {
-            file.write_all(chunk)
+    if opts.eol == EolChoice::Keep && opts.bom == BomChoice::Keep {
+        // The original pass-through path, byte for byte: a
+        // Keep/Keep save is identical to the pipeline the existing
+        // tests pin down.
+        for slice in table.iter_slices() {
+            for chunk in slice.chunks(opts.max_chunk) {
+                file.write_all(chunk)
+                    .map_err(|e| SaveError::new(SaveStep::Write, e))?;
+                written += chunk.len() as u64;
+            }
+        }
+    } else {
+        let mut transform = SaveTransform::new(opts);
+        let mut out: Vec<u8> = Vec::new();
+        for slice in table.iter_slices() {
+            for chunk in slice.chunks(opts.max_chunk) {
+                out.clear();
+                transform.feed(chunk, &mut out);
+                file.write_all(&out)
+                    .map_err(|e| SaveError::new(SaveStep::Write, e))?;
+                written += out.len() as u64;
+            }
+        }
+        out.clear();
+        transform.finish(&mut out);
+        if !out.is_empty() {
+            file.write_all(&out)
                 .map_err(|e| SaveError::new(SaveStep::Write, e))?;
-            written += chunk.len() as u64;
+            written += out.len() as u64;
         }
     }
     flush_file(&file).map_err(|e| SaveError::new(SaveStep::Flush, e))?;
@@ -514,7 +769,7 @@ pub fn save_atomic(
     // the staging file, instead of failing halfway through the write.
     check_free_space(target, table.len())?;
     let staging = staging_path_for(target);
-    let outcome = write_staging(table, &staging, opts.max_chunk)
+    let outcome = write_staging(table, &staging, opts)
         .and_then(|written| swap_files(target, &staging).map(|()| written));
     match outcome {
         Ok(written) => Ok(SaveReport {
@@ -587,7 +842,7 @@ impl PieceTable {
 
         // Steps 1–3: staging file, streaming writes, hardware flush. Our
         // own backing is still attached here: streaming reads from it.
-        let written = match write_staging(self, &staging, opts.max_chunk) {
+        let written = match write_staging(self, &staging, opts) {
             Ok(written) => written,
             Err(err) => {
                 let _ = std::fs::remove_file(&staging);
@@ -751,7 +1006,10 @@ mod tests {
         let dir = temp_dir("atomic-chunks");
         let target = dir.join("big.bin");
         let table = PieceTable::from_original(vec![b'x'; 100_000]);
-        let opts = SaveOptions { max_chunk: 999 };
+        let opts = SaveOptions {
+            max_chunk: 999,
+            ..SaveOptions::default()
+        };
         let report = save_atomic(&table, &target, &opts).unwrap();
         assert_eq!(report.bytes_written, 100_000);
         assert_eq!(std::fs::read(&target).unwrap().len(), 100_000);
@@ -1048,10 +1306,185 @@ mod tests {
         let dir = temp_dir("bad-chunk");
         let target = dir.join("doc.txt");
         let table = edited_table();
-        let opts = SaveOptions { max_chunk: 0 };
+        let opts = SaveOptions {
+            max_chunk: 0,
+            ..SaveOptions::default()
+        };
         let err = save_atomic(&table, &target, &opts).unwrap_err();
         assert_eq!(err.step, SaveStep::Staging);
         assert!(!target.exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- Save transforms (roadmap items 31/32) ----
+
+    /// Save `table` through `save_atomic` with `opts` into a fresh
+    /// temp file and return the bytes that landed on disk.
+    fn saved_bytes(tag: &str, table: &PieceTable, opts: &SaveOptions) -> Vec<u8> {
+        let dir = temp_dir(tag);
+        let target = dir.join("doc.bin");
+        let report = save_atomic(table, &target, opts).unwrap();
+        let bytes = std::fs::read(&target).unwrap();
+        assert_eq!(report.bytes_written, bytes.len() as u64);
+        std::fs::remove_dir_all(&dir).unwrap();
+        bytes
+    }
+
+    fn transform_opts(eol: EolChoice, bom: BomChoice, encoding: TextEncoding) -> SaveOptions {
+        SaveOptions {
+            encoding,
+            eol,
+            bom,
+            ..SaveOptions::default()
+        }
+    }
+
+    // CRLF → LF with a chunk size that splits a CRLF pair across
+    // two chunks ("ab\r" | "\ncd"…): the held CR must not become
+    // its own line ending.
+    #[test]
+    fn eol_crlf_to_lf_with_pair_straddling_chunks() {
+        let table = PieceTable::from_original(b"ab\r\ncd\r\n".to_vec());
+        let mut opts = transform_opts(EolChoice::Lf, BomChoice::Keep, TextEncoding::Utf8);
+        opts.max_chunk = 3;
+        assert_eq!(saved_bytes("eol-straddle", &table, &opts), b"ab\ncd\n");
+        // Every chunk size from 1 up gives the same result.
+        for chunk in 1..=8usize {
+            opts.max_chunk = chunk;
+            assert_eq!(
+                saved_bytes("eol-straddle-n", &table, &opts),
+                b"ab\ncd\n",
+                "chunk {chunk}"
+            );
+        }
+    }
+
+    // A CRLF pair split across *pieces* (CR ends one piece, LF
+    // starts the next) converts as one ending too.
+    #[test]
+    fn eol_conversion_across_a_piece_boundary() {
+        let mut table = PieceTable::from_original(b"a\r".to_vec());
+        table.insert(2, b"\nb");
+        assert_eq!(table.read(0, table.len()), b"a\r\nb");
+        let opts = transform_opts(EolChoice::Lf, BomChoice::Keep, TextEncoding::Utf8);
+        assert_eq!(saved_bytes("eol-pieces", &table, &opts), b"a\nb");
+    }
+
+    // Mixed endings normalise in both directions, and a trailing
+    // lone CR still counts as an ending.
+    #[test]
+    fn eol_normalises_mixed_endings_both_ways() {
+        let table = PieceTable::from_original(b"a\r\nb\nc\rd".to_vec());
+        let lf = transform_opts(EolChoice::Lf, BomChoice::Keep, TextEncoding::Utf8);
+        assert_eq!(saved_bytes("eol-mixed-lf", &table, &lf), b"a\nb\nc\nd");
+        let crlf = transform_opts(EolChoice::Crlf, BomChoice::Keep, TextEncoding::Utf8);
+        assert_eq!(
+            saved_bytes("eol-mixed-crlf", &table, &crlf),
+            b"a\r\nb\r\nc\r\nd"
+        );
+        let trailing = PieceTable::from_original(b"end\r".to_vec());
+        assert_eq!(saved_bytes("eol-trail-lf", &trailing, &lf), b"end\n");
+        assert_eq!(saved_bytes("eol-trail-crlf", &trailing, &crlf), b"end\r\n");
+    }
+
+    // UTF-16LE: conversion works on 2-byte units, with the BOM unit
+    // passing through as an ordinary unit under BomChoice::Keep.
+    #[test]
+    fn eol_conversion_utf16le() {
+        let mut bytes = vec![0xFF, 0xFE]; // BOM
+        for unit in [0x0061u16, 0x000D, 0x000A, 0x0062, 0x000A, 0x0063] {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let table = PieceTable::from_original(bytes);
+        let opts = transform_opts(EolChoice::Lf, BomChoice::Keep, TextEncoding::Utf16Le);
+        let mut want = vec![0xFF, 0xFE];
+        for unit in [0x0061u16, 0x000A, 0x0062, 0x000A, 0x0063] {
+            want.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(saved_bytes("eol-u16le", &table, &opts), want);
+    }
+
+    // UTF-16BE: LF → CRLF, byte order respected; chunks of 3 bytes
+    // split units across feeds.
+    #[test]
+    fn eol_conversion_utf16be_odd_chunks() {
+        let mut bytes = Vec::new();
+        for unit in [0x0061u16, 0x000A, 0x0062] {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        let table = PieceTable::from_original(bytes);
+        let mut opts = transform_opts(EolChoice::Crlf, BomChoice::Keep, TextEncoding::Utf16Be);
+        opts.max_chunk = 3;
+        let mut want = Vec::new();
+        for unit in [0x0061u16, 0x000D, 0x000A, 0x0062] {
+            want.extend_from_slice(&unit.to_be_bytes());
+        }
+        assert_eq!(saved_bytes("eol-u16be", &table, &opts), want);
+    }
+
+    // BOM add: prepended when missing, never doubled when present.
+    // BOM remove: stripped when present, a no-op otherwise.
+    #[test]
+    fn bom_add_and_remove_utf8() {
+        let plain = PieceTable::from_original(b"abc".to_vec());
+        let with_bom = PieceTable::from_original(b"\xEF\xBB\xBFabc".to_vec());
+        let add = transform_opts(EolChoice::Keep, BomChoice::Add, TextEncoding::Utf8);
+        assert_eq!(saved_bytes("bom-add", &plain, &add), b"\xEF\xBB\xBFabc");
+        assert_eq!(
+            saved_bytes("bom-add-present", &with_bom, &add),
+            b"\xEF\xBB\xBFabc"
+        );
+        let remove = transform_opts(EolChoice::Keep, BomChoice::Remove, TextEncoding::Utf8);
+        assert_eq!(saved_bytes("bom-remove", &with_bom, &remove), b"abc");
+        assert_eq!(saved_bytes("bom-remove-absent", &plain, &remove), b"abc");
+    }
+
+    // BOM add/remove for UTF-16 (2-byte marks), and ANSI — which
+    // has no BOM — treats both as no-ops.
+    #[test]
+    fn bom_add_and_remove_utf16_and_ansi() {
+        let mut le = vec![0xFF, 0xFE];
+        le.extend_from_slice(&0x0061u16.to_le_bytes());
+        let table = PieceTable::from_original(le);
+        let remove = transform_opts(EolChoice::Keep, BomChoice::Remove, TextEncoding::Utf16Le);
+        assert_eq!(
+            saved_bytes("bom-u16-remove", &table, &remove),
+            0x0061u16.to_le_bytes()
+        );
+        let add = transform_opts(EolChoice::Keep, BomChoice::Add, TextEncoding::Utf16Le);
+        let bare = PieceTable::from_original(0x0061u16.to_le_bytes().to_vec());
+        let mut want = vec![0xFF, 0xFE];
+        want.extend_from_slice(&0x0061u16.to_le_bytes());
+        assert_eq!(saved_bytes("bom-u16-add", &bare, &add), want);
+
+        let ansi = PieceTable::from_original(b"abc".to_vec());
+        let add_ansi = transform_opts(EolChoice::Keep, BomChoice::Add, TextEncoding::Ansi);
+        assert_eq!(saved_bytes("bom-ansi", &ansi, &add_ansi), b"abc");
+    }
+
+    // Adding a BOM to an empty document writes just the mark;
+    // Keep/Keep stays an identity even with transforms configured
+    // in the options' other fields.
+    #[test]
+    fn bom_add_to_empty_document_and_keep_identity() {
+        let empty = PieceTable::from_original(Vec::new());
+        let add = transform_opts(EolChoice::Keep, BomChoice::Add, TextEncoding::Utf8);
+        assert_eq!(saved_bytes("bom-empty", &empty, &add), b"\xEF\xBB\xBF");
+
+        let table = PieceTable::from_original(b"\xEF\xBB\xBFa\r\nb\r".to_vec());
+        let keep = SaveOptions::default();
+        assert_eq!(
+            saved_bytes("keep-identity", &table, &keep),
+            b"\xEF\xBB\xBFa\r\nb\r"
+        );
+    }
+
+    // BOM removal and EOL conversion compose: the mark goes, the
+    // endings convert.
+    #[test]
+    fn bom_and_eol_transforms_compose() {
+        let table = PieceTable::from_original(b"\xEF\xBB\xBFa\r\nb".to_vec());
+        let opts = transform_opts(EolChoice::Lf, BomChoice::Remove, TextEncoding::Utf8);
+        assert_eq!(saved_bytes("bom-eol", &table, &opts), b"a\nb");
     }
 }
