@@ -75,6 +75,30 @@ HEADLESS OPERATIONS:
                           At most 10000 parts are made. With --json
                           the report is
                           {\"parts\":N,\"part_size\":S,\"out_dir\":\"...\"}.
+    --slice \"<SPEC>\"      Extract the ranges SPEC names from FILE to
+    --out <DEST>          --out: byte ranges like 0-99 or 0x1000-0x1FFF
+                          and line ranges like L1-L20, separated by
+                          semicolons, in ascending order (the same
+                          grammar as File > Extract Ranges). Line
+                          ranges use whole lines, endings included.
+                          A bad spec is reported word for word, exit 2.
+    --export-patch <P>    Write a VELOPAT1 delta patch of FILE
+                          against its on-disk original to P. A
+                          headless run has no edits, so the patch has
+                          zero hunks; it still round-trips through
+                          --apply-patch.
+    --apply-patch <P>     Apply the VELOPAT1 patch P to FILE and
+    --out <DEST>          write the result to --out. FILE itself is
+                          never modified.
+    --insert-zeroes <N>   Insert N zero bytes into FILE in place, at
+    --at <OFFSET>         --at (default: the end of the file), through
+                          the atomic save. N takes the K, M or G
+                          suffixes like --part-size.
+    --compare <OTHER>     Structural compare: FILE against OTHER in
+                          1 MB blocks (SHA-256 per block); prints the
+                          differing regions and the first differing
+                          byte. Exit 0 when identical, 1 when the
+                          block maps differ, 2 on error.
 
 EXPLORER MENU (Windows, opt-in):
     --install-shell       Add an \"Open in VeloEdit\" item to the
@@ -101,9 +125,10 @@ GLOBAL FLAGS:
     --version             Show the version
 
 EXIT CODES:
-    0   Success (for --find: at least one match; for --diff: the files
-        are identical)
-    1   For --find: nothing matched. For --diff: the files differ
+    0   Success (for --find: at least one match; for --diff and
+        --compare: the files are identical)
+    1   For --find: nothing matched. For --diff and --compare: the
+        files differ
     2   An error occurred (bad arguments, unreadable file, failed
         write) — also used when the GUI was requested but this
         platform build has no window code
@@ -152,6 +177,30 @@ pub struct CliOptions {
     /// opt-in Explorer context-menu item (Windows registry, HKCU).
     pub install_shell: bool,
     pub uninstall_shell: bool,
+    /// `--slice "<spec>" --out <path>` (slice R4c, item 2): extract
+    /// the ranges the `crate::slicing` grammar names from `file`.
+    pub slice_spec: Option<String>,
+    /// Shared `--out <path>` destination for `--slice` and
+    /// `--apply-patch` (the `extract` subcommand keeps its own
+    /// `extract_out`, set by the same flag).
+    pub out: Option<PathBuf>,
+    /// `--export-patch <path>` (slice R4c, item 3): write a
+    /// VELOPAT1 delta patch of FILE against its on-disk original
+    /// (a file compared to itself yields an empty patch).
+    pub export_patch: Option<PathBuf>,
+    /// `--apply-patch <patch>` (slice R4c, item 3): apply a
+    /// VELOPAT1 patch to FILE, writing the result to `--out`
+    /// (never over FILE itself).
+    pub apply_patch: Option<PathBuf>,
+    /// `--insert-zeroes <count>` with `--at <offset>` (slice R4c,
+    /// item 4): insert a zero run into FILE in place through the
+    /// atomic save; `--at` defaults to the end of the file.
+    pub insert_zeroes: Option<u64>,
+    pub insert_at: Option<u64>,
+    /// `--compare <other>` (slice R4c, item 43): structural
+    /// (block-wise) comparison of FILE against another file; exit
+    /// 1 when the block maps differ.
+    pub compare: Option<PathBuf>,
     pub headless: bool,
     pub json: bool,
     pub silent: bool,
@@ -307,7 +356,40 @@ pub fn parse_args(args: &[String]) -> Result<CliOptions, CliError> {
             }
             "--out" => {
                 let value = take_value(args, &mut i, inline_value, "--out")?;
-                opts.extract_out = Some(PathBuf::from(value));
+                opts.extract_out = Some(PathBuf::from(value.clone()));
+                opts.out = Some(PathBuf::from(value));
+            }
+            "--slice" => {
+                let value = take_value(args, &mut i, inline_value, "--slice")?;
+                opts.slice_spec = Some(value);
+            }
+            "--export-patch" => {
+                let value = take_value(args, &mut i, inline_value, "--export-patch")?;
+                opts.export_patch = Some(PathBuf::from(value));
+            }
+            "--apply-patch" => {
+                let value = take_value(args, &mut i, inline_value, "--apply-patch")?;
+                opts.apply_patch = Some(PathBuf::from(value));
+            }
+            "--insert-zeroes" => {
+                let value = take_value(args, &mut i, inline_value, "--insert-zeroes")?;
+                opts.insert_zeroes = Some(parse_size(&value).map_err(|_| {
+                    CliError::new(format!(
+                        "--insert-zeroes needs a count (a whole number, or one with a K, M or G suffix), got '{value}'"
+                    ))
+                })?);
+            }
+            "--at" => {
+                let value = take_value(args, &mut i, inline_value, "--at")?;
+                opts.insert_at = Some(parse_u64(&value).map_err(|_| {
+                    CliError::new(format!(
+                        "--at needs a byte offset (decimal or 0x-hex), got '{value}'"
+                    ))
+                })?);
+            }
+            "--compare" => {
+                let value = take_value(args, &mut i, inline_value, "--compare")?;
+                opts.compare = Some(PathBuf::from(value));
             }
             "--mode" => {
                 let value = take_value(args, &mut i, inline_value, "--mode")?;
@@ -457,9 +539,13 @@ pub fn run(args: &[String]) -> i32 {
     // Windows, borrow the parent terminal's console for this run —
     // the binary is GUI-subsystem, so it has no console of its own
     // (the call lives in gui_win, the crate's unsafe-sanctioned
-    // Windows module).
+    // Windows module). The code-page converter (slice R4c, item
+    // 29) is installed at the same point so every later decode —
+    // GUI or headless — uses the same Win32 conversion.
     #[cfg(windows)]
     crate::gui_win::attach_parent_console();
+    #[cfg(windows)]
+    crate::gui_win::install_page_converter();
 
     let opts = match parse_args(args) {
         Ok(opts) => opts,
@@ -493,6 +579,26 @@ pub fn run(args: &[String]) -> i32 {
 
     if opts.split.is_some() {
         return run_split(&opts);
+    }
+
+    if opts.slice_spec.is_some() {
+        return run_slice(&opts);
+    }
+
+    if opts.export_patch.is_some() {
+        return run_export_patch(&opts);
+    }
+
+    if opts.apply_patch.is_some() {
+        return run_apply_patch(&opts);
+    }
+
+    if opts.insert_zeroes.is_some() {
+        return run_insert_zeroes(&opts);
+    }
+
+    if opts.compare.is_some() {
+        return run_compare(&opts);
     }
 
     if let Some((path_a, path_b)) = &opts.diff {
@@ -695,6 +801,392 @@ fn run_save_copy(opts: &CliOptions) -> i32 {
         }
     }
     0
+}
+
+/// A `read_at` closure over a plain file (seek + read) — the
+/// random-access byte source the patch and compare cores take.
+fn file_reader(file: std::fs::File) -> impl FnMut(u64, &mut [u8]) -> usize {
+    let mut file = file;
+    move |offset: u64, out: &mut [u8]| -> usize {
+        use std::io::{Read, Seek, SeekFrom};
+        if file.seek(SeekFrom::Start(offset)).is_err() {
+            return 0;
+        }
+        file.read(out).unwrap_or(0)
+    }
+}
+
+/// Headless `--slice "<spec>" --out <path>` (slice R4c, item 2):
+/// extract the ranges the slicing grammar names from FILE,
+/// streamed. The spec error text is printed verbatim — it is
+/// written for the person typing the spec. Exit 0 on success, 2
+/// on any usage, spec or I/O error. Line ranges need a complete
+/// line index: the first attempt runs without one, and only an
+/// index-required answer builds it and retries (byte-range specs
+/// never pay for an index).
+fn run_slice(opts: &CliOptions) -> i32 {
+    let spec = opts.slice_spec.as_deref().unwrap_or_default();
+    let Some(path) = &opts.file else {
+        eprintln!(
+            "VeloEdit: --slice needs a file: VeloEdit.exe <FILE> --slice \"<spec>\" --out <DEST>"
+        );
+        return 2;
+    };
+    let Some(out_path) = &opts.out else {
+        eprintln!("VeloEdit: --slice needs a destination: --out <DEST>");
+        return 2;
+    };
+    if out_path == path {
+        eprintln!(
+            "VeloEdit: --slice --out must differ from the input file ({})",
+            path.display()
+        );
+        return 2;
+    }
+    let table = match load_table_for_copy(path) {
+        Ok(table) => table,
+        Err(message) => {
+            eprintln!("VeloEdit: {message}");
+            return 2;
+        }
+    };
+    let attempt = |index: Option<&crate::line_index::LineIndex>| -> Result<crate::slicing::ExtractReport, crate::slicing::SliceError> {
+        let mut out_file =
+            std::fs::File::create(out_path).map_err(crate::slicing::SliceError::Io)?;
+        let report = crate::slicing::extract_ranges(&table, index, spec, &mut out_file)?;
+        std::io::Write::flush(&mut out_file).map_err(crate::slicing::SliceError::Io)?;
+        Ok(report)
+    };
+    let report = match attempt(None) {
+        Ok(report) => report,
+        Err(crate::slicing::SliceError::IndexRequired) => {
+            let index = crate::line_index::LineIndex::build(table.len(), |offset, buf| {
+                table.read_into(offset, buf)
+            });
+            match attempt(Some(&index)) {
+                Ok(report) => report,
+                Err(e) => {
+                    eprintln!("VeloEdit: {e}");
+                    return 2;
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("VeloEdit: {e}");
+            return 2;
+        }
+    };
+    if !opts.silent {
+        if opts.json {
+            println!(
+                "{{\"ranges\":{},\"bytes_written\":{}}}",
+                report.ranges, report.bytes_written
+            );
+        } else {
+            println!(
+                "Extracted {} range(s), {} byte(s), from {} to {}.",
+                report.ranges,
+                report.bytes_written,
+                path.display(),
+                out_path.display()
+            );
+        }
+    }
+    0
+}
+
+/// Headless `--export-patch <path>` (slice R4c, item 3): write a
+/// VELOPAT1 delta patch of FILE against its on-disk original. A
+/// headless run has no edits, so the patch honestly has zero
+/// hunks — the format round-trips and `--apply-patch` reproduces
+/// the file. Exit 0 on success, 2 on error.
+fn run_export_patch(opts: &CliOptions) -> i32 {
+    let dest = opts
+        .export_patch
+        .as_deref()
+        .unwrap_or_else(|| Path::new(""));
+    let Some(path) = &opts.file else {
+        eprintln!(
+            "VeloEdit: --export-patch needs a file: VeloEdit.exe <FILE> --export-patch <PATCH>"
+        );
+        return 2;
+    };
+    let table = match load_table_for_copy(path) {
+        Ok(table) => table,
+        Err(message) => {
+            eprintln!("VeloEdit: {message}");
+            return 2;
+        }
+    };
+    let source = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("VeloEdit: could not read {}: {e}", path.display());
+            return 2;
+        }
+    };
+    let patch =
+        match crate::patch::build_patch(table.original_file_size, file_reader(source), &table) {
+            Ok(patch) => patch,
+            Err(e) => {
+                eprintln!(
+                    "VeloEdit: could not build the patch for {}: {e}",
+                    path.display()
+                );
+                return 2;
+            }
+        };
+    let bytes = patch.to_bytes();
+    if let Err(e) = std::fs::write(dest, &bytes) {
+        eprintln!("VeloEdit: could not write {}: {e}", dest.display());
+        return 2;
+    }
+    if !opts.silent {
+        if opts.json {
+            println!(
+                "{{\"patch\":\"{}\",\"hunks\":{},\"bytes\":{},\"original_len\":{},\"result_len\":{}}}",
+                crate::settings::json_escape(&dest.to_string_lossy()),
+                patch.hunks.len(),
+                bytes.len(),
+                patch.original_len,
+                patch.result_len
+            );
+        } else {
+            println!(
+                "Wrote a delta patch with {} hunk(s) ({} bytes) to {}.",
+                patch.hunks.len(),
+                bytes.len(),
+                dest.display()
+            );
+        }
+    }
+    0
+}
+
+/// Headless `--apply-patch <patch> --out <path>` (slice R4c,
+/// item 3): apply a VELOPAT1 patch to FILE and write the result
+/// to `--out`. FILE itself is never modified — the same rule as
+/// the window's Apply Patch. Exit 0 on success, 2 on error
+/// (including a patch that does not match the base file).
+fn run_apply_patch(opts: &CliOptions) -> i32 {
+    let patch_path = opts.apply_patch.as_deref().unwrap_or_else(|| Path::new(""));
+    let Some(path) = &opts.file else {
+        eprintln!(
+            "VeloEdit: --apply-patch needs a base file: VeloEdit.exe <FILE> --apply-patch <PATCH> --out <DEST>"
+        );
+        return 2;
+    };
+    let Some(out_path) = &opts.out else {
+        eprintln!("VeloEdit: --apply-patch needs a destination: --out <DEST>");
+        return 2;
+    };
+    if out_path == path {
+        eprintln!(
+            "VeloEdit: --apply-patch --out must differ from the base file ({}); the base is never overwritten",
+            path.display()
+        );
+        return 2;
+    }
+    let patch_bytes = match std::fs::read(patch_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            eprintln!("VeloEdit: could not read {}: {e}", patch_path.display());
+            return 2;
+        }
+    };
+    let patch = match crate::patch::Patch::from_bytes(&patch_bytes) {
+        Ok(patch) => patch,
+        Err(e) => {
+            eprintln!(
+                "VeloEdit: {} is not a usable patch: {e}",
+                patch_path.display()
+            );
+            return 2;
+        }
+    };
+    let base = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("VeloEdit: could not read {}: {e}", path.display());
+            return 2;
+        }
+    };
+    let base_len = match base.metadata() {
+        Ok(md) => md.len(),
+        Err(e) => {
+            eprintln!("VeloEdit: could not read {}: {e}", path.display());
+            return 2;
+        }
+    };
+    let mut out_file = match std::fs::File::create(out_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("VeloEdit: could not create {}: {e}", out_path.display());
+            return 2;
+        }
+    };
+    let written =
+        match crate::patch::apply_patch(base_len, file_reader(base), &patch, &mut out_file) {
+            Ok(written) => written,
+            Err(e) => {
+                eprintln!("VeloEdit: could not apply {}: {e}", patch_path.display());
+                return 2;
+            }
+        };
+    if let Err(e) = std::io::Write::flush(&mut out_file) {
+        eprintln!("VeloEdit: could not finish {}: {e}", out_path.display());
+        return 2;
+    }
+    if !opts.silent {
+        if opts.json {
+            println!("{{\"bytes_written\":{written}}}");
+        } else {
+            println!(
+                "Applied {} to {} and wrote {} byte(s) to {}.",
+                patch_path.display(),
+                path.display(),
+                written,
+                out_path.display()
+            );
+        }
+    }
+    0
+}
+
+/// Headless `--insert-zeroes <count>` (slice R4c, item 4): insert
+/// a run of zero bytes into FILE at `--at <offset>` (default: the
+/// end of the file), in place through the atomic save — the same
+/// operation the window's Insert Zeroes runs, so the result is
+/// one atomic swap, never a half-written file. Exit 0 on success,
+/// 2 on any error.
+fn run_insert_zeroes(opts: &CliOptions) -> i32 {
+    let count = opts.insert_zeroes.unwrap_or(0);
+    let Some(path) = &opts.file else {
+        eprintln!(
+            "VeloEdit: --insert-zeroes needs a file: VeloEdit.exe <FILE> --insert-zeroes <COUNT>"
+        );
+        return 2;
+    };
+    if count == 0 {
+        eprintln!("VeloEdit: --insert-zeroes needs a count greater than zero");
+        return 2;
+    }
+    let mut table = match load_table_for_copy(path) {
+        Ok(table) => table,
+        Err(message) => {
+            eprintln!("VeloEdit: {message}");
+            return 2;
+        }
+    };
+    let at = opts.insert_at.unwrap_or(table.len());
+    if at > table.len() {
+        eprintln!(
+            "VeloEdit: --at {at} is beyond the end of {} ({} bytes)",
+            path.display(),
+            table.len()
+        );
+        return 2;
+    }
+    let mut history = crate::undo::UndoStack::new();
+    crate::op_insert_zeroes(&mut table, &mut history, at, count);
+    let report = match table.save_to(path, &mut history) {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("VeloEdit: could not save {}: {e}", path.display());
+            return 2;
+        }
+    };
+    if !opts.silent {
+        if opts.json {
+            println!(
+                "{{\"inserted\":{count},\"at\":{at},\"bytes_written\":{}}}",
+                report.bytes_written
+            );
+        } else {
+            println!(
+                "Inserted {count} zero byte(s) at byte {at} in {} (now {} bytes).",
+                path.display(),
+                report.bytes_written
+            );
+        }
+    }
+    0
+}
+
+/// Headless `--compare <other>` (slice R4c, item 43): the
+/// structural diff — compare FILE against another file block by
+/// block (1 MB blocks, SHA-256 per block) and print the differing
+/// regions. Exit 0 when the files are identical, 1 when they
+/// differ, 2 on error — the `--diff` scheme, at block level.
+fn run_compare(opts: &CliOptions) -> i32 {
+    let other = opts.compare.as_deref().unwrap_or_else(|| Path::new(""));
+    let Some(path) = &opts.file else {
+        eprintln!("VeloEdit: --compare needs a file: VeloEdit.exe <FILE> --compare <OTHER>");
+        return 2;
+    };
+    let table_a = match load_table_for_copy(path) {
+        Ok(table) => table,
+        Err(message) => {
+            eprintln!("VeloEdit: {message}");
+            return 2;
+        }
+    };
+    let table_b = match load_table_for_copy(other) {
+        Ok(table) => table,
+        Err(message) => {
+            eprintln!("VeloEdit: {message}");
+            return 2;
+        }
+    };
+    let report = crate::op_structural_diff(
+        table_a.len(),
+        |offset, buf| table_a.read_into(offset, buf),
+        table_b.len(),
+        |offset, buf| table_b.read_into(offset, buf),
+        crate::structdiff::DEFAULT_BLOCK_SIZE,
+    );
+    if !opts.silent {
+        if opts.json {
+            let mut json = String::from("{\"equal\":");
+            json.push_str(if report.equal() { "true" } else { "false" });
+            json.push_str(",\"first_divergence\":");
+            match report.first_divergence {
+                Some(offset) => json.push_str(&offset.to_string()),
+                None => json.push_str("null"),
+            }
+            json.push_str(",\"regions\":[");
+            for (i, region) in report.regions.iter().enumerate() {
+                if i > 0 {
+                    json.push(',');
+                }
+                json.push_str(&format!(
+                    "{{\"offset\":{},\"length\":{}}}",
+                    region.offset, region.length
+                ));
+            }
+            json.push_str(&format!(
+                "],\"len_a\":{},\"len_b\":{},\"block_size\":{}}}",
+                report.len_a, report.len_b, report.block_size
+            ));
+            println!("{json}");
+        } else if report.equal() {
+            println!("Files are identical ({} bytes each).", report.len_a);
+        } else {
+            println!(
+                "Files differ in {} region(s); first difference at byte {}.",
+                report.regions.len(),
+                report.first_divergence.unwrap_or(0)
+            );
+            for region in &report.regions {
+                println!("  byte {}: {} byte(s) differ", region.offset, region.length);
+            }
+        }
+    }
+    if report.equal() {
+        0
+    } else {
+        1
+    }
 }
 
 /// Headless `extract` subcommand (roadmap item 44): stream one byte
@@ -1388,6 +1880,204 @@ mod tests {
             dir.join("nope.bin").to_string_lossy().into_owned(),
             "--save-copy".into(),
             dest.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run(&args), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_r4c_operations() {
+        let opts = parse(&["f.bin", "--slice", "0-99;L1-L2", "--out", "part.bin"]).unwrap();
+        assert_eq!(opts.slice_spec, Some("0-99;L1-L2".to_string()));
+        assert_eq!(opts.out, Some(PathBuf::from("part.bin")));
+        let opts = parse(&["f.bin", "--export-patch", "p.velopat"]).unwrap();
+        assert_eq!(opts.export_patch, Some(PathBuf::from("p.velopat")));
+        let opts = parse(&["f.bin", "--apply-patch=p.velopat", "--out=o.bin"]).unwrap();
+        assert_eq!(opts.apply_patch, Some(PathBuf::from("p.velopat")));
+        assert_eq!(opts.out, Some(PathBuf::from("o.bin")));
+        let opts = parse(&["f.bin", "--insert-zeroes", "4K", "--at", "0x10"]).unwrap();
+        assert_eq!(opts.insert_zeroes, Some(4096));
+        assert_eq!(opts.insert_at, Some(16));
+        let opts = parse(&["f.bin", "--compare", "g.bin"]).unwrap();
+        assert_eq!(opts.compare, Some(PathBuf::from("g.bin")));
+        assert!(parse(&["f.bin", "--insert-zeroes", "lots"]).is_err());
+        assert!(parse(&["f.bin", "--at", "-1"]).is_err());
+        assert!(parse(&["f.bin", "--slice"]).is_err());
+    }
+
+    #[test]
+    fn slice_run_extracts_byte_and_line_ranges() {
+        let dir = std::env::temp_dir().join(format!("veloedit-slice-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.txt");
+        std::fs::write(&src, b"alpha\nbeta\ngamma\n").unwrap();
+        let out = dir.join("part.bin");
+        let src_s = src.to_string_lossy().into_owned();
+        let out_s = out.to_string_lossy().into_owned();
+
+        // Byte range, both ends inclusive.
+        let args: Vec<String> = vec![
+            src_s.clone(),
+            "--slice".into(),
+            "0-4".into(),
+            "--out".into(),
+            out_s.clone(),
+        ];
+        assert_eq!(run(&args), 0);
+        assert_eq!(std::fs::read(&out).unwrap(), b"alpha");
+
+        // Line range (needs the index retry path).
+        let args: Vec<String> = vec![
+            src_s.clone(),
+            "--slice".into(),
+            "L2-L3".into(),
+            "--out".into(),
+            out_s.clone(),
+        ];
+        assert_eq!(run(&args), 0);
+        assert_eq!(std::fs::read(&out).unwrap(), b"beta\ngamma\n");
+
+        // A bad spec is an error (exit 2), reported word for word.
+        let args: Vec<String> = vec![
+            src_s.clone(),
+            "--slice".into(),
+            "banana".into(),
+            "--out".into(),
+            out_s.clone(),
+        ];
+        assert_eq!(run(&args), 2);
+        // Missing --out / missing file / out == input are exit 2.
+        let args: Vec<String> = vec![src_s.clone(), "--slice".into(), "0-1".into()];
+        assert_eq!(run(&args), 2);
+        let args: Vec<String> = vec![
+            src_s.clone(),
+            "--slice".into(),
+            "0-1".into(),
+            "--out".into(),
+            src_s.clone(),
+        ];
+        assert_eq!(run(&args), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn patch_round_trip_through_the_cli() {
+        let dir = std::env::temp_dir().join(format!("veloedit-patch-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        std::fs::write(&src, b"patch me gently").unwrap();
+        let patch = dir.join("delta.velopat");
+        let out = dir.join("applied.bin");
+        let src_s = src.to_string_lossy().into_owned();
+
+        // Export from an unedited file: a valid empty patch.
+        let args: Vec<String> = vec![
+            src_s.clone(),
+            "--export-patch".into(),
+            patch.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run(&args), 0);
+        let patch_bytes = std::fs::read(&patch).unwrap();
+        assert!(patch_bytes.starts_with(b"VELOPAT1"));
+
+        // Applying it reproduces the base byte for byte.
+        let args: Vec<String> = vec![
+            src_s.clone(),
+            "--apply-patch".into(),
+            patch.to_string_lossy().into_owned(),
+            "--out".into(),
+            out.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run(&args), 0);
+        assert_eq!(std::fs::read(&out).unwrap(), b"patch me gently");
+        // The base was never modified, and applying over the base
+        // is refused.
+        assert_eq!(std::fs::read(&src).unwrap(), b"patch me gently");
+        let args: Vec<String> = vec![
+            src_s.clone(),
+            "--apply-patch".into(),
+            patch.to_string_lossy().into_owned(),
+            "--out".into(),
+            src_s.clone(),
+        ];
+        assert_eq!(run(&args), 2);
+        // A non-patch file is refused, exit 2.
+        let junk = dir.join("junk.velopat");
+        std::fs::write(&junk, b"not a patch at all").unwrap();
+        let args: Vec<String> = vec![
+            src_s.clone(),
+            "--apply-patch".into(),
+            junk.to_string_lossy().into_owned(),
+            "--out".into(),
+            out.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run(&args), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn insert_zeroes_run_edits_in_place_atomically() {
+        let dir = std::env::temp_dir().join(format!("veloedit-zeroes-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        std::fs::write(&src, b"ABCD").unwrap();
+        let src_s = src.to_string_lossy().into_owned();
+
+        // Default position: the end of the file.
+        let args: Vec<String> = vec![src_s.clone(), "--insert-zeroes".into(), "3".into()];
+        assert_eq!(run(&args), 0);
+        assert_eq!(std::fs::read(&src).unwrap(), b"ABCD\0\0\0");
+
+        // At an offset, with a size suffix.
+        let args: Vec<String> = vec![
+            src_s.clone(),
+            "--insert-zeroes".into(),
+            "2".into(),
+            "--at".into(),
+            "2".into(),
+        ];
+        assert_eq!(run(&args), 0);
+        assert_eq!(std::fs::read(&src).unwrap(), b"AB\0\0CD\0\0\0");
+
+        // Past-the-end --at and a zero count are errors, exit 2.
+        let args: Vec<String> = vec![
+            src_s.clone(),
+            "--insert-zeroes".into(),
+            "1".into(),
+            "--at".into(),
+            "99".into(),
+        ];
+        assert_eq!(run(&args), 2);
+        let args: Vec<String> = vec![src_s.clone(), "--insert-zeroes".into(), "0".into()];
+        assert_eq!(run(&args), 2);
+        // No staging file is left behind by the atomic save.
+        assert!(!crate::save::staging_path_for(&src).exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compare_run_reports_block_regions() {
+        let dir =
+            std::env::temp_dir().join(format!("veloedit-compare-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.bin");
+        let b = dir.join("b.bin");
+        std::fs::write(&a, vec![7u8; 5000]).unwrap();
+        std::fs::write(&b, vec![7u8; 5000]).unwrap();
+        let a_s = a.to_string_lossy().into_owned();
+        let b_s = b.to_string_lossy().into_owned();
+        let args: Vec<String> = vec![a_s.clone(), "--compare".into(), b_s.clone()];
+        assert_eq!(run(&args), 0);
+        // One byte different: exit 1.
+        let mut changed = vec![7u8; 5000];
+        changed[4999] = 8;
+        std::fs::write(&b, changed).unwrap();
+        assert_eq!(run(&args), 1);
+        // A missing other file is an error, exit 2.
+        let args: Vec<String> = vec![
+            a_s.clone(),
+            "--compare".into(),
+            dir.join("nope.bin").to_string_lossy().into_owned(),
         ];
         assert_eq!(run(&args), 2);
         std::fs::remove_dir_all(&dir).unwrap();
