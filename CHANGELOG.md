@@ -55,6 +55,99 @@ release asset naming in the specification.
   highlighted choice in the window without saving it — clicking
   keeps the choice, closing the menu without a click puts the
   previous theme and accent back.
+- File hashes core: MD5, SHA-1, and SHA-256 written by hand from
+  their public specifications (no library, per the dependency
+  rule), streaming over a file in 64 KB windows so hashing never
+  loads the file.
+- Data inspector core: the bytes at a position read as signed and
+  unsigned 8/16/32/64-bit integers and 32/64-bit floats in both
+  byte orders, plus hex/binary renderings, Unix-timestamp
+  readings (seconds and milliseconds, UTC), a GUID reading (the
+  standard layout, first three fields little-endian as Windows
+  stores them), a Windows FILETIME reading, and a short UTF-8
+  text preview.
+- Bookmarks core: named anchors at byte offsets, kept per file in
+  `data/bookmarks.json` and guarded by the file's size and
+  modification stamp — a file that changed since its bookmarks
+  were set drops them rather than pointing at the wrong bytes.
+  Toggle and next/previous navigation with wrap-around.
+- Delta-log recovery core: a document's recovery record now
+  stores the piece-table state — which parts of the original file
+  are still visible and the bytes of every edit — plus the
+  original file's SHA-256 fingerprint, instead of a copy of the
+  document's contents, so recovery is no longer limited by a
+  content-size cap. Rebuilding re-checks the fingerprint and
+  refuses when the original file changed.
+- Line-ending and BOM control on save: a save can normalise line
+  endings to LF or CRLF and add or remove the byte-order mark,
+  applied as a streaming transform in the document encoding's
+  unit width (UTF-16 included), correct across chunk boundaries.
+  The default keeps both exactly as they are.
+- Incremental find-all core: a windowed find returns the matches
+  starting inside one byte window, so a background worker can
+  populate the full match list piece by piece; joined over
+  consecutive windows the results equal a one-shot find-all.
+- Bookmarks (window): Ctrl+F2 toggles a bookmark at the caret,
+  F2 / Shift+F2 jump to the next / previous bookmark with
+  wrap-around. A bookmarked line carries a small accent square in
+  the gutter (in hex mode, beside the row's offset), and bookmarks
+  also appear as ticks in the scrollbar. They persist per file in
+  `data/bookmarks.json` and are dropped when the file changes.
+- Background find-all and scrollbar ticks (window): on documents
+  over 4 MB, a plain find's match list now fills in on a worker
+  thread — the count reads "Counting…" until the last window
+  lands, Find Next / Previous already work over the matches found
+  so far, and the first match is selected as soon as it is known.
+  Matches (accent) and bookmarks (text colour) draw as ticks in
+  the scrollbar track, one per track row. Documents up to 4 MB
+  keep the synchronous find, as do scoped and masked finds.
+- External-change notice: if the open file changes on disk, a
+  non-modal bar appears directly under the toolbar — "This file
+  changed on disk." with Reload and Ignore buttons — when the
+  window gains focus or just before a save. Reload re-opens the
+  file (asking about unsaved changes first, and cancelling keeps
+  the bar); Ignore dismisses the notice until the file changes
+  again.
+- Delta recovery (window): documents backed by a file now record
+  their recovery as the delta record (`data/recovery2.bin` — the
+  edit log plus the original file's fingerprint) at any size; the
+  fingerprint is computed on a background thread after opening.
+  Startup checks the delta record first: if the original file
+  changed, the record is deleted and a plain message says the
+  recovery was skipped; otherwise the rebuilt document is offered
+  exactly like the snapshot was. The 16 MB content snapshot
+  remains for documents with no backing file, and a successful
+  save or clean exit clears both forms.
+- Data Inspector (window): View ▸ Data Inspector docks a panel on
+  the right showing the readings of the 16 bytes at the caret —
+  integers and floats in both byte orders, hex and binary, Unix
+  and FILETIME dates, a GUID, and a text preview — refreshed as
+  the caret moves or the bytes change. The editor area shrinks
+  while the panel is open, and the open state is remembered.
+- Hex layout choices: View ▸ Hex Columns shows 8, 16, 24, 32 or
+  64 bytes per row, or fits the row width to the window
+  (recomputed on resize). View ▸ Hex Grouping displays bytes in
+  groups of 2, 4 or 8, and Big-Endian Groups shows each group
+  reversed, the way a stored number reads — display only: the
+  file's byte order never changes, the ASCII column is
+  unaffected, and the caret stays byte-based. All three choices
+  are remembered.
+- Relative offsets: View ▸ Relative Offsets shows hex row
+  addresses as distances from a base — the caret when the mode is
+  switched on — with signed negative offsets for rows above the
+  base; Set Offset Base at Caret moves the base, and the status
+  bar names the base while the mode is on.
+- Save Options (window): the File ▸ Save Options submenu chooses
+  the save pipeline's line-ending conversion (Keep / LF / CRLF)
+  and byte-order-mark handling (Keep / Add / Remove); the choices
+  persist, apply to Save and Save As, and show in the status bar
+  (for example "· → CRLF · +BOM") while a conversion is armed.
+- File Hashes (window): File ▸ File Hashes… streams the file on
+  disk through MD5, SHA-1 and SHA-256 on a worker thread and
+  fills in the three digests when the hashing completes; a
+  compare box reports which digest a pasted checksum matches, or
+  "No match". When the document has unsaved changes the dialog
+  says it is hashing the file on disk.
 
 ### Changed
 
