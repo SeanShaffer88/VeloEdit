@@ -1,6 +1,6 @@
 ; VeloEdit — NSIS installer script (SPEC §6.1)
 ;
-; Produces: VeloEdit-v1.0.0-x64-Setup.exe
+; Produces: VeloEdit-v<VERSION>-x64-Setup.exe
 ;
 ; Per-user install (no administrator prompt): the default and only install
 ; location root is $LOCALAPPDATA\Programs\VeloEdit, and the Add/Remove
@@ -21,7 +21,7 @@
   !define OUT_DIR "."
 !endif
 
-!define VERSION "1.0.0"
+!define VERSION "1.0.1"
 !define APPNAME "VeloEdit"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\VeloEdit"
 
@@ -47,6 +47,10 @@ VIAddVersionKey "LegalCopyright" "MIT License"
 !include "MUI2.nsh"
 
 !define MUI_ABORTWARNING
+; The program icon for the installer and uninstaller windows (and the
+; Setup exe itself). These defines must precede the MUI page macros.
+!define MUI_ICON "..\assets\veloedit.ico"
+!define MUI_UNICON "..\assets\veloedit.ico"
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_LICENSE "..\LICENSE"
 !insertmacro MUI_PAGE_DIRECTORY

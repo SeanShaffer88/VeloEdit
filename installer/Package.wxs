@@ -2,7 +2,7 @@
 <!--
   VeloEdit — WiX v4 package script (SPEC §6.1)
 
-  Produces: VeloEdit-v1.0.0-x64-Setup.msi
+  Produces: the versioned x64 Setup.msi
 
   Per-user package (Scope="perUser"): installs to
   %LOCALAPPDATA%\Programs\VeloEdit, needs no administrator rights, and
@@ -25,7 +25,7 @@
     (the extension version must match the tool's major version,
     or the build fails with WIX0144)
     wix build installer\Package.wxs -ext WixToolset.UI.wixext
-        -o VeloEdit-v1.0.0-x64-Setup.msi
+        -o VeloEdit-v<VERSION>-x64-Setup.msi
 
   File sources are written with the sys.SOURCEFILEDIR preprocessor
   variable (the folder this file lives in), because WiX resolves plain
@@ -40,11 +40,17 @@
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="VeloEdit"
            Manufacturer="Sean Shaffer"
-           Version="1.0.0"
+           Version="1.0.1"
            Scope="perUser"
            UpgradeCode="A38C6BC4-F086-4855-A7E6-8706BCA8F987">
     <MajorUpgrade DowngradeErrorMessage="A newer version of VeloEdit is already installed." />
     <MediaTemplate EmbedCab="yes" />
+
+    <!-- The program icon: used for the Add/Remove Programs entry (via
+         ARPPRODUCTICON) and the Start Menu shortcut. The .ico sits next
+         to this file (a copy of assets/veloedit.ico). -->
+    <Icon Id="VeloEditIcon" SourceFile="$(sys.SOURCEFILEDIR)veloedit.ico" />
+    <Property Id="ARPPRODUCTICON" Value="VeloEditIcon" />
 
     <!-- The one UI reference: minimal wizard from the UI extension. -->
     <ui:WixUI Id="WixUI_Minimal" />
@@ -90,6 +96,7 @@
                 Name="VeloEdit"
                 Description="Binary and large-file editor"
                 Target="[INSTALLFOLDER]VeloEdit.exe"
+                Icon="VeloEditIcon"
                 WorkingDirectory="INSTALLFOLDER" />
       <RemoveFolder Id="RemoveAppShortcutFolder" On="uninstall" />
       <RegistryValue Root="HKCU"
