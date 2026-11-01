@@ -63,11 +63,45 @@ fn system_time_nanos(time: SystemTime) -> i64 {
     }
 }
 
-/// One bookmark: a byte offset in the file, with a display name.
+/// The fixed bookmark colour swatches (slice R4c, item 20
+/// expansion): six bright, colourblind-safe colours that read on
+/// every built-in theme, chosen from the Okabe-Ito palette. A
+/// bookmark with no colour (`None`) draws in the theme accent, as
+/// bookmarks always have.
+pub const BOOKMARK_SWATCHES: [(&str, (u8, u8, u8)); 6] = [
+    ("Orange", (0xE6, 0x9F, 0x00)),
+    ("Sky Blue", (0x56, 0xB4, 0xE9)),
+    ("Green", (0x00, 0x9E, 0x73)),
+    ("Yellow", (0xF0, 0xE4, 0x42)),
+    ("Blue", (0x00, 0x72, 0xB2)),
+    ("Pink", (0xCC, 0x79, 0xA7)),
+];
+
+/// One bookmark: a byte offset in the file, with a display name,
+/// an optional colour swatch (an index into [`BOOKMARK_SWATCHES`])
+/// and an optional short note (empty = none). Colour and note are
+/// the R4c annotation fields: store files written before them
+/// load with both defaulted, and the writer only emits them when
+/// set, so an un-annotated store stays byte-identical to the old
+/// format.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bookmark {
     pub offset: u64,
     pub name: String,
+    pub color: Option<u8>,
+    pub note: String,
+}
+
+impl Bookmark {
+    /// A plain bookmark with no annotation (the pre-R4c shape).
+    pub fn new(offset: u64, name: &str) -> Self {
+        Self {
+            offset,
+            name: name.to_string(),
+            color: None,
+            note: String::new(),
+        }
+    }
 }
 
 /// The bookmarks of one file, kept sorted by offset at all times.
@@ -113,13 +147,7 @@ impl BookmarkList {
                     .iter()
                     .position(|b| b.offset > offset)
                     .unwrap_or(self.entries.len());
-                self.entries.insert(
-                    at,
-                    Bookmark {
-                        offset,
-                        name: name.to_string(),
-                    },
-                );
+                self.entries.insert(at, Bookmark::new(offset, name));
                 true
             }
         }
@@ -156,6 +184,44 @@ impl BookmarkList {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// The bookmark at exactly `offset`, if one sits there.
+    pub fn get(&self, offset: u64) -> Option<&Bookmark> {
+        self.entries.iter().find(|b| b.offset == offset)
+    }
+
+    /// Insert `bookmark` keeping the sort order, replacing any
+    /// bookmark already at its offset (annotations included).
+    pub fn add(&mut self, bookmark: Bookmark) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|b| b.offset == bookmark.offset)
+        {
+            self.entries[index] = bookmark;
+            return;
+        }
+        let at = self
+            .entries
+            .iter()
+            .position(|b| b.offset > bookmark.offset)
+            .unwrap_or(self.entries.len());
+        self.entries.insert(at, bookmark);
+    }
+
+    /// Set the annotation (colour swatch index, note) of the
+    /// bookmark at `offset`. A colour index outside
+    /// [`BOOKMARK_SWATCHES`] is stored as `None` (no colour)
+    /// rather than kept to break a later draw. Returns whether a
+    /// bookmark sits at `offset`.
+    pub fn set_annotation(&mut self, offset: u64, color: Option<u8>, note: &str) -> bool {
+        let Some(bookmark) = self.entries.iter_mut().find(|b| b.offset == offset) else {
+            return false;
+        };
+        bookmark.color = color.filter(|&c| (c as usize) < BOOKMARK_SWATCHES.len());
+        bookmark.note = note.to_string();
+        true
     }
 }
 
@@ -247,6 +313,24 @@ impl BookmarkStore {
         self.records.retain(|r| r.path != path);
     }
 
+    /// Set the annotation of the bookmark at `offset` in `path`'s
+    /// record (see [`BookmarkList::set_annotation`]). Stale
+    /// records count as empty. Returns whether the bookmark
+    /// exists.
+    pub fn set_annotation(
+        &mut self,
+        path: &str,
+        stamp: FileStamp,
+        offset: u64,
+        color: Option<u8>,
+        note: &str,
+    ) -> bool {
+        match self.fresh_record(path, stamp) {
+            Some(record) => record.list.set_annotation(offset, color, note),
+            None => false,
+        }
+    }
+
     // -- Persistence ---------------------------------------------------
 
     /// Render the store as the `bookmarks.json` text.
@@ -271,11 +355,22 @@ impl BookmarkStore {
                 if j > 0 {
                     out.push(',');
                 }
-                out.push_str(&format!(
-                    "\n        {{ \"offset\": {}, \"name\": \"{}\" }}",
+                // The annotation fields are emitted only when set,
+                // so a store without annotations keeps the exact
+                // pre-R4c byte shape.
+                let mut line = format!(
+                    "\n        {{ \"offset\": {}, \"name\": \"{}\"",
                     bookmark.offset,
                     json_escape(&bookmark.name)
-                ));
+                );
+                if let Some(color) = bookmark.color {
+                    line.push_str(&format!(", \"color\": {color}"));
+                }
+                if !bookmark.note.is_empty() {
+                    line.push_str(&format!(", \"note\": \"{}\"", json_escape(&bookmark.note)));
+                }
+                line.push_str(" }");
+                out.push_str(&line);
             }
             if !record.list.entries.is_empty() {
                 out.push_str("\n      ");
@@ -602,10 +697,7 @@ impl Parser {
     }
 
     fn bookmark(&mut self) -> Result<Bookmark, String> {
-        let mut bookmark = Bookmark {
-            offset: 0,
-            name: String::new(),
-        };
+        let mut bookmark = Bookmark::new(0, "");
         self.expect('{')?;
         loop {
             self.skip_ws();
@@ -617,6 +709,18 @@ impl Parser {
             match key.as_str() {
                 "offset" => bookmark.offset = self.unsigned()?,
                 "name" => bookmark.name = self.string()?,
+                // Annotation fields (R4c): absent in old files,
+                // where they default; an out-of-range colour is
+                // dropped, never kept to break a later draw.
+                "color" => {
+                    let n = self.unsigned()?;
+                    bookmark.color = if (n as usize) < BOOKMARK_SWATCHES.len() {
+                        Some(n as u8)
+                    } else {
+                        None
+                    };
+                }
+                "note" => bookmark.note = self.string()?,
                 _ => self.skip_value()?,
             }
             self.skip_ws();
@@ -678,6 +782,59 @@ mod tests {
         // At/before the first bookmark, prev wraps to the last.
         assert_eq!(list.prev_before(100), Some(500));
         assert_eq!(list.prev_before(0), Some(500));
+    }
+
+    // (R4c) Store files written before annotations existed load
+    // with colour/note defaulted, and a store without annotations
+    // serialises exactly as it did before.
+    #[test]
+    fn old_store_files_load_with_default_annotations() {
+        let old = "{\n  \"version\": 1,\n  \"files\": [\n    {\n      \"path\": \"C:/a.txt\",\n      \
+                   \"size\": 10,\n      \"mtime_nanos\": 1700000000000000000,\n      \"bookmarks\": [\n        \
+                   { \"offset\": 5, \"name\": \"Bookmark 1\" }\n      ]\n    }\n  ]\n}\n";
+        let stamp = make_stamp(10);
+        let mut store = BookmarkStore::from_json(old).expect("old-format store parses");
+        let entries = store.bookmarks("C:/a.txt", stamp);
+        let bookmark = entries
+            .iter()
+            .find(|b| b.offset == 5)
+            .expect("the bookmark survived");
+        assert_eq!(bookmark.color, None);
+        assert_eq!(bookmark.note, "");
+        // And re-serialising that record keeps the old byte shape:
+        // no annotation keys appear.
+        let out = store.to_json();
+        assert!(!out.contains("\"color\""), "{out}");
+        assert!(!out.contains("\"note\""), "{out}");
+    }
+
+    // (R4c) Annotations round-trip through the store JSON, and the
+    // swatch index is validated on the way in from both sides.
+    #[test]
+    fn annotations_round_trip_and_validate() {
+        let mut store = BookmarkStore::default();
+        let stamp = make_stamp(10);
+        store.toggle("C:/a.txt", stamp, 5, "Bookmark 1");
+        store.toggle("C:/a.txt", stamp, 9, "Bookmark 2");
+        assert!(store.set_annotation("C:/a.txt", stamp, 5, Some(2), "watch this spot"));
+        // Out-of-range swatch index degrades to "no colour".
+        assert!(store.set_annotation("C:/a.txt", stamp, 9, Some(200), ""));
+        assert!(!store.set_annotation("C:/a.txt", stamp, 999, Some(0), "nowhere"));
+        let json = store.to_json();
+        assert!(json.contains("\"color\": 2"), "{json}");
+        assert!(json.contains("\"note\": \"watch this spot\""), "{json}");
+        let mut back = BookmarkStore::from_json(&json).expect("annotated store parses");
+        let entries = back.bookmarks("C:/a.txt", stamp);
+        let first = entries.iter().find(|b| b.offset == 5).unwrap();
+        assert_eq!(first.color, Some(2));
+        assert_eq!(first.note, "watch this spot");
+        assert_eq!(entries.iter().find(|b| b.offset == 9).unwrap().color, None);
+        // A hand-edited out-of-range colour in the file is dropped
+        // on load, not kept.
+        let edited = json.replace("\"color\": 2", "\"color\": 77");
+        let mut back = BookmarkStore::from_json(&edited).expect("edited store parses");
+        let entries = back.bookmarks("C:/a.txt", stamp);
+        assert_eq!(entries.iter().find(|b| b.offset == 5).unwrap().color, None);
     }
 
     #[test]
