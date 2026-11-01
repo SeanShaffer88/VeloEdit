@@ -569,6 +569,57 @@ scored from real Windows evidence before any release.
     CLI halves (splitter, size parsing, scoped/masked editor
     operations) are unit-tested on the host.
 
+- 2026-11-01, micro-slice (owner-requested window features:
+  Ctrl+wheel font zoom; live theme/accent menu preview), built
+  locally on the development host; NOT published:
+  - Ctrl+wheel zoom: `on_wheel` checks MK_CONTROL (0x0008) in
+    the message's low word first. With Ctrl held it does not
+    scroll; deltas feed a dedicated accumulator (`wheel_zoom_rem`,
+    kept separate from the scroll remainder `wheel_rem` so partial
+    notches never mix) and each full 120 units steps the font by
+    calling the Font Bigger / Font Smaller command path itself —
+    same ±2 step, same 8–48 clamp, same settings write. Plain
+    wheel handling below the branch is untouched.
+  - Live preview: `apply_theme` was split into a committing
+    wrapper (settings → visual → save) and `apply_theme_visual`
+    (visual only, never touches settings). WM_MENUSELECT on the
+    Theme/Accent menus folds the highlighted item into a session
+    preview pair held in `App::menu_preview` — the first highlight
+    snapshots the committed (theme, accent); a theme highlight
+    resolves with the accent currently in effect and vice versa,
+    so cross-menu browsing keeps one backup — and applies it
+    visually. A click runs the ordinary command handlers (they
+    discard the backup and persist as before); WM_EXITMENULOOP
+    and WM_CANCELMODE restore the snapshot and resync the check
+    marks (which are drawn from committed settings and never
+    moved during preview). The Accent ▸ Custom… item has no
+    preview (its dialog behaviour is unchanged; if the dialog is
+    cancelled while a preview is somehow still in flight, the
+    committed look is restored). Keyboard menu navigation
+    previews too, because MENUSELECT covers it.
+  - The built-in guide and README name both behaviours;
+    CHANGELOG [1.1.0] and PARITY carry them. No new unit tests:
+    the behaviour lives entirely in window-message handling,
+    which the host suite cannot drive; the count stays 190.
+  - Gate, run locally on the development host (true exit codes):
+    - `cargo fmt --all` + `cargo fmt --all --check` — clean (exit 0)
+    - `cargo test` — **190 passed, 0 failed** (exit 0)
+    - `cargo clippy --all-targets -- -D warnings` (host) — clean
+      (exit 0)
+    - `cargo clippy --target x86_64-pc-windows-gnu --all-targets --
+      -D warnings` — clean (exit 0)
+    - `cargo check --target x86_64-pc-windows-msvc` — passed
+      (exit 0)
+    - `cargo build --release --target x86_64-pc-windows-gnu` —
+      passed (exit 0); `VeloEdit.exe` 762,880 bytes, SHA-256
+      `1f2d16594e888b3affc9393f93c37a0c5f5103aa4d0ef85b52d8f34402f92ff2`
+  - Honest status: both features are compile-verified only. The
+    Ctrl+wheel branch and the whole menu-preview flow
+    (MENUSELECT ordering, EXITMENULOOP/CANCELMODE restore, check
+    marks after dismissal) depend on the real Windows menu
+    message sequence and are Unverified until the owner's machine
+    runs them.
+
 ## Known gaps (honest list)
 
 - The installers have been *built* by the release workflow and their
