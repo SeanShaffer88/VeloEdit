@@ -25,7 +25,12 @@
 //! pointer targets and the jump history ([`pointers`]), log time
 //! deltas ([`timedeltas`]) and the delimiter grid ([`delimited`]).
 //! Slice R4c adds rebindable keys ([`keybindings`]) and the
-//! block-level structural diff ([`structdiff`]).
+//! block-level structural diff ([`structdiff`]). The roadmap R5a
+//! cores add the streaming regex engine ([`regex`]), binary
+//! templates ([`templates`]), the line diff ([`linediff`]), the
+//! x86-64 disassembly length decoder ([`disasm`]), the
+//! external-tools protocol ([`exttools`]) and multi-range /
+//! rectangular editing on the undo stack ([`undo`]).
 //!
 //! Unsafe policy (PROJECT_RULES.md): the crate root is
 //! `#![deny(unsafe_code)]`, and the only modules allowed to opt back in
@@ -41,9 +46,11 @@ pub mod bookmarks;
 pub mod cli;
 pub mod delimited;
 pub mod diff;
+pub mod disasm;
 pub mod editor;
 pub mod encoding;
 pub mod entropy;
+pub mod exttools;
 pub mod filter;
 #[cfg(windows)]
 pub mod gui_win;
@@ -52,6 +59,7 @@ pub mod hexview;
 pub mod inspector;
 pub mod keybindings;
 pub mod line_index;
+pub mod linediff;
 pub mod mapwindow;
 #[cfg(windows)]
 pub mod mmap_win;
@@ -59,12 +67,14 @@ pub mod patch;
 pub mod piece_table;
 pub mod pointers;
 pub mod recovery;
+pub mod regex;
 pub mod save;
 pub mod search;
 pub mod settings;
 pub mod slicing;
 pub mod strings;
 pub mod structdiff;
+pub mod templates;
 pub mod theme;
 pub mod timedeltas;
 pub mod undo;
@@ -333,4 +343,108 @@ pub fn op_structural_diff(
     block_size: u64,
 ) -> structdiff::StructDiffReport {
     structdiff::compare_sources(len_a, read_a, len_b, read_b, block_size)
+}
+
+/// Operation: find every match of a compiled regular expression
+/// in the document (roadmap item 9, R5a core), streaming over
+/// the piece table — the engine is a backtracking-free Pike VM,
+/// so cost stays linear in the document size. See [`regex`].
+pub fn op_find_regex(table: &PieceTable, re: &regex::Regex) -> Vec<(u64, u64)> {
+    re.find_iter(table.len(), |offset, out| table.read_into(offset, out))
+        .collect()
+}
+
+/// Operation: line diff (R5a core, for the side-by-side
+/// streaming diff) — compare two line sources and report the
+/// coalesced differing regions. See [`linediff`] for the
+/// reader contract and the algorithm's stated limits.
+pub fn op_line_diff(
+    left_count: u64,
+    read_left: impl FnMut(u64, &mut Vec<u8>) -> bool,
+    right_count: u64,
+    read_right: impl FnMut(u64, &mut Vec<u8>) -> bool,
+) -> linediff::LineDiffReport {
+    linediff::compare_lines(left_count, read_left, right_count, read_right)
+}
+
+/// Operation: lay a binary template over the document at `base`
+/// and report every field's offset, size and decoded value
+/// (roadmap item 17, R5a core). See [`templates`].
+pub fn op_apply_template(
+    table: &PieceTable,
+    set: &templates::TemplateSet,
+    name: &str,
+    base: u64,
+) -> Result<templates::AppliedStruct, templates::ApplyError> {
+    set.apply(name, base, |offset, out| table.read_into(offset, out))
+}
+
+/// Operation: apply a multi-range edit as ONE undoable history
+/// entry (R5a core — the multi-cursor primitive). See
+/// [`undo::UndoStack::do_multi_replace`] for the ordering and
+/// validation rules.
+pub fn op_multi_replace(
+    table: &mut PieceTable,
+    history: &mut UndoStack,
+    edits: &[undo::RangeEdit],
+) -> Result<Option<undo::EditAction>, undo::MultiEditError> {
+    history.do_multi_replace(table, edits)
+}
+
+/// Operation: extract a byte-column rectangle from a line range
+/// (R5a core). `line_starts` is the byte offset of each line's
+/// first byte. See [`undo::rect_extract`].
+pub fn op_rect_extract(
+    table: &PieceTable,
+    line_starts: &[u64],
+    first_line: usize,
+    last_line: usize,
+    col_start: usize,
+    col_end: usize,
+) -> Result<Vec<Vec<u8>>, undo::RectError> {
+    undo::rect_extract(
+        table,
+        line_starts,
+        first_line,
+        last_line,
+        col_start,
+        col_end,
+    )
+}
+
+/// Operation: delete a byte-column rectangle from a line range
+/// as ONE undoable history entry (R5a core). See
+/// [`undo::UndoStack::do_rect_delete`].
+pub fn op_rect_delete(
+    table: &mut PieceTable,
+    history: &mut UndoStack,
+    line_starts: &[u64],
+    first_line: usize,
+    last_line: usize,
+    col_start: usize,
+    col_end: usize,
+) -> Result<Option<undo::EditAction>, undo::RectError> {
+    history.do_rect_delete(
+        table,
+        line_starts,
+        first_line,
+        last_line,
+        col_start,
+        col_end,
+    )
+}
+
+/// Operation: insert bytes at one byte column on every line of
+/// a range as ONE undoable history entry (R5a core). See
+/// [`undo::UndoStack::do_rect_insert`].
+pub fn op_rect_insert(
+    table: &mut PieceTable,
+    history: &mut UndoStack,
+    line_starts: &[u64],
+    first_line: usize,
+    last_line: usize,
+    col: usize,
+    bytes: &[u8],
+) -> Result<Option<undo::EditAction>, undo::RectError> {
+    history.do_rect_insert(table, line_starts, first_line, last_line, col, bytes)
 }
