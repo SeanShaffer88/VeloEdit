@@ -16,8 +16,8 @@ the hand-written CLI with the V2.0 global flags.
 All owner-confirmed v1 features are now built: search/replace and text
 encodings (UTF-8, UTF-16 LE/BE, ANSI, with BOM detection) landed in
 Slice 2; Windows mmap backing and the atomic save pipeline in Slice 3;
-the Win32 + Direct2D interface, the editor state machine, the 18-theme
-library, portable settings, and crash recovery in Slice 4; the §6
+the Win32 + Direct2D interface, the editor state machine, the theme
+library (20 themes since roadmap slice R1), portable settings, and crash recovery in Slice 4; the §6
 packaging (NSIS + WiX scripts and the tag-triggered release workflow)
 in Slice 5. What remains unbuilt is any release itself — creating one
 is the owner's call — and every Windows-runtime verification.
@@ -28,7 +28,7 @@ is the owner's call — and every Windows-runtime verification.
 | --- | --- | --- |
 | Architecture & foundation | 4 | Frozen module layout in `PROJECT_RULES.md`; original-bytes seam (`OriginalBuffer`) now carries the Windows mmap backing with no API change; B-tree target documented where the Vec stands in |
 | Correctness (core operations) | 4 | Insert/delete/coalescence, multi-piece reads, undo/redo layout restoration, line checkpoints, hex/scroll math, diff counting, encoding detection/decode/encode, boundary-spanning search, single-undo replace-all, and the atomic save round trips (including both staged failure paths) are all covered by unit tests that exercise the real code paths |
-| Tests | 4 | 150 unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4: editor state machine, the 18 themes incl. WCAG contrast, settings incl. corruption handling), host gate fully green (see below). Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
+| Tests | 4 | 165 unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1: editor state machine, the 20 themes incl. WCAG contrast, settings incl. corruption handling, undo byte-budget trimming, the extract command and the standard exit codes), host gate fully green (see below). Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
 | Reliability & data safety | 4 | Undo never touches the append buffer; deletes return their removed pieces; `--clean` is guarded to the adjacent `data/` folder and tested. The atomic save safety path (SPEC §5.1) is implemented and covered by host tests for the success, replace, empty, staging-failure and swap-failure cases, with the table provably unchanged after a failed save; its Windows runtime behaviour (real `ReplaceFileW` under a live mapping) is still Unverified — see Known gaps |
 | Performance (SPEC §8 budgets) | Unverified | Host proxies are now measured and recorded in `docs/BENCHMARKS.md` (200 MB diff median 330 ms, find 1073 ms, save-copy 466 ms, `--version` start proxy median 1.07 ms, all Linux host build) — evidence about the core only. Every §8 metric itself (cold start <50 ms, 100 GB open <100 ms, <15 MB idle / <35 MB active, <16 ms frame) is a Windows measurement and remains a target, not a result |
 | Security & privacy | 4 | 100% offline, zero telemetry by construction (no network code at all); crate root is `#![deny(unsafe_code)]` with `unsafe` confined to `src/mmap_win.rs`, `src/gui_win.rs` and the Windows half of `src/save.rs`, every block carrying a `// SAFETY:` comment (PROJECT_RULES.md confinement rule); the only dependency crate is `windows-sys`, gated to `cfg(windows)` |
@@ -242,6 +242,130 @@ scored from real Windows evidence before any release.
     interaction (typing, opening a file's contents, find bar,
     theme switching) is still being exercised by the owner.
 
+- Design-fidelity slice (v1.0.1, 2026-10-31) — the GUI was brought
+  in line with the design mockup:
+  - Matched: a dark title bar through the Desktop Window Manager
+    (immersive dark mode, caption and caption-text colours from
+    the theme, reapplied on every theme change) with the document
+    file name in the title; a 2 DIP accent strip at the top of the
+    client area, with all client layout shifted below it; a Search
+    menu (Find / Replace / Find Next / Find Previous, with F3 and
+    Shift+F3 wired as accelerators); flat owner-drawn buttons with
+    a 1 px theme-line border on the toolbar and find bar, the old
+    single mode button replaced by Text / Hex toggles anchored to
+    the right of the toolbar with the active mode drawn in accent
+    text and border; "Find:" / "Replace:" labels and borderless
+    themed edit fields on the find bar; a custom-drawn scrollbar
+    (10 DIP panel-coloured track, accent thumb with a 24 DIP
+    minimum, thumb dragging and track paging — the OS scrollbar
+    and its SetScrollInfo sync are gone; the geometry helpers are
+    unit-tested); a two-part status bar (caret position and
+    selection size on the left; encoding, line-ending style and
+    human size on the right — the EOL style is detected from the
+    first 64 KB at open, and sizes are exact under 1 KB with one
+    decimal above); all find matches washed with the match colour
+    and the current match outlined in the accent colour
+    (DrawRectangle, vtable slot 16); the current line's number
+    and the caret row's hex address in the accent colour.
+  - Deliberate differences from the mockup: the window frame, the
+    menu bar and the caption buttons remain the operating
+    system's (the mockup draws them as custom chrome), so the
+    accent strip sits at the top of the client area, below the
+    real menu bar; and the find fields keep the editor-background
+    brush instead of the panel brush so a borderless field stays
+    visible against the find bar.
+  - Runtime appearance is Unverified until a field run on a real
+    Windows machine shows it, like the rest of the GUI before its
+    first field verification.
+
+- 2026-11-01, roadmap slice R1 (quick wins: items 5, 45, 46, 6, 21,
+  44, 35, 26/27), built locally on the development host; NOT
+  published — v1.0.1 remains held by the owner:
+  - (#5) Disk-space pre-check: `save::space_needed` (document length
+    + 5%) is checked before the streaming phase of both the editor
+    save (`PieceTable::save_to_with_options`) and `--save-copy`
+    (`save::save_atomic`); on Windows the target directory is
+    queried with `GetDiskFreeSpaceExW` and a short disk refuses the
+    save before anything is written, with the needed/free figures
+    in the message. A failed query fails open (the save proceeds as
+    before). Helper math is unit-tested; the Windows query path is
+    compile-verified only.
+  - (#45) Standard exit codes everywhere: 0 success (find: ≥1
+    match; diff: identical), 1 find-nothing / diff-differ, 2 usage
+    or I/O error. Every `run()` and sub-runner return path was
+    audited (parse errors, clean, diff, find, save-copy, extract,
+    and the no-GUI-build fallthrough, which stays 2). HELP, README
+    and PARITY state the same scheme. Host smoke test on the built
+    binary: find match 0 / no-match 1, diff identical 0 / differ 1,
+    bad flag 2.
+  - (#46) `attach_parent_console` now also sets the console input
+    and output code pages to UTF-8 (65001) after attaching; results
+    ignored, SAFETY comment covers all three calls.
+  - (#6) Configurable undo: settings keys `undo_limit` (default
+    1024, clamped 16..=65536) and `undo_byte_budget_mb` (default
+    256, clamped 1..=4096), parsed/serialised with the other keys.
+    `UndoStack::with_limits` tracks the summed payload bytes of the
+    stored deltas (kept incrementally) and trims the oldest entries
+    when either bound is exceeded; the newest entry is never
+    trimmed. `Editor::set_undo_limits` applies them; the shell
+    passes the settings values for the startup editor and every
+    opened document. Unit tests cover oldest-first trimming, the
+    never-empty guarantee, and the editor-level wiring.
+  - (#21) Column ruler: settings key `ruler_column` (default 0 =
+    off); View ▸ Column Ruler cycles Off → 80 → 120 → Off (check
+    mark when on, persisted). The paint pass draws a 1-DIP line in
+    the theme line colour at gutter + text padding + column ×
+    character width — the same x-grid as the caret — in text mode
+    only, when it falls inside the editor area. Compile-verified;
+    runtime Unverified.
+  - (#44) `extract` subcommand: `VeloEdit extract <file> --start N
+    --length M --out DEST`; the input comes from the normal file
+    argument, numbers parse via the tested `cli::parse_u64`
+    (decimal or 0x-hex), the range streams in 4 MB chunks through
+    `save::write_table_range` (clamped; a start beyond EOF exits 2
+    before any output file is created). HELP + README documented;
+    run-level tests carve, clamp and refuse.
+  - (#35) File ▸ Save Selection to File…: enabled only when a
+    selection exists (the WM_INITMENUPOPUP grey pattern), shows the
+    existing save dialog, and streams the selection through
+    `Editor::save_selection_to` → `save::write_range_to_file`
+    (range validated before the file is created). Round-trip tested
+    at the save and editor levels; the dialog wiring is
+    compile-verified only.
+  - (#26/27) Themes 19/20: "High Contrast" (pure black background
+    and panel, white text, yellow accent, grey muted/line) and
+    "E-ink" (paper #F5F1E8, near-black text, restrained dark blue
+    accent), appended in the existing `build(...)` pattern; both
+    pass the WCAG AA text-on-background test (21:1 and ~15:1). The
+    theme-count tests now pin 20. Accent presets gain the
+    colour-blind-safe Okabe Blue #0072B2, Okabe Orange #E69F00 and
+    Okabe Sky #56B4E9 (11 total); the Custom… menu id is now derived
+    from the preset count instead of a hard-coded offset. README,
+    PARITY, the in-app guide and the menu comments say 20 themes.
+  - Gate, run locally on the development host (true exit codes):
+    - `cargo fmt --all` + `cargo fmt --all --check` — clean (exit 0)
+    - `cargo test` — **165 passed, 0 failed** (exit 0; 150 → 165,
+      +15 new tests across settings, undo, save, editor, theme, cli)
+    - `cargo clippy --all-targets -- -D warnings` (host) — clean
+      (exit 0)
+    - `cargo clippy --target x86_64-pc-windows-gnu --all-targets --
+      -D warnings` — clean (exit 0; one Windows-only lint,
+      `io_other_error`, was found by this run and fixed)
+    - `cargo check --target x86_64-pc-windows-msvc` — passed
+      (exit 0)
+    - `cargo build --release --target x86_64-pc-windows-gnu` —
+      passed (exit 0); `VeloEdit.exe` 680,960 bytes, SHA-256
+      `cea13ca513a0c233adcfea24eb2344ad60294dfd0de1a6a4eeb473071bd082b6`,
+      PE subsystem 2 (Windows GUI); the new feature strings (theme
+      names, menu labels, the disk-space message) are present in the
+      binary.
+  - Honest status: every GUI-facing item (ruler paint, the two new
+    menu items and their enable/check behaviour, the undo-limit
+    wiring in the shell, the UTF-8 console switch, the Windows
+    disk-space query) is compile-verified only. Runtime behaviour
+    is Unverified until the owner's Windows machine runs it, as with
+    every GUI slice before its field run.
+
 ## Known gaps (honest list)
 
 - The installers have been *built* by the release workflow and their
@@ -254,8 +378,11 @@ scored from real Windows evidence before any release.
   slice, so point lookups are O(N) in the number of pieces for now.
 - The line-index scan is a plain chunked scan; the SIMD inner loop
   (SPEC §3.1) replaces `count_newlines_in` later without API change.
-- Undo history cap (1024 entries) is a documented placeholder; the
-  blueprint requires memory-constrained history but names no number.
+- Undo history bounds are owner settings since roadmap slice R1
+  (`undo_limit` steps, default 1024; `undo_byte_budget_mb`, default
+  256 MB of stored deltas). The defaults are the shipped choice —
+  the blueprint requires memory-constrained history but names no
+  numbers, and no field evidence has asked for different ones yet.
 - **External-truncation risk on mapped files (by design, SPEC §2.1):**
   the Windows backing opens the file with share modes that let other
   processes write it. If another process truncates the file while it is
