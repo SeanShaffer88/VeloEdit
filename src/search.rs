@@ -180,6 +180,10 @@ pub fn find_in_window(
     let mut tail: Vec<u8> = Vec::new();
     let mut tail_start: u64 = start;
     let mut slice_pos: u64 = 0;
+    // Scan window, refilled per slice and reused across slices
+    // (architectural audit): this used to be a fresh allocation of
+    // tail + slice length for every piece the scan touched.
+    let mut window: Vec<u8> = Vec::new();
     for slice in table.iter_slices() {
         let slice = slice.as_ref();
         let slice_end = slice_pos + slice.len() as u64;
@@ -188,7 +192,7 @@ pub fn find_in_window(
         let hi = scan_end.min(slice_end);
         if lo < hi {
             let part = &slice[(lo - slice_pos) as usize..(hi - slice_pos) as usize];
-            let mut window: Vec<u8> = Vec::with_capacity(tail.len() + part.len());
+            window.clear();
             window.extend_from_slice(&tail);
             window.extend_from_slice(part);
             let window_start = tail_start;
@@ -247,13 +251,17 @@ fn collect_matches(
     let mut tail: Vec<u8> = Vec::new();
     let mut tail_start: u64 = 0;
     let mut suppress_until: u64 = 0;
+    // Scan window, refilled per slice and reused across slices
+    // (architectural audit): this used to be a fresh allocation of
+    // tail + slice length for every piece the scan touched.
+    let mut window: Vec<u8> = Vec::new();
 
     for slice in table.iter_slices() {
         let slice = slice.as_ref();
         if slice.is_empty() {
             continue;
         }
-        let mut window: Vec<u8> = Vec::with_capacity(tail.len() + slice.len());
+        window.clear();
         window.extend_from_slice(&tail);
         window.extend_from_slice(slice);
         let window_start = tail_start;
@@ -357,6 +365,14 @@ pub struct MaskedPattern {
     pairs: Vec<(u8, u8)>,
 }
 
+// Layout pin (architectural audit): the pattern's storage is exactly
+// two bytes per pattern byte — the compact representation the masked
+// scan's per-byte compare assumes. The tuple is not `repr(transparent)`
+// (a tuple cannot carry the attribute); the pin states the same
+// guarantee the attribute would: the element is `(u8, u8)` and nothing
+// more, so `pairs` is a flat 2-bytes-per-byte array.
+const _: () = assert!(std::mem::size_of::<(u8, u8)>() == 2);
+
 impl MaskedPattern {
     /// Number of bytes in the pattern.
     pub fn len(&self) -> usize {
@@ -439,18 +455,23 @@ pub fn find_masked_all(
     let mut results: Vec<u64> = Vec::new();
     let mut tail: Vec<u8> = Vec::new();
     let mut tail_start: u64 = 0;
+    // Scan window and candidate-start list, refilled per slice and
+    // reused across slices (architectural audit): both used to be
+    // fresh allocations for every piece the scan touched.
+    let mut window: Vec<u8> = Vec::new();
+    let mut starts: Vec<usize> = Vec::new();
     for slice in table.iter_slices() {
         let slice = slice.as_ref();
         if slice.is_empty() {
             continue;
         }
-        let mut window: Vec<u8> = Vec::with_capacity(tail.len() + slice.len());
+        window.clear();
         window.extend_from_slice(&tail);
         window.extend_from_slice(slice);
         let window_start = tail_start;
         if window.len() >= n {
             let last_start = window.len() - n;
-            let mut starts: Vec<usize> = Vec::new();
+            starts.clear();
             match anchor {
                 Some(a) => {
                     let target = pattern.pairs()[a].0;
@@ -477,7 +498,7 @@ pub fn find_masked_all(
                 }
                 None => starts.extend(0..=last_start),
             }
-            for i in starts {
+            for &i in &starts {
                 if pattern.matches_at(&window[i..i + n]) {
                     results.push(window_start + i as u64);
                     if results.len() >= limit {
