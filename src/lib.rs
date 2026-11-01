@@ -15,7 +15,10 @@
 //! GUI-independent editor state machine ([`editor`]), the built-in
 //! theme library ([`theme`]), portable settings ([`settings`]) and the
 //! Win32 / Direct2D shell ([`gui_win`], Windows only). On Windows, the
-//! read-only memory-mapped file backing lives in [`mmap_win`].
+//! read-only memory-mapped file backing lives in [`mmap_win`]. The
+//! roadmap R3 cores add hand-written streaming hashes ([`hash`]), the
+//! data inspector's byte readings ([`inspector`]), per-file bookmarks
+//! ([`bookmarks`]) and delta-log crash recovery ([`recovery`]).
 //!
 //! Unsafe policy (PROJECT_RULES.md): the crate root is
 //! `#![deny(unsafe_code)]`, and the only modules allowed to opt back in
@@ -27,17 +30,21 @@
 
 #![deny(unsafe_code)]
 
+pub mod bookmarks;
 pub mod cli;
 pub mod diff;
 pub mod editor;
 pub mod encoding;
 #[cfg(windows)]
 pub mod gui_win;
+pub mod hash;
 pub mod hexview;
+pub mod inspector;
 pub mod line_index;
 #[cfg(windows)]
 pub mod mmap_win;
 pub mod piece_table;
+pub mod recovery;
 pub mod save;
 pub mod search;
 pub mod settings;
@@ -186,6 +193,37 @@ pub fn op_replace_all(
     options: &search::SearchOptions,
 ) -> search::ReplaceReport {
     search::replace_all(table, history, needle, replacement, options)
+}
+
+/// Operation: find the occurrences of `needle` starting inside the
+/// window `[start, end)` (roadmap item 10) — the incremental form a
+/// background worker drives window by window; concatenated over
+/// consecutive windows it equals [`op_find_all`].
+pub fn op_find_in_window(
+    table: &PieceTable,
+    needle: &[u8],
+    options: &search::SearchOptions,
+    start: u64,
+    end: u64,
+) -> Vec<u64> {
+    search::find_in_window(table, needle, options, start, end)
+}
+
+/// Operation: read the bytes at a position as inspector values —
+/// integers and floats in both byte orders, hex/binary renderings,
+/// and Unix-timestamp readings (roadmap item 15).
+pub fn op_inspect(bytes: &[u8]) -> inspector::InspectorReport {
+    inspector::inspect(bytes)
+}
+
+/// Operation: hash a byte source with MD5, SHA-1, and SHA-256,
+/// streamed through fixed-size windows (roadmap item 37). `read_at`
+/// follows the contract of [`hash::hash_byte_source`].
+pub fn op_hash_byte_source(
+    total: u64,
+    read_at: impl FnMut(u64, &mut [u8]) -> usize,
+) -> hash::FileHashes {
+    hash::hash_byte_source(total, read_at)
 }
 
 /// Operation: split a file into fixed-size parts, streamed (roadmap
