@@ -288,6 +288,62 @@ release asset naming in the specification.
 - Scrollbar tick previews (window): resting the pointer on the
   scrollbar where a match or bookmark tick sits shows a tooltip
   with the line number and the start of that line.
+- Extended code pages: the new Encoding menu re-reads the
+  document under UTF-8, UTF-16 LE / BE or ANSI, and its Code
+  Pages submenu adds Shift-JIS (932), GBK (936), EUC-KR (949),
+  ISO-8859-1 (28591), ISO-8859-15 (28605), Windows-1250 and
+  Windows-1251 for files written by older or regional programs.
+  The status bar names the page in use (for example CP932);
+  typing and saving convert back through the same page.
+  Conversion is lossy where a page cannot represent a
+  character: a replacement mark on decode, "?" on encode.
+- Extract Ranges: File ▸ Extract Ranges… copies chosen byte
+  ranges (0-1023, 0x1000-0x1FFF) and line ranges (L10-L20) of
+  the document into a new file, in order, separated by ";" —
+  also headless as `--slice "<spec>" --out <path>`.
+- Delta patches: File ▸ Export Delta Patch… writes a small
+  VELOPAT1 patch holding only the current edits against the
+  file on disk; File ▸ Apply Patch… applies a patch to the
+  current document's file and writes the result to a new file
+  (the base is never overwritten). Headless forms:
+  `--export-patch <path>` and `--apply-patch <patch> --out
+  <path>`.
+- Insert Zeroes: Edit ▸ Insert Zeroes… adds a run of zero bytes
+  at the caret (a count, or a K / M / G size) as one undo step;
+  headless `--insert-zeroes <count> [--at <offset>]` edits a
+  file in place through the atomic save.
+- Bookmark colours and notes: a bookmark can carry one of six
+  colours and a short note (right-click its gutter square, or
+  Search ▸ Bookmarks ▸ Edit Bookmark…). The gutter square and
+  scrollbar tick draw in the colour, and jumping to a noted
+  bookmark shows the note in the status bar. Annotations live
+  in the same `data/bookmarks.json`; older store files load
+  unchanged.
+- Compare With: File ▸ Compare With… compares the document
+  with another file block by block (1 MB blocks, SHA-256) on a
+  worker and lists the regions that differ, with a Go to that
+  jumps the caret; headless `--compare <other>` prints the
+  regions and exits 1 when the files differ.
+- Keyboard shortcuts can be rebound: `data/keybindings.json`
+  maps action names ("find", "save", "toggle_hex", …) to chord
+  strings ("Ctrl+Shift+F"); menu labels show the effective
+  chords, an empty string unbinds, and a file with mistakes
+  falls back to the defaults for the actions concerned with a
+  one-line status note at startup. The Built-in Guide lists
+  every action and its default.
+- Read-only files: a file with the read-only mark opens with
+  "(read-only)" in the title and "Read-only file" in the
+  status bar; Save explains and offers Save a Copy… instead of
+  failing. File ▸ Open as Administrator relaunches the program
+  with full rights on the same file, explaining before the
+  Windows prompt appears.
+- Two new settings-file keys: `map_window_mb` (0 = map the
+  whole file, the default; 512 / 1024 / 2048 / 4096 read the
+  open-path samples through a moving mapped window) and
+  `fast_save_clone` (off by default; when on, an in-place save
+  reuses the file's unchanged extents where the drive supports
+  it and silently falls back to the normal save when it
+  cannot).
 
 ### Changed
 
@@ -336,6 +392,17 @@ release asset naming in the specification.
   the standard size, updated live by the font commands and
   Ctrl+mouse-wheel) and keeps clear space at both ends of the
   window.
+- Filter view on large files: the filter now opens at once and
+  fills in as a background worker scans the document — the
+  status bar reads "Filtering… NN%" until the build lands, and
+  leaving the filter or opening another document cancels it.
+  Documents under 4 MB still build in one step.
+- Filter prompt: confirming with an empty pattern now leaves
+  the filter view (before, it did nothing); Search ▸ Clear
+  Filter does the same and is enabled only while filtering.
+- File Hashes dialog: the CRC32 and xxHash64 checksums join
+  MD5, SHA-1 and SHA-256 in the same worker pass, and the
+  compare box checks pasted text against all five.
 
 ## [1.0.1] — Unreleased
 
