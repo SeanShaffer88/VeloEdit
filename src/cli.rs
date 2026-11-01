@@ -23,6 +23,7 @@ VeloEdit 0.1.0 — portable binary and large-file editor (Windows 11, 64-bit)
 USAGE:
     VeloEdit.exe [OPTIONS] [FILE]
     VeloEdit.exe --diff <A> <B> [--output <REPORT>] [--headless]
+    VeloEdit.exe extract <FILE> --start <N> --length <M> --out <DEST>
 
 OPEN A FILE IN THE GRAPHICAL EDITOR (Windows):
     FILE                  File to open (memory-mapped; huge files open fast)
@@ -37,9 +38,10 @@ HEADLESS OPERATIONS:
     --find <TEXT>         Find TEXT in FILE and print the result as JSON:
                           {\"count\":N,\"offsets\":[...]} — byte offsets, at
                           most 1000 listed (with \"truncated\":true when
-                          capped). Exit code is 0 whether or not anything
-                          matches. Runs headless; combine with --headless
-                          as in: VeloEdit.exe notes.txt --find TODO --headless
+                          capped). Exit code is 0 when at least one match
+                          is found, 1 when nothing matches. Runs headless;
+                          combine with --headless as in:
+                          VeloEdit.exe notes.txt --find TODO --headless
     --encoding <NAME>     Encoding used to read FILE for --find:
                           utf8 | utf16le | utf16be | ansi
                           (default: detect from the file's first 64 KB,
@@ -52,6 +54,15 @@ HEADLESS OPERATIONS:
                           DEST must differ from FILE; FILE itself is
                           never modified. With --output <PATH> the JSON
                           report is also written to PATH.
+    extract <FILE>        Copy one byte range of FILE to another file:
+    --start <N>           first byte of the range (default 0); <N> and
+    --length <M>          <M> are decimal or 0x-hex numbers. --length
+    --out <DEST>          defaults to the rest of the file. The range is
+                          clamped to the file; a --start beyond the end
+                          of the file is an error (exit 2). The bytes are
+                          streamed in 4 MB chunks, so huge files are
+                          fine. With --json the report is
+                          {\"start\":N,\"bytes_written\":M}.
 
 CLEANUP:
     --clean               Remove the portable data folder next to the program
@@ -68,10 +79,12 @@ GLOBAL FLAGS:
     --version             Show the version
 
 EXIT CODES:
-    0   Success (for --diff: the files are identical)
-    1   An error occurred (bad arguments, unreadable file, failed write)
-    2   The GUI was requested but this platform build has no window code
-    3   For --diff: the files differ
+    0   Success (for --find: at least one match; for --diff: the files
+        are identical)
+    1   For --find: nothing matched. For --diff: the files differ
+    2   An error occurred (bad arguments, unreadable file, failed
+        write) — also used when the GUI was requested but this
+        platform build has no window code
 
 VeloEdit works fully offline and writes only to the data folder next to the
 program file. It never writes to %APPDATA% or the registry.
@@ -99,6 +112,13 @@ pub struct CliOptions {
     pub find: Option<String>,
     pub encoding: Option<TextEncoding>,
     pub save_copy: Option<PathBuf>,
+    /// The `extract` subcommand was given (roadmap item 44): stream
+    /// the byte range `extract_start`..+`extract_length` of `file`
+    /// to `extract_out`.
+    pub extract: bool,
+    pub extract_start: Option<u64>,
+    pub extract_length: Option<u64>,
+    pub extract_out: Option<PathBuf>,
     pub headless: bool,
     pub json: bool,
     pub silent: bool,
@@ -112,7 +132,8 @@ pub struct CliOptions {
     pub version: bool,
 }
 
-/// A command-line problem, reported in plain words with exit code 1.
+/// A command-line problem, reported in plain words with exit code 2
+/// (the standard scheme documented in [`HELP`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CliError {
     pub message: String,
@@ -126,9 +147,39 @@ impl CliError {
     }
 }
 
+/// Parse a whole number written in decimal or as `0x`/`0X` hex
+/// (roadmap item 44: `extract --start` / `--length`, and `--line`).
+/// Surrounding spaces are ignored; anything else — signs, empty text,
+/// a bare `0x`, values past u64 — is an error, never a guess.
+pub fn parse_u64(text: &str) -> Result<u64, CliError> {
+    let trimmed = text.trim();
+    let parsed = match trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        Some(hex) if !hex.is_empty() => u64::from_str_radix(hex, 16),
+        _ => trimmed.parse::<u64>(),
+    };
+    parsed.map_err(|_| {
+        CliError::new(format!(
+            "'{text}' is not a whole number (decimal or 0x-hex)"
+        ))
+    })
+}
+
 /// Parse arguments (without the program name) by hand.
 pub fn parse_args(args: &[String]) -> Result<CliOptions, CliError> {
     let mut opts = CliOptions::default();
+    // The `extract` subcommand (roadmap item 44) is a leading word,
+    // not a flag: `VeloEdit extract FILE --start N --length M --out
+    // DEST`. The input file then arrives through the normal file
+    // argument, exactly like the other headless operations.
+    let args: &[String] = if args.first().map(String::as_str) == Some("extract") {
+        opts.extract = true;
+        &args[1..]
+    } else {
+        args
+    };
     let mut i = 0;
     let mut positional_only = false;
     while i < args.len() {
@@ -159,9 +210,29 @@ pub fn parse_args(args: &[String]) -> Result<CliOptions, CliError> {
             "--uninstall" => opts.uninstall = true,
             "--line" => {
                 let value = take_value(args, &mut i, inline_value, "--line")?;
-                opts.line = Some(value.parse::<u64>().map_err(|_| {
+                opts.line = Some(parse_u64(&value).map_err(|_| {
                     CliError::new(format!("--line needs a whole number, got '{value}'"))
                 })?);
+            }
+            "--start" => {
+                let value = take_value(args, &mut i, inline_value, "--start")?;
+                opts.extract_start = Some(parse_u64(&value).map_err(|_| {
+                    CliError::new(format!(
+                        "--start needs a whole number (decimal or 0x-hex), got '{value}'"
+                    ))
+                })?);
+            }
+            "--length" => {
+                let value = take_value(args, &mut i, inline_value, "--length")?;
+                opts.extract_length = Some(parse_u64(&value).map_err(|_| {
+                    CliError::new(format!(
+                        "--length needs a whole number (decimal or 0x-hex), got '{value}'"
+                    ))
+                })?);
+            }
+            "--out" => {
+                let value = take_value(args, &mut i, inline_value, "--out")?;
+                opts.extract_out = Some(PathBuf::from(value));
             }
             "--mode" => {
                 let value = take_value(args, &mut i, inline_value, "--mode")?;
@@ -307,12 +378,20 @@ pub fn clean_data_dir(exe_dir: &Path, dry_run: bool) -> Result<CleanReport, Stri
 /// Run the program for already-collected arguments (without the program
 /// name) and return the process exit code documented in [`HELP`].
 pub fn run(args: &[String]) -> i32 {
+    // Before anything can print (including argument errors): on
+    // Windows, borrow the parent terminal's console for this run —
+    // the binary is GUI-subsystem, so it has no console of its own
+    // (the call lives in gui_win, the crate's unsafe-sanctioned
+    // Windows module).
+    #[cfg(windows)]
+    crate::gui_win::attach_parent_console();
+
     let opts = match parse_args(args) {
         Ok(opts) => opts,
         Err(err) => {
             eprintln!("VeloEdit: {}", err.message);
             eprintln!("Run VeloEdit --help for usage.");
-            return 1;
+            return 2;
         }
     };
 
@@ -327,6 +406,10 @@ pub fn run(args: &[String]) -> i32 {
 
     if opts.clean || opts.uninstall {
         return run_clean(&opts);
+    }
+
+    if opts.extract {
+        return run_extract(&opts);
     }
 
     if let Some((path_a, path_b)) = &opts.diff {
@@ -365,8 +448,9 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 /// Headless `--find`: report every offset of the needle in the file as
-/// JSON and exit 0 (also when nothing matches — a search that finds
-/// nothing is a successful search).
+/// JSON. Exit codes follow the standard scheme (roadmap item 45): 0
+/// when at least one match was found, 1 when nothing matched, 2 on
+/// any usage or I/O error.
 ///
 /// This headless tool path reads the file with `std::fs::read` and builds
 /// an in-memory piece table over the bytes. That is deliberately *not*
@@ -378,13 +462,13 @@ fn run_find(opts: &CliOptions) -> i32 {
     let needle_text = opts.find.as_deref().unwrap_or_default();
     let Some(path) = &opts.file else {
         eprintln!("VeloEdit: --find needs a file to search: VeloEdit.exe <FILE> --find <TEXT>");
-        return 1;
+        return 2;
     };
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(e) => {
             eprintln!("VeloEdit: could not read {}: {e}", path.display());
-            return 1;
+            return 2;
         }
     };
     // Encoding: forced by --encoding, otherwise detected from the first
@@ -405,7 +489,7 @@ fn run_find(opts: &CliOptions) -> i32 {
                 "VeloEdit: could not encode the search text as {}: {e}",
                 enc.name()
             );
-            return 1;
+            return 2;
         }
     };
     let table = PieceTable::from_original(bytes);
@@ -432,13 +516,19 @@ fn run_find(opts: &CliOptions) -> i32 {
     if let Some(output) = &opts.output {
         if let Err(e) = std::fs::write(output, json.clone() + "\n") {
             eprintln!("VeloEdit: could not write {}: {e}", output.display());
-            return 1;
+            return 2;
         }
     }
     if !opts.silent {
         println!("{json}");
     }
-    0
+    // The standard scheme: a search that found nothing is a
+    // successful run with a "no" answer — exit 1, not an error.
+    if total > 0 {
+        0
+    } else {
+        1
+    }
 }
 
 /// Load a file as a piece table for the headless `--save-copy` tool:
@@ -462,7 +552,7 @@ fn load_table_for_copy(path: &Path) -> Result<PieceTable, String> {
 
 /// Headless `--save-copy`: save a copy of FILE to the destination with
 /// the atomic save pipeline (`crate::save::save_atomic`) and report the
-/// result; exit 0 on success, 1 on any error.
+/// result; exit 0 on success, 2 on any error.
 ///
 /// The destination must differ from the source: saving a file *over
 /// itself* is the editor's save operation (which closes our mapping of
@@ -475,20 +565,20 @@ fn run_save_copy(opts: &CliOptions) -> i32 {
         eprintln!(
             "VeloEdit: --save-copy needs a file to copy: VeloEdit.exe <FILE> --save-copy <DEST>"
         );
-        return 1;
+        return 2;
     };
     if dest == path.as_path() {
         eprintln!(
             "VeloEdit: --save-copy destination must differ from the source file ({})",
             path.display()
         );
-        return 1;
+        return 2;
     }
     let table = match load_table_for_copy(path) {
         Ok(table) => table,
         Err(message) => {
             eprintln!("VeloEdit: {message}");
-            return 1;
+            return 2;
         }
     };
     let report = match crate::save::save_atomic(&table, dest, &crate::save::SaveOptions::default())
@@ -496,7 +586,7 @@ fn run_save_copy(opts: &CliOptions) -> i32 {
         Ok(report) => report,
         Err(e) => {
             eprintln!("VeloEdit: could not save copy to {}: {e}", dest.display());
-            return 1;
+            return 2;
         }
     };
     let json = format!(
@@ -506,7 +596,7 @@ fn run_save_copy(opts: &CliOptions) -> i32 {
     if let Some(output) = &opts.output {
         if let Err(e) = std::fs::write(output, json.clone() + "\n") {
             eprintln!("VeloEdit: could not write {}: {e}", output.display());
-            return 1;
+            return 2;
         }
     }
     if !opts.silent {
@@ -524,6 +614,80 @@ fn run_save_copy(opts: &CliOptions) -> i32 {
     0
 }
 
+/// Headless `extract` subcommand (roadmap item 44): stream one byte
+/// range of FILE to `--out`, in 4 MB chunks, and report the result.
+/// Exit 0 on success, 2 on any usage or I/O error. A `--start` beyond
+/// the end of the file is an error and no output file is created; a
+/// `--length` running past the end is clamped to what exists. The
+/// input is opened the same way `--save-copy` opens it (memory-mapped
+/// on Windows), so carving a range out of a huge file loads nothing.
+fn run_extract(opts: &CliOptions) -> i32 {
+    let Some(path) = &opts.file else {
+        eprintln!(
+            "VeloEdit: extract needs a file: VeloEdit.exe extract <FILE> --start <N> --length <M> --out <DEST>"
+        );
+        return 2;
+    };
+    let Some(out_path) = &opts.extract_out else {
+        eprintln!("VeloEdit: extract needs a destination: --out <DEST>");
+        return 2;
+    };
+    if out_path == path {
+        eprintln!(
+            "VeloEdit: extract --out must differ from the input file ({})",
+            path.display()
+        );
+        return 2;
+    }
+    let table = match load_table_for_copy(path) {
+        Ok(table) => table,
+        Err(message) => {
+            eprintln!("VeloEdit: {message}");
+            return 2;
+        }
+    };
+    let start = opts.extract_start.unwrap_or(0);
+    if start > table.len() {
+        eprintln!(
+            "VeloEdit: --start {start} is beyond the end of {} ({} bytes)",
+            path.display(),
+            table.len()
+        );
+        return 2;
+    }
+    let length = opts.extract_length.unwrap_or(table.len() - start);
+    let mut out_file = match std::fs::File::create(out_path) {
+        Ok(file) => file,
+        Err(e) => {
+            eprintln!("VeloEdit: could not create {}: {e}", out_path.display());
+            return 2;
+        }
+    };
+    let written = match crate::save::write_table_range(&table, start, length, &mut out_file) {
+        Ok(written) => written,
+        Err(e) => {
+            eprintln!("VeloEdit: could not write {}: {e}", out_path.display());
+            return 2;
+        }
+    };
+    if let Err(e) = std::io::Write::flush(&mut out_file) {
+        eprintln!("VeloEdit: could not finish {}: {e}", out_path.display());
+        return 2;
+    }
+    if !opts.silent {
+        if opts.json {
+            println!("{{\"start\":{start},\"bytes_written\":{written}}}");
+        } else {
+            println!(
+                "Extracted {written} byte(s) from {} starting at byte {start} to {}.",
+                path.display(),
+                out_path.display()
+            );
+        }
+    }
+    0
+}
+
 fn run_clean(opts: &CliOptions) -> i32 {
     let exe_dir = match std::env::current_exe() {
         Ok(mut path) => {
@@ -532,7 +696,7 @@ fn run_clean(opts: &CliOptions) -> i32 {
         }
         Err(e) => {
             eprintln!("VeloEdit: could not find the program folder: {e}");
-            return 1;
+            return 2;
         }
     };
     match clean_data_dir(&exe_dir, opts.dry_run) {
@@ -557,7 +721,7 @@ fn run_clean(opts: &CliOptions) -> i32 {
         }
         Err(message) => {
             eprintln!("VeloEdit: {message}");
-            1
+            2
         }
     }
 }
@@ -571,13 +735,13 @@ fn run_diff(opts: &CliOptions, path_a: &Path, path_b: &Path) -> i32 {
                 path_a.display(),
                 path_b.display()
             );
-            return 1;
+            return 2;
         }
     };
     if let Some(output) = &opts.output {
         if let Err(e) = std::fs::write(output, report.to_json() + "\n") {
             eprintln!("VeloEdit: could not write {}: {e}", output.display());
-            return 1;
+            return 2;
         }
         if opts.verbose && !opts.silent {
             println!("Wrote {}", output.display());
@@ -604,7 +768,7 @@ fn run_diff(opts: &CliOptions, path_a: &Path, path_b: &Path) -> i32 {
     if report.equal {
         0
     } else {
-        3
+        1
     }
 }
 
@@ -723,17 +887,17 @@ mod tests {
         assert!(written.contains("\"equal\":true"));
 
         std::fs::write(&b, b"different!").unwrap();
-        assert_eq!(run(&args), 3);
+        assert_eq!(run(&args), 1);
         let written = std::fs::read_to_string(&out).unwrap();
         assert!(written.contains("\"equal\":false"));
 
-        // Missing input file is an error, exit 1.
+        // Missing input file is an error, exit 2.
         let missing: Vec<String> = vec![
             "--diff".into(),
             dir.join("nope.bin").to_string_lossy().into_owned(),
             b.to_string_lossy().into_owned(),
         ];
-        assert_eq!(run(&missing), 1);
+        assert_eq!(run(&missing), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -766,9 +930,9 @@ mod tests {
             "--headless".into(),
         ];
         assert_eq!(run(&args), 0);
-        // No matches: still exit 0 (a successful search).
+        // No matches: exit 1 (the search ran fine; the answer is "no").
         let args: Vec<String> = vec![path.clone(), "--find".into(), "absent".into()];
-        assert_eq!(run(&args), 0);
+        assert_eq!(run(&args), 1);
         // Forced encoding works too.
         let args: Vec<String> = vec![
             path.clone(),
@@ -778,16 +942,124 @@ mod tests {
             "utf8".into(),
         ];
         assert_eq!(run(&args), 0);
-        // --find without a file is an error, exit 1.
+        // --find without a file is an error, exit 2.
         let args: Vec<String> = vec!["--find".into(), "TODO".into()];
-        assert_eq!(run(&args), 1);
-        // A missing file is an error, exit 1.
+        assert_eq!(run(&args), 2);
+        // A missing file is an error, exit 2.
         let args: Vec<String> = vec![
             dir.join("nope.txt").to_string_lossy().into_owned(),
             "--find".into(),
             "TODO".into(),
         ];
-        assert_eq!(run(&args), 1);
+        assert_eq!(run(&args), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_u64_accepts_decimal_and_hex() {
+        assert_eq!(parse_u64("0").unwrap(), 0);
+        assert_eq!(parse_u64("42").unwrap(), 42);
+        assert_eq!(parse_u64("0x1000").unwrap(), 4096);
+        assert_eq!(parse_u64("0Xff").unwrap(), 255);
+        assert_eq!(parse_u64(" 17 ").unwrap(), 17);
+        assert!(parse_u64("abc").is_err());
+        assert!(parse_u64("0x").is_err());
+        assert!(parse_u64("-1").is_err());
+        assert!(parse_u64("").is_err());
+        // One past u64::MAX overflows: an error, never a wraparound.
+        assert!(parse_u64("18446744073709551616").is_err());
+    }
+
+    #[test]
+    fn parse_extract_subcommand() {
+        let opts = parse(&[
+            "extract", "big.bin", "--start", "0x1000", "--length", "4096", "--out", "part.bin",
+        ])
+        .unwrap();
+        assert!(opts.extract);
+        assert_eq!(opts.file, Some(PathBuf::from("big.bin")));
+        assert_eq!(opts.extract_start, Some(4096));
+        assert_eq!(opts.extract_length, Some(4096));
+        assert_eq!(opts.extract_out, Some(PathBuf::from("part.bin")));
+        // A plain file open is not an extract.
+        let opts = parse(&["big.bin"]).unwrap();
+        assert!(!opts.extract);
+        // A bad number is a parse error (exit 2 through run()).
+        assert!(parse(&["extract", "big.bin", "--start", "zz"]).is_err());
+    }
+
+    #[test]
+    fn extract_run_carves_and_clamps_ranges() {
+        let dir =
+            std::env::temp_dir().join(format!("veloedit-extract-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        std::fs::write(&src, b"0123456789ABCDEF").unwrap();
+        let out = dir.join("slice.bin");
+        let src_s = src.to_string_lossy().into_owned();
+        let out_s = out.to_string_lossy().into_owned();
+
+        // A plain decimal range lands byte-exact.
+        let args: Vec<String> = vec![
+            "extract".into(),
+            src_s.clone(),
+            "--start".into(),
+            "4".into(),
+            "--length".into(),
+            "6".into(),
+            "--out".into(),
+            out_s.clone(),
+        ];
+        assert_eq!(run(&args), 0);
+        assert_eq!(std::fs::read(&out).unwrap(), b"456789");
+
+        // A hex start, with the length clamped to the end of the file.
+        let args: Vec<String> = vec![
+            "extract".into(),
+            src_s.clone(),
+            "--start".into(),
+            "0xE".into(),
+            "--length".into(),
+            "100".into(),
+            "--out".into(),
+            out_s.clone(),
+        ];
+        assert_eq!(run(&args), 0);
+        assert_eq!(std::fs::read(&out).unwrap(), b"EF");
+
+        // Defaults: no --start/--length copies the whole file.
+        let args: Vec<String> = vec![
+            "extract".into(),
+            src_s.clone(),
+            "--out".into(),
+            out_s.clone(),
+        ];
+        assert_eq!(run(&args), 0);
+        assert_eq!(std::fs::read(&out).unwrap(), b"0123456789ABCDEF");
+
+        // A start beyond the end: exit 2, and no output file appears.
+        let never = dir.join("never.bin");
+        let args: Vec<String> = vec![
+            "extract".into(),
+            src_s.clone(),
+            "--start".into(),
+            "17".into(),
+            "--out".into(),
+            never.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run(&args), 2);
+        assert!(!never.exists());
+
+        // A missing --out and a missing input file are both exit 2.
+        let args: Vec<String> = vec!["extract".into(), src_s.clone()];
+        assert_eq!(run(&args), 2);
+        let args: Vec<String> = vec![
+            "extract".into(),
+            dir.join("nope.bin").to_string_lossy().into_owned(),
+            "--out".into(),
+            out_s.clone(),
+        ];
+        assert_eq!(run(&args), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -826,23 +1098,23 @@ mod tests {
         // No staging file is left behind.
         assert!(!crate::save::staging_path_for(&dest).exists());
 
-        // Destination equal to the source is refused, exit 1.
+        // Destination equal to the source is refused, exit 2.
         let args: Vec<String> = vec![
             src.to_string_lossy().into_owned(),
             "--save-copy".into(),
             src.to_string_lossy().into_owned(),
         ];
-        assert_eq!(run(&args), 1);
-        // --save-copy without a file is an error, exit 1.
+        assert_eq!(run(&args), 2);
+        // --save-copy without a file is an error, exit 2.
         let args: Vec<String> = vec!["--save-copy".into(), dest.to_string_lossy().into_owned()];
-        assert_eq!(run(&args), 1);
-        // A missing source file is an error, exit 1.
+        assert_eq!(run(&args), 2);
+        // A missing source file is an error, exit 2.
         let args: Vec<String> = vec![
             dir.join("nope.bin").to_string_lossy().into_owned(),
             "--save-copy".into(),
             dest.to_string_lossy().into_owned(),
         ];
-        assert_eq!(run(&args), 1);
+        assert_eq!(run(&args), 2);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
