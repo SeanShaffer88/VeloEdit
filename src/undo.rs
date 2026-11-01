@@ -222,6 +222,46 @@ impl UndoStack {
         });
     }
 
+    /// Apply a zero-run insert to `table` and record it for undo
+    /// (roadmap R4 zero-run insert). The recorded action is an
+    /// ordinary [`EditAction::Insert`] of `count` bytes — the bytes
+    /// happen to be zeros — and the segment bookkeeping is the same
+    /// as [`Self::do_insert`]'s, so undo restores the exact prior
+    /// layout (including splitting an extended zero piece back to
+    /// its old length) and redo re-applies it.
+    pub fn do_insert_zeroes(&mut self, table: &mut PieceTable, offset: u64, count: u64) {
+        if count == 0 {
+            return;
+        }
+        let count_before = table.pieces.len();
+        let gen_before = table.coalesce_gen();
+        let full_before = layout_snapshot(table, 2);
+        let (anchor, before) = insert_anchor(table, offset);
+        table.insert_zeroes(offset, count);
+        if table.coalesce_gen() != gen_before {
+            let full_before = full_before.expect("coalesce implies the snapshot was taken");
+            return self.record(HistoryEntry {
+                action: EditAction::Insert {
+                    offset,
+                    length: count,
+                },
+                anchor: 0,
+                before: full_before,
+                after: table.pieces.clone(),
+            });
+        }
+        let after = segment_after(table, anchor, before.len(), count_before);
+        self.record(HistoryEntry {
+            action: EditAction::Insert {
+                offset,
+                length: count,
+            },
+            anchor,
+            before,
+            after,
+        });
+    }
+
     /// Apply a delete to `table` and record it for undo. Returns the removed
     /// content pieces, exactly as [`PieceTable::delete`] reports them.
     pub fn do_delete(&mut self, table: &mut PieceTable, offset: u64, len: u64) -> Vec<PieceNode> {
@@ -660,6 +700,31 @@ mod tests {
         assert_eq!(text(&table), "xy");
         assert!(!disabled.can_undo());
         assert!(!disabled.apply_undo(&mut table));
+    }
+
+    #[test]
+    fn undo_zero_run_insert_restores_layout_exactly() {
+        let mut table = PieceTable::from_original(b"abcd".to_vec());
+        let layout_before = table.pieces.clone();
+        let mut history = UndoStack::new();
+        history.do_insert_zeroes(&mut table, 2, 3);
+        assert_eq!(table.read(0, 99), vec![b'a', b'b', 0, 0, 0, b'c', b'd']);
+        assert!(history.apply_undo(&mut table));
+        assert_eq!(table.pieces, layout_before);
+        assert_eq!(text(&table), "abcd");
+        assert!(history.apply_redo(&mut table));
+        assert_eq!(table.read(0, 99), vec![b'a', b'b', 0, 0, 0, b'c', b'd']);
+        // Extending an existing run also undoes to the old length:
+        // the second insert extends the same piece in place, and
+        // undo must shrink it back rather than remove a node.
+        history.do_insert_zeroes(&mut table, 5, 4);
+        assert_eq!(table.piece_count(), 3);
+        assert_eq!(table.pieces[1].length, 7);
+        assert!(history.apply_undo(&mut table));
+        assert_eq!(table.piece_count(), 3);
+        assert_eq!(table.pieces[1].length, 3);
+        assert_eq!(table.read(0, 99), vec![b'a', b'b', 0, 0, 0, b'c', b'd']);
+        assert!(table.check_invariants());
     }
 
     #[test]
