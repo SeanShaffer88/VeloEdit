@@ -42,7 +42,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::encoding::{self, Detection, EncodeError, TextEncoding};
+use crate::encoding::{self, CodePage, Detection, EncodeError, TextCodec, TextEncoding};
 use crate::hexview;
 use crate::line_index::{count_newlines_in, LineIndex, INDEX_HEAD_BYTES};
 use crate::piece_table::PieceTable;
@@ -210,6 +210,9 @@ pub struct StatusInfo {
     /// Document length in bytes.
     pub size: u64,
     pub encoding: TextEncoding,
+    /// The owner-chosen extended code page (roadmap item 29), when
+    /// one overrides the detected encoding for display and edits.
+    pub page: Option<CodePage>,
     pub encoding_confident: bool,
     pub dirty: bool,
     pub read_only: bool,
@@ -274,12 +277,28 @@ pub fn decode_lossy(bytes: &[u8], enc: TextEncoding) -> String {
     }
 }
 
+/// Decode bytes for display through a [`TextCodec`] (roadmap
+/// item 29): the lossy standard decode, or the code page's lossy
+/// decode when the owner chose a page.
+pub fn decode_lossy_codec(bytes: &[u8], codec: TextCodec) -> String {
+    match codec {
+        TextCodec::Standard(enc) => decode_lossy(bytes, enc),
+        TextCodec::Page(page) => encoding::decode_page_lossy(bytes, page),
+    }
+}
+
 /// The editor: one document, its history, and the view state over it.
 #[derive(Debug)]
 pub struct Editor {
     table: PieceTable,
     history: UndoStack,
     detection: Detection,
+    /// The owner-chosen extended code page (roadmap item 29):
+    /// while set, display decodes and typed text encodes through
+    /// the page instead of the detected encoding. Byte offsets,
+    /// the line index and the piece table never see it — it is a
+    /// codec choice at the text edges only.
+    page: Option<CodePage>,
     path: Option<PathBuf>,
     mode: EditorMode,
     read_only: bool,
@@ -348,6 +367,7 @@ impl Editor {
             table,
             history: UndoStack::new(),
             detection,
+            page: None,
             path,
             mode: EditorMode::Text,
             read_only,
@@ -451,6 +471,94 @@ impl Editor {
         self.detection.encoding
     }
 
+    /// The owner-chosen extended code page, when one is active
+    /// (roadmap item 29).
+    pub fn code_page(&self) -> Option<CodePage> {
+        self.page
+    }
+
+    /// The codec text is decoded and encoded through right now:
+    /// the chosen code page when one is set, otherwise the
+    /// detected standard encoding.
+    pub fn codec(&self) -> TextCodec {
+        match self.page {
+            Some(page) => TextCodec::Page(page),
+            None => TextCodec::Standard(self.detection.encoding),
+        }
+    }
+
+    /// Choose (or clear, with `None`) the extended code page the
+    /// document is viewed and edited through. The document bytes
+    /// do not change — only how they are read as text and how
+    /// typed text is written back. Any find state built under the
+    /// old codec is dropped (its needle bytes mean something else
+    /// now); the needle *text* is kept, so Find Next re-encodes it
+    /// under the new codec.
+    pub fn set_code_page(&mut self, page: Option<CodePage>) {
+        if self.page != page {
+            self.page = page;
+            self.drop_find_bytes();
+        }
+    }
+
+    /// Re-decode the document under a different standard encoding
+    /// (the Encoding menu's standard entries): the detection's
+    /// encoding is overridden, any code page is cleared, and the
+    /// byte-order-mark skip is recomputed for the new encoding
+    /// from the document's first bytes.
+    pub fn set_encoding(&mut self, enc: TextEncoding) {
+        self.page = None;
+        self.detection.encoding = enc;
+        let bom = encoding::bom_bytes(enc);
+        let head = self.table.read(0, bom.len() as u64);
+        self.detection.bom_len = if !bom.is_empty() && head == bom {
+            bom.len()
+        } else {
+            0
+        };
+        self.drop_find_bytes();
+    }
+
+    /// Drop the find state that depends on encoded bytes (see
+    /// [`Editor::set_code_page`]).
+    fn drop_find_bytes(&mut self) {
+        self.matches.clear();
+        self.match_index = None;
+        self.needle_bytes.clear();
+    }
+
+    /// Bytes to skip at the document's start when reading text:
+    /// the detected mark under a standard codec, nothing under a
+    /// code page (pages carry no mark in this design).
+    pub fn bom_skip(&self) -> u64 {
+        if self.page.is_some() {
+            0
+        } else {
+            self.detection.bom_len as u64
+        }
+    }
+
+    /// Decode document bytes for display through the active codec.
+    pub fn decode_display(&self, bytes: &[u8]) -> String {
+        decode_lossy_codec(bytes, self.codec())
+    }
+
+    /// Encode text through the active codec (typed text, needles,
+    /// replacements): strict for the standard encodings, per-page
+    /// for a code page; an unrepresentable character is an error.
+    pub fn encode_text(&self, text: &str) -> Result<Vec<u8>, EncodeError> {
+        encoding::encode_codec(text, self.codec())
+    }
+
+    /// True when the active codec is a UTF-16 standard encoding —
+    /// the case the find match-alignment filter applies to.
+    pub fn codec_is_utf16(&self) -> bool {
+        matches!(
+            self.codec(),
+            TextCodec::Standard(TextEncoding::Utf16Le | TextEncoding::Utf16Be)
+        )
+    }
+
     /// The line ending new lines are inserted with: `"\r\n"` when the
     /// document already uses CRLF, `"\n"` otherwise.
     pub fn line_ending(&self) -> &'static str {
@@ -547,7 +655,7 @@ impl Editor {
     /// is a display surface; the document bytes are never altered by
     /// copying).
     pub fn selected_text_lossy(&self) -> String {
-        decode_lossy(&self.selected_bytes(), self.encoding())
+        self.decode_display(&self.selected_bytes())
     }
 
     // ---- Line index ------------------------------------------------
@@ -829,7 +937,7 @@ impl Editor {
     fn line_bounds(&self, raw_start: u64) -> (u64, u64, u64) {
         let total = self.total_len();
         let content_start = if raw_start == 0 {
-            (self.detection.bom_len as u64).max(raw_start)
+            (self.bom_skip()).max(raw_start)
         } else {
             raw_start
         };
@@ -985,10 +1093,7 @@ impl Editor {
     /// error). `None` when the line does not exist.
     pub fn line_text(&mut self, line: u64) -> Option<String> {
         let (start, end) = self.line_content_range(line)?;
-        Some(decode_lossy(
-            &self.table.read(start, end - start),
-            self.encoding(),
-        ))
+        Some(self.decode_display(&self.table.read(start, end - start)))
     }
 
     /// Number of characters in a line's content.
@@ -1108,12 +1213,9 @@ impl Editor {
             0
         } else {
             let upto = offset.min(content_end);
-            decode_lossy(
-                &self.table.read(content_start, upto - content_start),
-                self.encoding(),
-            )
-            .chars()
-            .count() as u64
+            self.decode_display(&self.table.read(content_start, upto - content_start))
+                .chars()
+                .count() as u64
         };
         (line, col)
     }
@@ -1124,7 +1226,7 @@ impl Editor {
         let text = self.line_text(line)?;
         let (start, _) = self.line_content_range(line)?;
         let prefix: String = text.chars().take(col as usize).collect();
-        match encoding::encode(&prefix, self.encoding()) {
+        match self.encode_text(&prefix) {
             Ok(bytes) => Some(start + bytes.len() as u64),
             Err(_) => {
                 // The decoded prefix holds a character this encoding
@@ -1159,7 +1261,7 @@ impl Editor {
             };
             let fetch_len = (end - start).min(ROW_FETCH_BYTES);
             let bytes = self.table.read(start, fetch_len);
-            let mut text = decode_lossy(&bytes, self.encoding());
+            let mut text = self.decode_display(&bytes);
             let truncated = fetch_len < end - start || text.chars().count() > MAX_ROW_CHARS;
             if text.chars().count() > MAX_ROW_CHARS {
                 text = text.chars().take(MAX_ROW_CHARS).collect();
@@ -1524,7 +1626,7 @@ impl Editor {
     /// is inserted (never a silent `'?'`).
     pub fn insert_text(&mut self, text: &str) -> Result<(), EditorError> {
         self.require_writable()?;
-        let bytes = encoding::encode(text, self.encoding()).map_err(EditorError::Encode)?;
+        let bytes = self.encode_text(text).map_err(EditorError::Encode)?;
         self.insert_bytes(&bytes)
     }
 
@@ -1717,8 +1819,7 @@ impl Editor {
         needle_text: &str,
         options: SearchOptions,
     ) -> Result<usize, EditorError> {
-        let needle =
-            encoding::encode_needle(needle_text, self.encoding()).map_err(EditorError::Encode)?;
+        let needle = self.encode_text(needle_text).map_err(EditorError::Encode)?;
         self.needle_bytes = needle;
         self.needle_text = needle_text.to_string();
         self.find_options = options;
@@ -1752,18 +1853,14 @@ impl Editor {
         start: u64,
         end: u64,
     ) -> Result<usize, EditorError> {
-        let needle =
-            encoding::encode_needle(needle_text, self.encoding()).map_err(EditorError::Encode)?;
+        let needle = self.encode_text(needle_text).map_err(EditorError::Encode)?;
         self.needle_bytes = needle;
         self.needle_text = needle_text.to_string();
         self.find_options = options;
         let mut found =
             search::find_in_range(&self.table, &self.needle_bytes, &options, start, end);
-        if matches!(
-            self.encoding(),
-            TextEncoding::Utf16Le | TextEncoding::Utf16Be
-        ) {
-            let bom = self.detection.bom_len as u64;
+        if self.codec_is_utf16() {
+            let bom = self.bom_skip();
             found.retain(|&m| m >= bom && (m - bom) % 2 == 0);
         }
         self.matches = found;
@@ -1814,11 +1911,8 @@ impl Editor {
             return;
         }
         let mut found = search::find_all(&self.table, &self.needle_bytes, &self.find_options);
-        if matches!(
-            self.encoding(),
-            TextEncoding::Utf16Le | TextEncoding::Utf16Be
-        ) {
-            let bom = self.detection.bom_len as u64;
+        if self.codec_is_utf16() {
+            let bom = self.bom_skip();
             found.retain(|&m| m >= bom && (m - bom) % 2 == 0);
         }
         self.matches = found;
@@ -1901,7 +1995,7 @@ impl Editor {
         if self.selection_range() != Some((start, end)) {
             return Ok(false);
         }
-        let bytes = encoding::encode(replacement, self.encoding()).map_err(EditorError::Encode)?;
+        let bytes = self.encode_text(replacement).map_err(EditorError::Encode)?;
         let removed = self.table.read(start, end - start);
         self.note_newline_delta(&bytes, &removed);
         search::replace_one(
@@ -1928,7 +2022,7 @@ impl Editor {
         if self.needle_bytes.is_empty() {
             return Ok(0);
         }
-        let bytes = encoding::encode(replacement, self.encoding()).map_err(EditorError::Encode)?;
+        let bytes = self.encode_text(replacement).map_err(EditorError::Encode)?;
         let needle = self.needle_bytes.clone();
         let options = self.find_options;
         let first = search::find_next(&self.table, &needle, 0, &options).unwrap_or(0);
@@ -1966,7 +2060,7 @@ impl Editor {
         if self.needle_bytes.is_empty() || start >= end {
             return Ok(0);
         }
-        let bytes = encoding::encode(replacement, self.encoding()).map_err(EditorError::Encode)?;
+        let bytes = self.encode_text(replacement).map_err(EditorError::Encode)?;
         let needle = self.needle_bytes.clone();
         let options = self.find_options;
         let first = search::find_in_range(&self.table, &needle, &options, start, end)
@@ -2001,7 +2095,7 @@ impl Editor {
     fn expand_to_lines(&mut self, start: u64, end: u64) -> (u64, u64) {
         let (_, raw_start) = self.line_and_start(start);
         let region_start = if raw_start == 0 {
-            (self.detection.bom_len as u64).max(raw_start)
+            (self.bom_skip()).max(raw_start)
         } else {
             raw_start
         };
@@ -2202,6 +2296,7 @@ impl Editor {
             offset: self.caret,
             size: self.total_len(),
             encoding: self.encoding(),
+            page: self.page,
             encoding_confident: self.detection.confident,
             dirty: self.dirty,
             read_only: self.read_only,
@@ -2761,6 +2856,38 @@ mod tests {
         assert_eq!(e.first_line(), 2);
         e.goto_line(1);
         assert_eq!(e.caret(), 0);
+    }
+
+    // (Roadmap item 29) A chosen code page re-decodes the view and
+    // encodes typed text back, without touching the stored bytes.
+    #[test]
+    fn code_page_redecodes_and_encodes_back() {
+        // "caféx" as legacy bytes: 63 61 66 E9 78 (the E9 followed
+        // by 'x' cannot be UTF-8, so detection lands on ANSI).
+        let mut e = ed(&[0x63, 0x61, 0x66, 0xE9, 0x78]);
+        assert_eq!(e.codec(), TextCodec::Standard(TextEncoding::Ansi));
+        e.set_code_page(Some(CodePage::Iso88591));
+        assert_eq!(e.code_page(), Some(CodePage::Iso88591));
+        assert_eq!(e.codec(), TextCodec::Page(CodePage::Iso88591));
+        assert_eq!(e.status().page, Some(CodePage::Iso88591));
+        // The line decodes through the page.
+        assert_eq!(e.line_text(0).as_deref(), Some("caféx"));
+        // Typing encodes through the page: 'é' becomes the byte 0xE9.
+        e.move_doc_end(false);
+        e.insert_text("é").unwrap();
+        assert_eq!(content(&e), vec![0x63, 0x61, 0x66, 0xE9, 0x78, 0xE9]);
+        // A character the page cannot represent is an error.
+        assert!(e.insert_text("\u{4E2D}").is_err());
+        // Find encodes its needle through the page too.
+        assert_eq!(e.set_find("fé", SearchOptions::default()).unwrap(), 1);
+        // Clearing the page returns to the detected encoding, and a
+        // standard re-decode clears the page as well.
+        e.set_code_page(None);
+        assert_eq!(e.codec(), TextCodec::Standard(TextEncoding::Ansi));
+        e.set_code_page(Some(CodePage::Iso885915));
+        e.set_encoding(TextEncoding::Utf8);
+        assert_eq!(e.code_page(), None);
+        assert_eq!(e.encoding(), TextEncoding::Utf8);
     }
 
     #[test]
