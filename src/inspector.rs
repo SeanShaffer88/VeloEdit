@@ -259,7 +259,7 @@ pub fn format_unix_millis(millis: u64) -> String {
 /// never pass a negative count, but the FILETIME reading reaches
 /// back to 1601, and the era arithmetic below is exact for those
 /// negative inputs too (down to −134,774 days).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097; // day of era, [0, 146096]
@@ -274,6 +274,22 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
         month as u32,
         day as u32,
     )
+}
+
+/// (year, month, day) → days since 1970-01-01: the exact inverse
+/// of [`civil_from_days`], by the same algorithm. Out-of-range
+/// fields are *normalised*, not rejected (February 30 becomes
+/// March 2), so a caller validating a parsed date must round-trip
+/// through [`civil_from_days`] and compare — the time-delta core
+/// (`crate::timedeltas`) does exactly that.
+pub(crate) fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // year of era, [0, 399]
+    let mp = i64::from(if month > 2 { month - 3 } else { month + 9 }); // [0, 11]
+    let doy = (153 * mp + 2) / 5 + i64::from(day) - 1; // day of year
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // day of era
+    era * 146_097 + doe - 719_468
 }
 
 #[cfg(test)]
@@ -496,5 +512,21 @@ mod tests {
         let long = "é".repeat(40);
         let preview = inspect(long.as_bytes()).utf8_preview;
         assert_eq!(preview.chars().count(), 32);
+    }
+
+    #[test]
+    fn days_from_civil_inverts_civil_from_days() {
+        // Anchors known independently of the algorithm.
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(1601, 1, 1), -134_774);
+        assert_eq!(days_from_civil(2026, 11, 1), 20_758);
+        // Round-trip across era boundaries and leap cases.
+        for days in [-134_774, -1, 0, 1, 20_758, 47_482] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days, "day {days}");
+        }
+        for (y, m, d) in [(2000, 2, 29), (1900, 3, 1), (2024, 2, 29), (2099, 12, 31)] {
+            assert_eq!(civil_from_days(days_from_civil(y, m, d)), (y, m, d));
+        }
     }
 }
