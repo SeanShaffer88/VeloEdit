@@ -1356,6 +1356,106 @@ scored from real Windows evidence before any release.
     before cleanup, the rule the neighbouring save_to tests
     already document. Test-only change; no product code moved.
 
+- 2026-11-01, roadmap slice R5a (R5 pure cores: the six
+  host-testable cores the R5 wiring slices build on; no GUI
+  wiring in this slice beyond operation facades in
+  `src/lib.rs`). What landed: (1) `src/regex.rs` — streaming
+  regular expressions (roadmap item 9): a Thompson NFA compiled
+  to a bytecode program (cap 8192 instructions; counted repeats
+  expand; nesting cap 128) and run as a Pike VM over a windowed
+  `FnMut(u64, &mut [u8]) -> usize` reader (the `patch.rs`
+  reader shape, chosen and named in the module docs) —
+  backtracking-free, so cost is bounded by input × program and
+  pathological patterns cannot blow up; literals, `.`,
+  classes/ranges/negation, `\d \w \s` and complements, `\xHH`,
+  line anchors, greedy + lazy quantifiers and `{n,m}`,
+  alternation, groups; whole-match spans only, streamed in
+  bounded memory (two thread lists + one window).
+  (2) `src/templates.rs` — the binary-template language
+  (item 17): struct definitions with every sized int/float
+  primitive in both endians, `char` arrays as text, nested
+  structs, `//` comments, and count-from-field arrays (the
+  count names an earlier scalar integer field of the same
+  struct); parse errors carry line numbers, recursive structs
+  and unknown types are refused at parse time, and applying
+  over a reader yields a flat leaf list with offsets, sizes
+  and display values — truncation returns a partial result
+  flagged incomplete, never an error. (3) `src/linediff.rs` —
+  the line-diff core for the side-by-side diff: common
+  prefix/suffix framing, lockstep consumption, and
+  bounded-window anchor resynchronisation (SHA-256 line hashes
+  confirmed by exact comparison, 3-line confirm), emitting
+  coalesced regions plus the first differing line; documented
+  in the module and in PARITY as anchor-and-trim alignment,
+  NOT a minimal Myers script. (4) `src/disasm.rs` — an x86-64
+  length-accurate instruction decoder: legacy prefixes, REX,
+  one-byte + 0F/0F38/0F3A maps (3DNow suffix byte included),
+  VEX/EVEX/XOP, ModRM/SIB/displacement/immediate sizing per
+  the Intel rules in 64-bit and 67h 32-bit addressing;
+  mnemonic text is best-effort with honest generic renderings
+  otherwise; 64-bit-dropped opcodes and truncation return
+  typed errors, never panics. (5) `src/exttools.rs` — the
+  external-tools protocol core (item 49): parses/validates
+  `data/tools.json` (input/output enums with defaults,
+  non-empty unique names, per-field errors, unknown fields
+  tolerated) and the pure `{file}`/`{offset}` substitution;
+  no process spawning (wiring slice). (6) `src/undo.rs` gains
+  multi-range editing: `UndoStack::do_multi_replace` applies
+  range edits back-to-front as ONE undo entry on the
+  segment-replace mechanism (validated first — ascending,
+  non-overlapping, in-bounds; a refusal mutates and records
+  nothing; no-op edits dropped; a single pure insert degrades
+  to `do_insert`), plus byte-column rectangular
+  extract/delete/insert over a caller-supplied line map as
+  single undo entries (clamped per line, no padding, line
+  terminators untouched). Facades: `op_find_regex`,
+  `op_line_diff`, `op_apply_template`, `op_multi_replace`,
+  `op_rect_extract`, `op_rect_delete`, `op_rect_insert`.
+  Fifty new host tests (347 → 397): the regex suite includes
+  an independent continuation-passing backtracking reference
+  matcher and a 400-case generated equivalence sweep, 3-byte
+  window spanning, anchor/lazy/empty-match cases, and
+  `a*a*a*b` over 200 000 non-matching bytes completing inside
+  the normal run; templates run a PE-shaped template with
+  known values, count-from-field, nesting, truncation and
+  eleven parse-error cases; linediff covers
+  identical/insert/delete/change/both-ends/coalescing and
+  indexed-reader equivalence; disasm carries a known-length
+  corpus, truncation at every prefix of eight multi-byte
+  forms, the dropped-opcode set, and an exact-end stream walk;
+  the multi-edit suite pins exact bytes, single-undo layout
+  restoration, validation refusals and rectangle clamping.
+  Two real bugs were caught by the suites and fixed in-slice:
+  the Pike VM's per-step match arbitration (a same-step
+  lower-priority thread could overwrite a leftmost match),
+  and the 0F BA group encoding being shadowed in the 0F
+  length table (wrong length for a ModRM+imm8 form).
+  - Gate, run locally on this tree: `cargo fmt --all -- --check`
+    clean (exit 0). Host `cargo test`: **397 passed; 0 failed;
+    2 ignored**. `cargo clippy --all-targets -- -D warnings`
+    clean (exit 0, host) and
+    `cargo clippy --target x86_64-pc-windows-gnu --all-targets -- -D warnings`
+    clean (exit 0).
+    `cargo check --target x86_64-pc-windows-msvc --all-targets`
+    clean (exit 0). Release build
+    (`cargo build --release --target x86_64-pc-windows-gnu`,
+    exit 0): `VeloEdit.exe` 1 240 576 bytes, SHA-256
+    `4b34222060e98f5b4306d8d4e1689066c21a854f2e006d2a8d01972a90eda19c`
+    — the same size as the R4c build with a fresh hash and
+    timestamp: the new cores are not yet referenced by the GUI
+    binary, so the release linker strips them. Toolchain note:
+    the MinGW linker was missing on this machine (the VM had
+    been replaced) and was reinstalled from apt before the
+    build, per the standing recovery note.
+  - Honest status: every R5a core is host-verified by its test
+    suite; nothing in this slice is Windows-only code, and no
+    core is reachable from the GUI or CLI yet — the wiring
+    (regex in Find, the side-by-side diff view, the templates
+    panel, the tools menu, multi-cursor UI, the disassembly
+    gutter) is the R5b/R5c slices, and Windows runtime
+    behaviour stays **Unverified** until the field checks on
+    a real machine.
+
 ## Known gaps (honest list)
 
 - The installers have been *built* by the release workflow and their
