@@ -75,8 +75,11 @@
 
     <!-- Empty data folder: a component with CreateFolder so the installer
          creates (and on uninstall removes) the folder itself; its contents
-         are the user's and are left alone. -->
-    <Component Id="DataFolderComponent" Directory="DataFolder" Guid="*">
+         are the user's and are left alone. This component carries an
+         EXPLICIT guid (never change it): a folder-only component's key
+         path is its directory, and WiX rejects auto-generated guids for
+         those (WIX0230). -->
+    <Component Id="DataFolderComponent" Directory="DataFolder" Guid="AE66BEE6-02EC-41BF-8B6D-B783DEA4F0ED">
       <CreateFolder />
       <RemoveFolder Id="RemoveDataFolder" On="uninstall" />
     </Component>
