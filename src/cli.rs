@@ -63,9 +63,31 @@ HEADLESS OPERATIONS:
                           streamed in 4 MB chunks, so huge files are
                           fine. With --json the report is
                           {\"start\":N,\"bytes_written\":M}.
+    --split <FILE>        Split FILE into fixed-size parts, streamed:
+    --part-size <SIZE>    the part size (required with --split): a
+                          whole number of bytes (decimal or 0x-hex) or
+                          a number with a K, M or G suffix, like 500M
+                          or 4G (K = 1024 bytes, and so on).
+    --out-dir <DIR>       Folder the parts are written to (default:
+                          the current folder). Parts are named
+                          <name>.part001, <name>.part002, ... and
+                          joining them in order restores FILE exactly.
+                          At most 10000 parts are made. With --json
+                          the report is
+                          {\"parts\":N,\"part_size\":S,\"out_dir\":\"...\"}.
+
+EXPLORER MENU (Windows, opt-in):
+    --install-shell       Add an \"Open in VeloEdit\" item to the
+                          Explorer right-click menu for all files.
+                          It is stored under the current user only
+                          (no administrator rights) and is the one
+                          registry entry VeloEdit ever writes.
+    --uninstall-shell     Remove that menu item again. --clean also
+                          removes it.
 
 CLEANUP:
-    --clean               Remove the portable data folder next to the program
+    --clean               Remove the portable data folder next to the program,
+                          and the Explorer menu item when one was added
     --uninstall           Same as --clean in portable builds
     --dry-run             Show what an operation would do without doing it
 
@@ -87,7 +109,9 @@ EXIT CODES:
         platform build has no window code
 
 VeloEdit works fully offline and writes only to the data folder next to the
-program file. It never writes to %APPDATA% or the registry.
+program file. It never writes to %APPDATA%, and the only registry entry it
+ever writes is the Explorer menu item — only when you add it with
+--install-shell; --uninstall-shell or --clean removes it.
 ";
 
 /// View mode requested on the command line (SPEC.md section 7).
@@ -119,6 +143,15 @@ pub struct CliOptions {
     pub extract_start: Option<u64>,
     pub extract_length: Option<u64>,
     pub extract_out: Option<PathBuf>,
+    /// `--split <FILE>` (roadmap item 36): split that file into parts
+    /// of `part_size` bytes in `split_out_dir`.
+    pub split: Option<PathBuf>,
+    pub part_size: Option<u64>,
+    pub split_out_dir: Option<PathBuf>,
+    /// `--install-shell` / `--uninstall-shell` (roadmap item 38): the
+    /// opt-in Explorer context-menu item (Windows registry, HKCU).
+    pub install_shell: bool,
+    pub uninstall_shell: bool,
     pub headless: bool,
     pub json: bool,
     pub silent: bool,
@@ -167,6 +200,30 @@ pub fn parse_u64(text: &str) -> Result<u64, CliError> {
     })
 }
 
+/// Parse a byte size for `--part-size` (roadmap item 36): a whole
+/// number in the [`parse_u64`] forms (decimal or `0x`-hex), optionally
+/// followed by one suffix letter — `K`, `M` or `G` (either case) for
+/// kibi/mebi/gibibytes (1024-based steps). A size of 0 parses fine
+/// here and is refused by the split itself; an overflowing size is an
+/// error, never a wraparound.
+pub fn parse_size(text: &str) -> Result<u64, CliError> {
+    let trimmed = text.trim();
+    let (digits, multiplier) = match trimmed.chars().last() {
+        Some('K') | Some('k') => (&trimmed[..trimmed.len() - 1], 1024u64),
+        Some('M') | Some('m') => (&trimmed[..trimmed.len() - 1], 1024u64 * 1024),
+        Some('G') | Some('g') => (&trimmed[..trimmed.len() - 1], 1024u64 * 1024 * 1024),
+        _ => (trimmed, 1u64),
+    };
+    let value = parse_u64(digits).map_err(|_| {
+        CliError::new(format!(
+            "'{text}' is not a size (a whole number, optionally with a K, M or G suffix)"
+        ))
+    })?;
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| CliError::new(format!("'{text}' is too large to be a size")))
+}
+
 /// Parse arguments (without the program name) by hand.
 pub fn parse_args(args: &[String]) -> Result<CliOptions, CliError> {
     let mut opts = CliOptions::default();
@@ -208,6 +265,24 @@ pub fn parse_args(args: &[String]) -> Result<CliOptions, CliError> {
             "--trace" => opts.trace = true,
             "--clean" => opts.clean = true,
             "--uninstall" => opts.uninstall = true,
+            "--install-shell" => opts.install_shell = true,
+            "--uninstall-shell" => opts.uninstall_shell = true,
+            "--split" => {
+                let value = take_value(args, &mut i, inline_value, "--split")?;
+                opts.split = Some(PathBuf::from(value));
+            }
+            "--part-size" => {
+                let value = take_value(args, &mut i, inline_value, "--part-size")?;
+                opts.part_size = Some(parse_size(&value).map_err(|_| {
+                    CliError::new(format!(
+                        "--part-size needs a size (a whole number, or one with a K, M or G suffix), got '{value}'"
+                    ))
+                })?);
+            }
+            "--out-dir" => {
+                let value = take_value(args, &mut i, inline_value, "--out-dir")?;
+                opts.split_out_dir = Some(PathBuf::from(value));
+            }
             "--line" => {
                 let value = take_value(args, &mut i, inline_value, "--line")?;
                 opts.line = Some(parse_u64(&value).map_err(|_| {
@@ -408,8 +483,16 @@ pub fn run(args: &[String]) -> i32 {
         return run_clean(&opts);
     }
 
+    if opts.install_shell || opts.uninstall_shell {
+        return run_shell_menu(&opts);
+    }
+
     if opts.extract {
         return run_extract(&opts);
+    }
+
+    if opts.split.is_some() {
+        return run_split(&opts);
     }
 
     if let Some((path_a, path_b)) = &opts.diff {
@@ -688,6 +771,92 @@ fn run_extract(opts: &CliOptions) -> i32 {
     0
 }
 
+/// Headless `--split` (roadmap item 36): split the file into parts
+/// of `--part-size` bytes in `--out-dir` (default: the current
+/// folder), streamed by [`crate::save::split_file`]. Exit 0 on
+/// success, 2 on any usage or I/O error.
+fn run_split(opts: &CliOptions) -> i32 {
+    let path = opts.split.as_deref().unwrap_or_else(|| Path::new(""));
+    let Some(part_size) = opts.part_size else {
+        eprintln!(
+            "VeloEdit: --split needs a part size: --part-size <SIZE> (for example 500M or 4G)"
+        );
+        return 2;
+    };
+    let out_dir = opts
+        .split_out_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("."));
+    let parts = match crate::save::split_file(path, part_size, &out_dir) {
+        Ok(parts) => parts,
+        Err(e) => {
+            eprintln!("VeloEdit: could not split {}: {e}", path.display());
+            return 2;
+        }
+    };
+    if !opts.silent {
+        if opts.json {
+            println!(
+                "{{\"parts\":{},\"part_size\":{},\"out_dir\":\"{}\"}}",
+                parts.len(),
+                part_size,
+                crate::settings::json_escape(&out_dir.to_string_lossy())
+            );
+        } else {
+            println!(
+                "Split {} into {} part(s) of at most {} bytes in {}.",
+                path.display(),
+                parts.len(),
+                part_size,
+                out_dir.display()
+            );
+        }
+    }
+    0
+}
+
+/// `--install-shell` / `--uninstall-shell` (roadmap item 38): the
+/// opt-in Explorer context-menu item lives in the Windows registry
+/// (current user only); the calls themselves are in
+/// [`crate::gui_win`], the crate's Windows module. Exit 0 on success
+/// (including "was not installed" for a removal), 2 on error — and on
+/// any non-Windows build, where there is no Explorer menu to touch.
+fn run_shell_menu(opts: &CliOptions) -> i32 {
+    #[cfg(windows)]
+    {
+        let result = if opts.install_shell {
+            crate::gui_win::shell_menu_install().map(|_| ())
+        } else {
+            crate::gui_win::shell_menu_uninstall().map(|_| ())
+        };
+        match result {
+            Ok(()) => {
+                if !opts.silent {
+                    println!(
+                        "{}",
+                        if opts.install_shell {
+                            "Added \"Open in VeloEdit\" to the Explorer menu for all files."
+                        } else {
+                            "Removed \"Open in VeloEdit\" from the Explorer menu."
+                        }
+                    );
+                }
+                0
+            }
+            Err(message) => {
+                eprintln!("VeloEdit: {message}");
+                2
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = opts;
+        eprintln!("VeloEdit: the Explorer menu item is a Windows feature; this build has no registry to write to.");
+        2
+    }
+}
+
 fn run_clean(opts: &CliOptions) -> i32 {
     let exe_dir = match std::env::current_exe() {
         Ok(mut path) => {
@@ -715,6 +884,25 @@ fn run_clean(opts: &CliOptions) -> i32 {
                     );
                 } else {
                     println!("Removed {}", report.data_dir.display());
+                }
+            }
+            // Roadmap item 38: --clean also removes the Explorer menu
+            // item when one was installed — a portable cleanup should
+            // leave nothing behind, in the data folder or the registry.
+            // A dry run only previews, so it removes nothing here.
+            #[cfg(windows)]
+            if !opts.dry_run {
+                match crate::gui_win::shell_menu_uninstall() {
+                    Ok(true) => {
+                        if !opts.silent {
+                            println!("Removed the Explorer menu item.");
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(message) => {
+                        eprintln!("VeloEdit: {message}");
+                        return 2;
+                    }
                 }
             }
             0
@@ -1058,6 +1246,93 @@ mod tests {
             dir.join("nope.bin").to_string_lossy().into_owned(),
             "--out".into(),
             out_s.clone(),
+        ];
+        assert_eq!(run(&args), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_size_accepts_plain_and_suffixed_sizes() {
+        assert_eq!(parse_size("4096").unwrap(), 4096);
+        assert_eq!(parse_size("0x1000").unwrap(), 4096);
+        assert_eq!(parse_size("4K").unwrap(), 4 * 1024);
+        assert_eq!(parse_size("500M").unwrap(), 500 * 1024 * 1024);
+        assert_eq!(parse_size("4G").unwrap(), 4 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size("2g").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size(" 10M ").unwrap(), 10 * 1024 * 1024);
+        assert!(parse_size("").is_err());
+        assert!(parse_size("M").is_err());
+        assert!(parse_size("10T").is_err());
+        assert!(parse_size("1.5M").is_err());
+        // 2^54 gibibytes overflows u64: an error, not a wraparound.
+        assert!(parse_size("18014398509481984G").is_err());
+    }
+
+    #[test]
+    fn parse_split_and_shell_flags() {
+        let opts = parse(&[
+            "--split",
+            "big.bin",
+            "--part-size",
+            "500M",
+            "--out-dir",
+            "parts",
+        ])
+        .unwrap();
+        assert_eq!(opts.split, Some(PathBuf::from("big.bin")));
+        assert_eq!(opts.part_size, Some(500 * 1024 * 1024));
+        assert_eq!(opts.split_out_dir, Some(PathBuf::from("parts")));
+        let opts = parse(&["--part-size=4G", "--split=big.bin"]).unwrap();
+        assert_eq!(opts.part_size, Some(4 * 1024 * 1024 * 1024));
+        assert!(parse(&["--part-size", "lots"]).is_err());
+        assert!(parse(&["--split"]).is_err());
+        let opts = parse(&["--install-shell"]).unwrap();
+        assert!(opts.install_shell && !opts.uninstall_shell);
+        let opts = parse(&["--uninstall-shell"]).unwrap();
+        assert!(opts.uninstall_shell && !opts.install_shell);
+    }
+
+    #[test]
+    fn split_run_writes_parts_and_reports_errors() {
+        let dir = std::env::temp_dir().join(format!("veloedit-split-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        std::fs::write(&src, vec![3u8; 250]).unwrap();
+        let out = dir.join("parts");
+        let args: Vec<String> = vec![
+            "--split".into(),
+            src.to_string_lossy().into_owned(),
+            "--part-size".into(),
+            "100".into(),
+            "--out-dir".into(),
+            out.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run(&args), 0);
+        let mut names: Vec<String> = std::fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["src.bin.part001", "src.bin.part002", "src.bin.part003"]
+        );
+        // A missing --part-size, a zero size and a missing file are
+        // all exit 2.
+        let args: Vec<String> = vec!["--split".into(), src.to_string_lossy().into_owned()];
+        assert_eq!(run(&args), 2);
+        let args: Vec<String> = vec![
+            "--split".into(),
+            src.to_string_lossy().into_owned(),
+            "--part-size".into(),
+            "0".into(),
+        ];
+        assert_eq!(run(&args), 2);
+        let args: Vec<String> = vec![
+            "--split".into(),
+            dir.join("nope.bin").to_string_lossy().into_owned(),
+            "--part-size".into(),
+            "100".into(),
         ];
         assert_eq!(run(&args), 2);
         std::fs::remove_dir_all(&dir).unwrap();
