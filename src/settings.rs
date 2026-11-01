@@ -140,6 +140,21 @@ pub struct Settings {
     /// as one big-endian number. Display only — file bytes never
     /// change order.
     pub hex_endian: bool,
+    /// Follow Tail switch (roadmap item 22, "Ghost Tail"): while
+    /// on, a clean document whose file only grew on disk adopts the
+    /// growth silently instead of showing the external-change bar.
+    pub follow_tail: bool,
+    /// Soft word wrap for text mode (roadmap item 19): view-only —
+    /// the file's bytes never change.
+    pub word_wrap: bool,
+    /// Whether the strings pane is docked open (strings pane).
+    pub strings_open: bool,
+    /// Strings pane minimum run length in characters: one of 4, 6
+    /// or 8; anything else loads as the default 4.
+    pub strings_min_len: u32,
+    /// Number of top lines pinned by the freeze pane (freeze
+    /// pane): 0 = off, otherwise 1..=50.
+    pub freeze_lines: u32,
     /// Line-ending handling for saves (roadmap item 31): one of
     /// the `SAVE_EOL_*` words; anything else loads as "keep".
     pub save_eol: String,
@@ -168,6 +183,11 @@ impl Default for Settings {
             hex_cols: DEFAULT_HEX_COLS,
             hex_group: DEFAULT_HEX_GROUP,
             hex_endian: false,
+            follow_tail: false,
+            word_wrap: false,
+            strings_open: false,
+            strings_min_len: 4,
+            freeze_lines: 0,
             save_eol: SAVE_EOL_KEEP.to_string(),
             save_bom: SAVE_BOM_KEEP.to_string(),
             window: None,
@@ -243,6 +263,14 @@ impl Settings {
         out.push_str(&format!("  \"hex_cols\": {},\n", self.hex_cols));
         out.push_str(&format!("  \"hex_group\": {},\n", self.hex_group));
         out.push_str(&format!("  \"hex_endian\": {},\n", self.hex_endian));
+        out.push_str(&format!("  \"follow_tail\": {},\n", self.follow_tail));
+        out.push_str(&format!("  \"word_wrap\": {},\n", self.word_wrap));
+        out.push_str(&format!("  \"strings_open\": {},\n", self.strings_open));
+        out.push_str(&format!(
+            "  \"strings_min_len\": {},\n",
+            self.strings_min_len
+        ));
+        out.push_str(&format!("  \"freeze_lines\": {},\n", self.freeze_lines));
         out.push_str(&format!(
             "  \"save_eol\": \"{}\",\n",
             json_escape(&self.save_eol)
@@ -337,6 +365,20 @@ impl Settings {
                     };
                 }
                 "hex_endian" => settings.hex_endian = parser.boolean()?,
+                "follow_tail" => settings.follow_tail = parser.boolean()?,
+                "word_wrap" => settings.word_wrap = parser.boolean()?,
+                "strings_open" => settings.strings_open = parser.boolean()?,
+                "strings_min_len" => {
+                    let n = parser.integer()?;
+                    settings.strings_min_len = match n {
+                        4 | 6 | 8 => n as u32,
+                        _ => 4,
+                    };
+                }
+                "freeze_lines" => {
+                    let n = parser.integer()?;
+                    settings.freeze_lines = (n.clamp(0, 50)) as u32;
+                }
                 "save_eol" => {
                     let word = parser.string()?;
                     settings.save_eol = match word.as_str() {
@@ -664,6 +706,11 @@ mod tests {
             hex_cols: 32,
             hex_group: 4,
             hex_endian: true,
+            follow_tail: true,
+            word_wrap: true,
+            strings_open: true,
+            strings_min_len: 6,
+            freeze_lines: 3,
             save_eol: SAVE_EOL_CRLF.to_string(),
             save_bom: SAVE_BOM_ADD.to_string(),
             window: Some((-120, 40, 1100, 750)),
