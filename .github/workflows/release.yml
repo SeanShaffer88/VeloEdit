@@ -90,7 +90,18 @@ jobs:
           if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
             choco install nsis -y --no-progress
           }
-          $makensis = (Get-Command makensis).Source
+          # The choco install lands in "Program Files (x86)\NSIS", which is
+          # not on this process's PATH - resolve the exe explicitly.
+          $makensis = (Get-Command makensis -ErrorAction SilentlyContinue).Source
+          if (-not $makensis) {
+            foreach ($candidate in @(
+              "C:\Program Files (x86)\NSIS\makensis.exe",
+              "C:\Program Files\NSIS\makensis.exe"
+            )) {
+              if (Test-Path $candidate) { $makensis = $candidate; break }
+            }
+          }
+          if (-not $makensis) { throw "makensis.exe not found after install" }
           & $makensis "-DEXE_PATH=$PWD\target\x86_64-pc-windows-msvc\release\VeloEdit.exe" "-DOUT_DIR=$PWD\dist" installer\VeloEdit.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
           if (-not (Test-Path "dist\VeloEdit-v$version-x64-Setup.exe")) { throw "Setup exe was not produced" }
