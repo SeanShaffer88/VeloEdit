@@ -403,6 +403,31 @@ release asset naming in the specification.
 - File Hashes dialog: the CRC32 and xxHash64 checksums join
   MD5, SHA-1 and SHA-256 in the same worker pass, and the
   compare box checks pasted text against all five.
+- Regular-expression search core (not yet wired into the
+  window): a streaming, backtracking-free regex engine —
+  classes, alternation, greedy and lazy quantifiers, counted
+  repeats, and line anchors — that finds matches in files of
+  any size in bounded memory, with no pattern able to make
+  the search blow up.
+- Binary templates core (not yet wired into the window): a
+  plain-text struct definition language for describing file
+  headers and packets, applied over a file to list every
+  field's offset, size, and decoded value, including counted
+  arrays whose length comes from an earlier field.
+- Line diff core (for the coming side-by-side compare):
+  reports the regions where two files' lines differ,
+  streaming both sides in bounded memory.
+- Disassembly length decoder core (for the coming hex-mode
+  gutter): exact x86-64 instruction lengths with a
+  best-effort text rendering.
+- External tools core (not yet wired into the window): the
+  `data/tools.json` format for running user programs on a
+  selection or range and bringing their output back — parsing,
+  validation, and `{file}` / `{offset}` substitution.
+- Multi-cursor editing core: many range replacements applied
+  as a single undo step, plus rectangular (column) extract,
+  delete, and insert over a line range, also as single undo
+  steps.
 
 ## [1.0.1] — Unreleased
 
