@@ -28,7 +28,7 @@ is the owner's call — and every Windows-runtime verification.
 | --- | --- | --- |
 | Architecture & foundation | 4 | Frozen module layout in `PROJECT_RULES.md`; original-bytes seam (`OriginalBuffer`) now carries the Windows mmap backing with no API change; the piece Vec carries a Fenwick weight index for O(log N) lookups (R2a) in place of the sketched B-tree, with the trade-off recorded in Known gaps |
 | Correctness (core operations) | 4 | Insert/delete/coalescence, multi-piece reads, undo/redo layout restoration, line checkpoints, hex/scroll math, diff counting, encoding detection/decode/encode, boundary-spanning search, single-undo replace-all, and the atomic save round trips (including both staged failure paths) are all covered by unit tests that exercise the real code paths |
-| Tests | 4 | 249 host unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1 + 16 roadmap R2a + 9 roadmap R2b + 37 roadmap R3a: Fenwick piece-index equivalence against a naive model over random edit scripts, 100k-piece lookups, coalescing, SWAR-vs-scalar and parallel-vs-serial line-index equivalence, SWAR search equivalence, scoped find/replace, masked search, line sort/dedup, scoped find navigation, masked find flow, the file splitter, CLI size parsing and split runs, hash known-answer vectors, inspector readings and civil-date conversion, bookmark store round trips and staleness, delta-recovery rebuilds and refusals, save EOL/BOM transforms, windowed find + 15 roadmap R3b-2: GUID, FILETIME and text-preview inspector readings, width-parameterised hex row maths, grouped and big-endian hex formatting and click hit-testing, fit-to-window widths, settings validation for the new hex/save keys, editor hex movement and formatting at row widths 8 and 32, save-with-options transforms + 7 instant-open: the indexing percent/suffix helper, staged-build prefix and completion identity against the one-shot build, small-file head-build completeness, forward-resolver agreement within and beyond the indexed prefix, staged-open exactness with a head-only frontier, staged completion attach with a monotonic frontier, and edit-during-staged-build discard ending exact — plus 2 ignored 1 GB bench tests for staged open versus the one-shot build), host gate fully green (see below); the Windows-only GUI suite adds layout/formatting/menu/theme-preview tests plus R3b-1's scrollbar-tick bucketing, R3b-2's inspector-rows, hash-verdict and armed-save-suffix tests, and the polish pass's zoom-percentage and colour-blend tests, and runs in CI. Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
+| Tests | 4 | 306 host unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1 + 16 roadmap R2a + 9 roadmap R2b + 37 roadmap R3a: Fenwick piece-index equivalence against a naive model over random edit scripts, 100k-piece lookups, coalescing, SWAR-vs-scalar and parallel-vs-serial line-index equivalence, SWAR search equivalence, scoped find/replace, masked search, line sort/dedup, scoped find navigation, masked find flow, the file splitter, CLI size parsing and split runs, hash known-answer vectors, inspector readings and civil-date conversion, bookmark store round trips and staleness, delta-recovery rebuilds and refusals, save EOL/BOM transforms, windowed find + 15 roadmap R3b-2: GUID, FILETIME and text-preview inspector readings, width-parameterised hex row maths, grouped and big-endian hex formatting and click hit-testing, fit-to-window widths, settings validation for the new hex/save keys, editor hex movement and formatting at row widths 8 and 32, save-with-options transforms + 7 instant-open: the indexing percent/suffix helper, staged-build prefix and completion identity against the one-shot build, small-file head-build completeness, forward-resolver agreement within and beyond the indexed prefix, staged-open exactness with a head-only frontier, staged completion attach with a monotonic frontier, and edit-during-staged-build discard ending exact + 57 roadmap R4a: zero-run reads proven on every read path with exact undo (including a 5,000,000-byte run stored as one piece and a 1 GB run as one piece), Ghost Tail growth extension and refusal rules with builder-resume identity from a mid-grid frontier, CRC32 and xxHash64 known-answer vectors (reference-checked against a reference implementation), filter line mapping on complete and partial indexes, the slicing grammar with its reversed / out-of-range / overlap / order refusals, VELOPAT1 patch round trips (insert-at-start, delete-at-end, no-change, duplicated original bytes) and corruption refusals, strings runs across the 64 KiB window edge in both encodings, entropy known values, pointer readings and the 128-entry jump-history cap, timestamp validation and consecutive-pair deltas, delimiter splitting, quoting and detection — plus 2 ignored 1 GB bench tests for staged open versus the one-shot build), host gate fully green (see below); the Windows-only GUI suite adds layout/formatting/menu/theme-preview tests plus R3b-1's scrollbar-tick bucketing, R3b-2's inspector-rows, hash-verdict and armed-save-suffix tests, and the polish pass's zoom-percentage and colour-blend tests, and runs in CI. Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
 | Reliability & data safety | 4 | Undo never touches the append buffer; deletes return their removed pieces; `--clean` is guarded to the adjacent `data/` folder and tested. The atomic save safety path (SPEC §5.1) is implemented and covered by host tests for the success, replace, empty, staging-failure and swap-failure cases, with the table provably unchanged after a failed save; its Windows runtime behaviour (real `ReplaceFileW` under a live mapping) is still Unverified — see Known gaps |
 | Performance (SPEC §8 budgets) | Unverified | Host proxies are now measured and recorded in `docs/BENCHMARKS.md` (200 MB diff median 330 ms, find 1073 ms, save-copy 466 ms, `--version` start proxy median 1.07 ms, all Linux host build; the instant-open slice adds the 1 GB staged-open proxies: one-shot index build 3,112 ms against a 4.89 ms head prefix, editor first line question 32.81 ms) — evidence about the core only. Every §8 metric itself (cold start <50 ms, 100 GB open <100 ms, <15 MB idle / <35 MB active, <16 ms frame) is a Windows measurement and remains a target, not a result |
 | Security & privacy | 4 | 100% offline, zero telemetry by construction (no network code at all); crate root is `#![deny(unsafe_code)]` with `unsafe` confined to `src/mmap_win.rs`, `src/gui_win.rs` and the Windows half of `src/save.rs`, every block carrying a `// SAFETY:` comment (PROJECT_RULES.md confinement rule); the only dependency crate is `windows-sys`, gated to `cfg(windows)` |
@@ -1199,6 +1199,49 @@ scored from real Windows evidence before any release.
     search naive-equivalence tests). No GUI code changed in this
     pass. Windows runtime remains **Unverified** for everything
     the §8 table lists, exactly as before.
+
+- 2026-11-01, roadmap R4a (R4 engine cores), run locally on the
+  development host. Core modules only — `src/gui_win.rs` and
+  `src/cli.rs` untouched; the CLI/GUI surfaces for these cores
+  land in R4b/R4c. What was added: the Ghost Tail growth path
+  (`PieceTable::extend_original` / `adopt_grown_original`,
+  `LineIndex::extended_to`, `LineIndexBuilder::resume_from` with
+  a mid-interval top-up so a resumed build stays
+  checkpoint-identical to a one-shot build, and
+  `Editor::note_file_growth` refusing dirty or history-carrying
+  documents); the structural filter view (`src/filter.rs`); the
+  multi-range slicing core (`src/slicing.rs`); the zero-run piece
+  (`BufferSource::Zeroes` through the piece table, undo, editor
+  and the recovery record); the `VELOPAT1` delta patch core
+  (`src/patch.rs`); CRC32 and xxHash64 in `src/hash.rs`; and the
+  strings, entropy, pointers/jump-history, time-delta and
+  delimiter cores (`src/strings.rs`, `src/entropy.rs`,
+  `src/pointers.rs`, `src/timedeltas.rs`, `src/delimited.rs`),
+  plus `inspector::days_from_civil` (the civil-date inverse the
+  time-delta core validates dates with) and four `op_*` facades.
+  - Gate (this slice, true exit codes): `cargo fmt --all --
+    --check` — clean (0). `cargo test` — **306 passed, 0 failed,
+    2 ignored** (0). `cargo clippy --all-targets -- -D warnings`
+    (host) — clean (0). `cargo clippy --target
+    x86_64-pc-windows-gnu --all-targets -- -D warnings` — clean
+    (0). `cargo check --target x86_64-pc-windows-msvc` — passed
+    (0). `cargo build --release --target x86_64-pc-windows-gnu`
+    — passed (0); `VeloEdit.exe` 935,936 bytes, SHA-256
+    `585671e9e60b37f023a9c81d88099dcef7582fca51d8c4ae3ef4e373bbafe89a`
+    (previous build 930,304 bytes / `6424aff4…`; the size and hash
+    differ, proving this is the fresh build).
+  - Known-answer honesty note: the xxHash64 values first pinned
+    for the two FIPS test messages were wrong in the test, not in
+    the implementation — the values were re-derived from the
+    reference implementation during this slice and the corrected
+    constants are what the suite now pins (the implementation
+    matched the reference on every vector, including the two
+    corrected ones). The CRC32 vectors were reference-checked
+    the same way.
+  - Honest status: all R4a cores are verified by the host test
+    suite only. Nothing in this slice is user-visible yet (every
+    PARITY row is **Foundation**); Windows runtime remains
+    **Unverified**, exactly as before.
 
 ## Known gaps (honest list)
 
