@@ -146,10 +146,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $version = '${{ steps.tag.outputs.version }}'
-          gh release create '${{ steps.tag.outputs.tag }}' `
-            "dist\VeloEdit-v$version-x64-Setup.exe" `
-            "dist\VeloEdit-v$version-x64-Setup.msi" `
-            "dist\VeloEdit-v$version-x64-Portable.zip" `
-            "dist\SHA256SUMS.txt" `
+          $assets = @(
+            "dist\VeloEdit-v$version-x64-Setup.exe",
+            "dist\VeloEdit-v$version-x64-Setup.msi",
+            "dist\VeloEdit-v$version-x64-Portable.zip",
+            "dist\SHA256SUMS.txt"
+          )
+          # The release may already exist (the tag was created by publishing
+          # the release in the web UI): then just (re)upload the assets.
+          gh release create '${{ steps.tag.outputs.tag }}' $assets `
             --title "VeloEdit v$version" `
             --notes-file release-notes.md
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Release already exists - uploading assets instead."
+            gh release upload '${{ steps.tag.outputs.tag }}' $assets --clobber
+            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
+          }
