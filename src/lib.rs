@@ -24,6 +24,8 @@
 //! the strings scan ([`strings`]), the entropy map ([`entropy`]),
 //! pointer targets and the jump history ([`pointers`]), log time
 //! deltas ([`timedeltas`]) and the delimiter grid ([`delimited`]).
+//! Slice R4c adds rebindable keys ([`keybindings`]) and the
+//! block-level structural diff ([`structdiff`]).
 //!
 //! Unsafe policy (PROJECT_RULES.md): the crate root is
 //! `#![deny(unsafe_code)]`, and the only modules allowed to opt back in
@@ -48,7 +50,9 @@ pub mod gui_win;
 pub mod hash;
 pub mod hexview;
 pub mod inspector;
+pub mod keybindings;
 pub mod line_index;
+pub mod mapwindow;
 #[cfg(windows)]
 pub mod mmap_win;
 pub mod patch;
@@ -60,6 +64,7 @@ pub mod search;
 pub mod settings;
 pub mod slicing;
 pub mod strings;
+pub mod structdiff;
 pub mod theme;
 pub mod timedeltas;
 pub mod undo;
@@ -314,4 +319,18 @@ pub fn op_build_patch(
     table: &PieceTable,
 ) -> Result<patch::Patch, patch::PatchError> {
     patch::build_patch(original_len, read_original, table)
+}
+
+/// Operation: structural diff (roadmap item 43, slice R4c) —
+/// compare two byte sources block-wise and report the coalesced
+/// differing regions plus the first-divergence offset, windowed
+/// so memory stays flat. See [`structdiff`].
+pub fn op_structural_diff(
+    len_a: u64,
+    read_a: impl FnMut(u64, &mut [u8]) -> usize,
+    len_b: u64,
+    read_b: impl FnMut(u64, &mut [u8]) -> usize,
+    block_size: u64,
+) -> structdiff::StructDiffReport {
+    structdiff::compare_sources(len_a, read_a, len_b, read_b, block_size)
 }
