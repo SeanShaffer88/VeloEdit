@@ -192,6 +192,38 @@ impl LineIndexBuilder {
             .unwrap_or(1)
             .clamp(1, 8);
 
+        // A builder resumed from a snapshot of a grown source (see
+        // `resume_from`) can start mid-interval: its frontier is the
+        // old source's end, not a checkpoint multiple. Top the
+        // partial interval up first — count its newlines WITHOUT
+        // pushing a checkpoint — so the checkpoint grid stays on
+        // CHECKPOINT_INTERVAL multiples and the finished index is
+        // identical to a one-shot build. (A fresh or staged builder
+        // always sits on a multiple, so this never runs for them.)
+        // The top-up may overshoot `limit` by less than one
+        // interval, inside the round-overshoot allowance below.
+        while !self.stopped && self.offset < self.total_len && self.offset < limit {
+            let misalignment = self.offset % CHECKPOINT_INTERVAL;
+            if misalignment == 0 {
+                break;
+            }
+            let grid_end = self.offset + (CHECKPOINT_INTERVAL - misalignment);
+            let want = (grid_end.min(self.total_len) - self.offset) as usize;
+            let mut buffer = self.scratch_buffers.pop().unwrap_or_default();
+            buffer.clear();
+            buffer.resize(want, 0);
+            let read = read_at(self.offset, &mut buffer);
+            buffer.truncate(read);
+            if read == 0 {
+                self.stopped = true;
+            } else {
+                self.lines_before += count_newlines_in(&buffer);
+                self.prev_byte = buffer.last().copied();
+                self.offset += read as u64;
+            }
+            self.scratch_buffers.push(buffer);
+        }
+
         // Blocks are read serially (the `read_at` contract is a
         // single-threaded cursor) in rounds of up to `workers` blocks
         // — at most 8 × 64 KB of live memory — and each round's
@@ -293,6 +325,55 @@ impl LineIndexBuilder {
     pub fn finish(self) -> LineIndex {
         self.snapshot()
     }
+
+    /// Resume a build from a snapshot taken over the same source
+    /// (roadmap item 22, Ghost Tail): the snapshot's checkpoints,
+    /// newline total and frontier seed the new builder, so
+    /// [`Self::advance`] continues exactly where the snapshotted
+    /// build stopped and the finished index is checkpoint-identical
+    /// to a one-shot build — the growth path only ever has to scan
+    /// the appended tail. When the snapshot's source has since
+    /// grown, pass the *extended* snapshot (see
+    /// [`LineIndex::extended_to`]): the builder's promised length is
+    /// the snapshot's `total_length`, so the extension is what
+    /// tells it about the new bytes. A snapshot with no bytes
+    /// indexed resumes as a fresh build (its checkpoint list may
+    /// hold only the synthesised origin checkpoint, which a fresh
+    /// builder reproduces itself).
+    pub fn resume_from(index: &LineIndex) -> LineIndexBuilder {
+        if index.indexed_bytes() == 0 {
+            return LineIndexBuilder::new(index.total_length());
+        }
+        // A snapshot taken after a build stopped early (the source
+        // ended before its promised length) can carry a checkpoint
+        // exactly at the frontier — the empty block that discovered
+        // the end. Drop any such trailing checkpoints: the resumed
+        // build pushes the frontier's checkpoint itself when it
+        // gets there, and the newline accounting comes from the
+        // snapshot's total, not from the dropped entries.
+        let mut checkpoints = index.checkpoints().to_vec();
+        while checkpoints
+            .last()
+            .is_some_and(|cp| cp.byte_offset >= index.indexed_bytes())
+        {
+            checkpoints.pop();
+        }
+        LineIndexBuilder {
+            total_len: index.total_length(),
+            checkpoints,
+            lines_before: index.total_newlines(),
+            // The byte before the frontier matters only through
+            // "was it a newline" (the next checkpoint's
+            // at_line_start), which the snapshot's
+            // ends_with_newline answers exactly.
+            prev_byte: Some(if index.ends_with_newline { b'\n' } else { 0 }),
+            offset: index.indexed_bytes(),
+            stopped: false,
+            scratch_buffers: Vec::new(),
+            scratch_blocks: Vec::new(),
+            scratch_results: Vec::new(),
+        }
+    }
 }
 
 /// The sparse checkpoint index over one byte source.
@@ -346,6 +427,25 @@ impl LineIndex {
     /// index, the staged frontier for a partial one.
     pub fn indexed_bytes(&self) -> u64 {
         self.indexed_bytes
+    }
+
+    /// Re-promise this index against a longer source (roadmap item
+    /// 22, Ghost Tail): when the source grows by appends, the bytes
+    /// already indexed are unchanged, so the checkpoints, newline
+    /// total and frontier carry over verbatim and only the promised
+    /// length grows — the result is the partial index of the grown
+    /// source, ready to be finished by
+    /// [`LineIndexBuilder::resume_from`]. Returns `None` when
+    /// `new_total_len` is below the length this index already
+    /// describes (that is not growth).
+    pub fn extended_to(&self, new_total_len: u64) -> Option<LineIndex> {
+        if new_total_len < self.total_length {
+            return None;
+        }
+        let mut extended = self.clone();
+        extended.total_length = new_total_len;
+        extended.complete = self.complete && new_total_len == self.total_length;
+        Some(extended)
     }
 
     /// True when this index describes the whole source. A partial
@@ -848,6 +948,65 @@ mod tests {
         let head2 = LineIndex::build_prefix(data.len() as u64, INDEX_HEAD_BYTES, reader_for(&data));
         assert_eq!(head2.checkpoints(), head.checkpoints());
         assert_eq!(head2.indexed_bytes(), head.indexed_bytes());
+    }
+
+    #[test]
+    fn resume_from_a_snapshot_finishes_identically() {
+        // Ghost Tail core, index level: index a prefix, snapshot,
+        // resume, finish — the result must be checkpoint-identical
+        // to the one-shot build of the same source.
+        let data = synthetic_doc(200_000); // 6.4 MB
+        let full = LineIndex::build_from_bytes(&data);
+        let head = LineIndex::build_prefix(data.len() as u64, INDEX_HEAD_BYTES, reader_for(&data));
+        let mut builder = LineIndexBuilder::resume_from(&head);
+        assert_eq!(builder.indexed_bytes(), head.indexed_bytes());
+        assert_eq!(builder.total_len(), data.len() as u64);
+        let mut reader = reader_for(&data);
+        assert!(builder.advance(u64::MAX, &mut reader));
+        let resumed = builder.finish();
+        assert_eq!(resumed.checkpoints(), full.checkpoints());
+        assert_eq!(resumed.total_newlines(), full.total_newlines());
+        assert_eq!(resumed.line_count(), full.line_count());
+    }
+
+    #[test]
+    fn growth_extension_and_resume_scan_only_the_tail() {
+        // The full Ghost Tail index flow: the source is indexed
+        // completely at its old length; the file then grows. The
+        // extended snapshot keeps every old checkpoint, and the
+        // resumed build finishes with checkpoints identical to a
+        // one-shot build of the grown source.
+        let old = synthetic_doc(3_000); // 96_000 bytes
+        let tail = synthetic_doc(2_000);
+        let mut grown = old.clone();
+        grown.extend_from_slice(&tail);
+        let old_index = LineIndex::build_from_bytes(&old);
+        assert!(old_index.is_complete());
+        let extended = old_index
+            .extended_to(grown.len() as u64)
+            .expect("growth extends");
+        assert!(!extended.is_complete());
+        assert_eq!(extended.total_length(), grown.len() as u64);
+        assert_eq!(extended.indexed_bytes(), old.len() as u64);
+        assert_eq!(extended.checkpoints(), old_index.checkpoints());
+        assert_eq!(extended.total_newlines(), old_index.total_newlines());
+        // Shrinking the promise is refused, the same length is the
+        // identity.
+        assert!(old_index.extended_to(old.len() as u64 - 1).is_none());
+        assert_eq!(
+            old_index
+                .extended_to(old.len() as u64)
+                .unwrap()
+                .checkpoints(),
+            old_index.checkpoints()
+        );
+        let mut builder = LineIndexBuilder::resume_from(&extended);
+        let mut reader = reader_for(&grown);
+        assert!(builder.advance(u64::MAX, &mut reader));
+        let finished = builder.finish();
+        let one_shot = LineIndex::build_from_bytes(&grown);
+        assert_eq!(finished.checkpoints(), one_shot.checkpoints());
+        assert_eq!(finished.line_count(), 5_000);
     }
 
     #[test]
