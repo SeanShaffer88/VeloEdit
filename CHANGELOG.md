@@ -162,6 +162,40 @@ release asset naming in the specification.
   threads, producing checkpoints identical to the serial build.
 - Search scanning uses the same word-parallel technique to filter
   candidate positions before verifying them; results are unchanged.
+- Find bar restyle: the bar is now the same height as the toolbar
+  and its buttons share the toolbar buttons' size and drawn style.
+  The field labels and the match count sit on the bar's own
+  background instead of in panel-coloured boxes — the count in the
+  muted colour, vertically centred with the buttons, with clear
+  space on both sides — and the "In selection" toggle shows its
+  on state like the Text / Hex toggles (accent border and text,
+  with a ✓ before its name) instead of a ballot-box glyph.
+- Instant open for huge files: opening a file no longer waits
+  for its whole line index to be built. The window opens after
+  indexing just the first few megabytes — enough for the first
+  screens — and the rest of the index finishes on the background
+  thread while you work. The status bar shows "Indexing NN%"
+  until the index lands, and until then the scrollbar measures
+  your place by file size rather than by line; scrolling reaches
+  as far as the index has built, which sweeps the file in
+  seconds. Positions are exact at every stage, and the finished
+  index is identical to a one-shot build.
+- Window polish pass: the toolbar buttons (Open, Save, Undo,
+  Redo, Find, Replace) carry small drawn icons beside their
+  labels. The Text / Hex switch is now one segmented control —
+  the two sides joined with no gap under one shared frame and a
+  single divider, the side in use filled with the accent colour
+  and labelled in white. Every owner-drawn button (toolbar,
+  find bar, change bar, and the dialogs) now shows keyboard
+  focus as an accent frame inset inside its border. The current
+  line sits on a raised band — the background blended halfway
+  toward the panel colour — spanning the text area in both
+  modes, and line numbers away from the current line are drawn
+  one step brighter than before. The status bar leads its
+  right-hand facts with the text size as a percentage (100% is
+  the standard size, updated live by the font commands and
+  Ctrl+mouse-wheel) and keeps clear space at both ends of the
+  window.
 
 ## [1.0.1] — Unreleased
 
