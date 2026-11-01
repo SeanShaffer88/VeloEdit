@@ -17,14 +17,21 @@
 //!   the standard line-feed code unit has `0x0A` as its low byte in both
 //!   byte orders. A trailing `'\r'` is treated as part of the line
 //!   ending, never as content.
-//! * The line index is rebuilt lazily from the piece table whenever its
-//!   recorded length no longer matches the document (an edit happened).
-//!   On open, the GUI seeds it from its background thread via
-//!   [`Editor::attach_line_index`] (the SPEC.md section 3.1 secondary
-//!   thread); a rebuild here is a sequential scan, bounded in memory by
-//!   the index's 64 KB checkpoint buffer. For a 100+ GB file the seeded
-//!   index is what keeps opening instant — the lazy rebuild only runs
-//!   after an edit, over the edited document.
+//! * The line index is *staged*: the first line question over a fresh
+//!   document indexes only the head region
+//!   ([`crate::line_index::INDEX_HEAD_BYTES`]) synchronously, so
+//!   opening a huge file never waits for a full scan, and the GUI's
+//!   background thread (the SPEC.md section 3.1 secondary thread)
+//!   delivers the growing and then complete index through
+//!   [`Editor::attach_line_index`]. While the index is partial,
+//!   positions stay exact — lines past the frontier resolve by
+//!   scanning forward from the nearest checkpoint — and
+//!   [`Editor::line_count`] reports the indexed prefix's count, a
+//!   lower bound, never a claimed document total.
+//!   [`Editor::rebuild_index`] is the explicit full synchronous
+//!   build. After an edit the index is stale rather than rebuilt:
+//!   its still-valid prefix plus bounded forward scans keep every
+//!   answer exact (see `index_dirty_from`).
 //! * Dirty tracking: any mutation sets the flag; undo/redo recompute it
 //!   as "history can still undo", which is exact because saving clears
 //!   the history (save is a history boundary, Slice 3). One known
@@ -37,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 use crate::encoding::{self, Detection, EncodeError, TextEncoding};
 use crate::hexview;
-use crate::line_index::LineIndex;
+use crate::line_index::{count_newlines_in, LineIndex, INDEX_HEAD_BYTES};
 use crate::piece_table::PieceTable;
 use crate::save::{SaveError, SaveReport};
 use crate::search::{self, SearchOptions};
@@ -246,6 +253,13 @@ pub struct Editor {
     /// Last (line, raw start) found by walking, so sequential row
     /// fetches after an edit stay proportional to the viewport.
     walk_cache: Option<(u64, u64)>,
+    /// Memo of the last line start resolved under a partial
+    /// (staged) index, keyed by line. Paint passes ask for the
+    /// first visible line on every frame while the walk cache sits
+    /// a page ahead of it; without this memo, a view parked past
+    /// the frontier (say at end of file) would re-scan the whole
+    /// unindexed gap per frame. Cleared wherever `walk_cache` is.
+    row_anchor: Option<(u64, u64)>,
     line_ending: &'static str,
     dirty: bool,
     matches: Vec<u64>,
@@ -294,6 +308,7 @@ impl Editor {
             nl_delta: 0,
             nl_delta_known: true,
             walk_cache: None,
+            row_anchor: None,
             line_ending,
             dirty: false,
             matches: Vec::new(),
@@ -488,12 +503,21 @@ impl Editor {
     /// thread) when it describes the document's current bytes and the
     /// document has not been edited since; an index for different
     /// bytes is ignored (the lazy paths below keep working anyway).
+    /// Staged builds arrive as a growing sequence of snapshots: a
+    /// snapshot whose frontier is behind the one already held is
+    /// ignored, so the indexed prefix never shrinks.
     pub fn attach_line_index(&mut self, index: LineIndex) {
         if index.total_length() == self.total_len() && self.index_dirty_from.is_none() {
+            if let Some(current) = &self.index {
+                if current.indexed_bytes() > index.indexed_bytes() {
+                    return;
+                }
+            }
             self.index = Some(index);
             self.nl_delta = 0;
             self.nl_delta_known = true;
             self.walk_cache = None;
+            self.row_anchor = None;
         }
     }
 
@@ -503,16 +527,57 @@ impl Editor {
         self.index.is_some() && self.index_dirty_from.is_none()
     }
 
+    /// Whether a *complete* line index describes the current
+    /// document: the staged background build has finished and no
+    /// edit has landed since. Callers that need document totals
+    /// (a go-to-line clamp, the final line count) wait for this.
+    pub fn has_complete_index(&self) -> bool {
+        self.index.as_ref().is_some_and(|i| i.is_complete()) && self.index_dirty_from.is_none()
+    }
+
+    /// Whether the held index is a staged build still in progress
+    /// (its checkpoints cover a prefix of the document only).
+    pub fn index_is_partial(&self) -> bool {
+        self.index.as_ref().is_some_and(|i| !i.is_complete())
+    }
+
+    /// Bytes covered by the held index (0 when there is none): the
+    /// staged frontier the background build has reached.
+    pub fn index_frontier(&self) -> u64 {
+        self.index.as_ref().map(|i| i.indexed_bytes()).unwrap_or(0)
+    }
+
+    /// Index the head region now (the staged-open seed): the same
+    /// lazy build the first line question would perform, done
+    /// explicitly at open so the first paint never pays for it.
+    /// Documents no larger than the head region come back fully
+    /// indexed; larger ones are partial until the background build
+    /// is attached.
+    pub fn seed_line_index(&mut self) {
+        self.ensure_index();
+    }
+
     fn ensure_index(&mut self) {
         if self.index.is_none() {
+            // Staged open: only the head region is indexed
+            // synchronously, so the first line question over a huge
+            // document returns at once. Completing the index is the
+            // caller's background job (the GUI's index thread,
+            // delivered via `attach_line_index`) or an explicit
+            // `rebuild_index`; until then, positions resolve exactly
+            // through the partial index's forward scans and
+            // `line_count` reports the indexed prefix.
             let table = &self.table;
             let index =
-                LineIndex::build(self.total_len(), |offset, out| table.read_into(offset, out));
+                LineIndex::build_prefix(self.total_len(), INDEX_HEAD_BYTES, |offset, out| {
+                    table.read_into(offset, out)
+                });
             self.index = Some(index);
             self.index_dirty_from = None;
             self.nl_delta = 0;
             self.nl_delta_known = true;
             self.walk_cache = None;
+            self.row_anchor = None;
         }
     }
 
@@ -520,8 +585,14 @@ impl Editor {
     /// Editing never needs this (the lazy paths stay exact); it exists
     /// for callers that want the index itself refreshed in one go.
     pub fn rebuild_index(&mut self) {
-        self.index = None;
-        self.ensure_index();
+        let table = &self.table;
+        let index = LineIndex::build(self.total_len(), |offset, out| table.read_into(offset, out));
+        self.index = Some(index);
+        self.index_dirty_from = None;
+        self.nl_delta = 0;
+        self.nl_delta_known = true;
+        self.walk_cache = None;
+        self.row_anchor = None;
     }
 
     /// Number of lines in the document (0 for an empty document).
@@ -529,10 +600,17 @@ impl Editor {
     /// newline effect is tracked (typing, deletion, replace); after
     /// undo/redo it falls back to the index's own count until a
     /// re-index — a documented approximation only the scrollbar and
-    /// page clamping consume.
+    /// page clamping consume. While the staged index is still
+    /// partial it returns the indexed prefix's line count — a lower
+    /// bound for the document, never a claimed total; the shell
+    /// shows the build's percentage instead of presenting this as
+    /// the document's line count.
     pub fn line_count(&mut self) -> u64 {
         self.ensure_index();
         let index = self.index.as_ref().expect("index present");
+        if !index.is_complete() {
+            return index.line_count();
+        }
         if self.index_dirty_from.is_none() {
             return index.line_count();
         }
@@ -594,10 +672,46 @@ impl Editor {
         self.ensure_index();
         if self.index_dirty_from.is_none() {
             let index = self.index.as_ref().expect("index present");
+            let partial = !index.is_complete();
+            if partial {
+                // Partial (staged) index: the row anchor memoizes
+                // the last line start resolved this way. Paint
+                // passes ask for the first visible line every frame
+                // while the walk cache sits a page ahead of it, so
+                // without the anchor a view parked past the
+                // frontier would re-scan the whole unindexed gap
+                // on every frame.
+                if let Some((_, start)) = self.row_anchor.filter(|(l, _)| *l == line) {
+                    return Some(start);
+                }
+                // A cached walk position at or before the target
+                // is the next cheapest exact route — sequential
+                // row fetches stay proportional to the page instead
+                // of re-scanning the unindexed gap from the last
+                // checkpoint for every row.
+                if let Some((wl, ws)) = self.walk_cache.filter(|(l, _)| *l <= line) {
+                    let resolved = self.walk_lines((wl, ws), line);
+                    if let Some(start) = resolved {
+                        self.row_anchor = Some((line, start));
+                    }
+                    return resolved;
+                }
+            }
             let table = &self.table;
-            let start = index.line_start_offset(line, |offset, out| table.read_into(offset, out));
+            // A partial index resolves through the forward
+            // resolver: lines past the frontier have no checkpoints
+            // yet, but their starts are still exact — the scan walks
+            // from the last checkpoint, counting blocks at speed.
+            let start = if partial {
+                index.line_start_offset_forward(line, |offset, out| table.read_into(offset, out))
+            } else {
+                index.line_start_offset(line, |offset, out| table.read_into(offset, out))
+            };
             if let Some(start) = start {
                 self.walk_cache = Some((line, start));
+                if partial {
+                    self.row_anchor = Some((line, start));
+                }
             }
             return start;
         }
@@ -609,7 +723,7 @@ impl Editor {
         // first edited byte (that start lies in the index's
         // still-valid prefix — the bytes before an edit never move).
         let dirty = self.index_dirty_from.unwrap_or(0);
-        let (mut cur_line, mut cur_start) = match self.walk_cache {
+        let (cur_line, cur_start) = match self.walk_cache {
             Some((l, s)) if l <= line => (l, s),
             _ => {
                 let (l, start) = self.line_and_start(dirty);
@@ -624,9 +738,23 @@ impl Editor {
                 (l, start)
             }
         };
+        self.walk_lines((cur_line, cur_start), line)
+    }
+
+    /// Walk forward from a known `(line, raw start)` to `line`, one
+    /// line at a time, refreshing the walk cache as it goes. The
+    /// cost is the bytes of the lines crossed. `None` when no
+    /// further line exists.
+    fn walk_lines(&mut self, from: (u64, u64), line: u64) -> Option<u64> {
+        let (mut cur_line, mut cur_start) = from;
         while cur_line < line {
             let (_, _, next) = self.line_bounds(cur_start);
-            if next <= cur_start {
+            // `next` at the end of the document is the
+            // no-further-line sentinel (with or without a trailing
+            // newline): the line that would start there is the
+            // phantom after the last line and does not exist, the
+            // same answer the index resolvers give.
+            if next <= cur_start || next >= self.total_len() {
                 return None; // no further line exists
             }
             cur_line += 1;
@@ -640,12 +768,27 @@ impl Editor {
     /// line 0 the range starts after any byte-order mark. `None` when
     /// the line does not exist.
     pub fn line_content_range(&mut self, line: u64) -> Option<(u64, u64)> {
-        if self.index_dirty_from.is_none() && line >= self.line_count() {
+        // The count gate applies only to a complete index: while
+        // the staged build is partial, the prefix count would
+        // wrongly reject lines past the frontier — the resolver
+        // below answers for them exactly (or returns None past the
+        // last line).
+        let complete = self.index.as_ref().is_some_and(|i| i.is_complete());
+        if self.index_dirty_from.is_none() && complete && line >= self.line_count() {
             return None;
         }
         let raw_start = self.line_start(line)?;
         let (start, end, _) = self.line_bounds(raw_start);
         Some((start, end))
+    }
+
+    /// Byte offset where a line's content starts (after any
+    /// byte-order mark on line 0), or `None` when the line does not
+    /// exist. The shell's size-proportional scrollbar uses this
+    /// while the staged index is partial, when line numbers do not
+    /// yet span the document but byte positions always do.
+    pub fn line_start_byte(&mut self, line: u64) -> Option<u64> {
+        self.line_content_range(line).map(|(start, _)| start)
     }
 
     /// Decoded text of one line's content (strict decode, lossy on
@@ -700,17 +843,41 @@ impl Editor {
                 cp.byte_offset,
             )
         };
-        let mut buffer = [0u8; 8192];
+        // Forward scan from the seed to `offset`, counting
+        // newlines a 64 KB block at a time (SWAR) so a caret deep
+        // past the indexed frontier — or deep past an edit — costs
+        // a scan-speed pass, not a byte-at-a-time walk. Only the
+        // final block (the one containing `offset`) and any short
+        // read are scanned byte-wise, where each newline's exact
+        // position is tracked as before.
+        let mut buffer = vec![0u8; 65536];
         while pos < offset {
-            let want = ((offset - pos).min(8192)) as usize;
+            let want = ((offset - pos).min(buffer.len() as u64)) as usize;
             let read = self.table.read_into(pos, &mut buffer[..want]);
             if read == 0 {
                 break;
             }
-            for (i, &b) in buffer[..read].iter().enumerate() {
-                if b == b'\n' {
-                    line += 1;
-                    line_start = Some(pos + i as u64 + 1);
+            let chunk = &buffer[..read];
+            if read == buffer.len() {
+                // A whole block (which by the `want` cap ends at or
+                // before `offset`): count it in bulk; the line
+                // containing `offset` starts after its last newline,
+                // if it has one.
+                let in_block = count_newlines_in(chunk);
+                if in_block > 0 {
+                    line += in_block;
+                    let last = chunk
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .expect("counted newlines are present");
+                    line_start = Some(pos + last as u64 + 1);
+                }
+            } else {
+                for (i, &b) in chunk.iter().enumerate() {
+                    if b == b'\n' {
+                        line += 1;
+                        line_start = Some(pos + i as u64 + 1);
+                    }
                 }
             }
             pos += read as u64;
@@ -784,7 +951,16 @@ impl Editor {
 
     /// The visible text rows starting at `first_line`, at most `count`.
     pub fn visible_text_rows(&mut self, first_line: u64, count: usize) -> Vec<TextRow> {
-        let total = self.line_count();
+        // While the staged index is partial there is no document
+        // total to bound against: rows are fetched until the
+        // resolver reports no line, which is exact at the end of
+        // the document and never blocks inside the prefix.
+        self.ensure_index();
+        let total = if self.index_is_partial() {
+            u64::MAX
+        } else {
+            self.line_count()
+        };
         let mut rows = Vec::new();
         let mut line = first_line;
         while (rows.len()) < count && line < total {
@@ -1060,6 +1236,7 @@ impl Editor {
             None => first_touched,
         });
         self.walk_cache = None;
+        self.row_anchor = None;
     }
 
     /// Track the newline effect of an edit so `line_count` stays exact
@@ -1255,6 +1432,7 @@ impl Editor {
         self.index_dirty_from = Some(0);
         self.nl_delta_known = false;
         self.walk_cache = None;
+        self.row_anchor = None;
         self.dirty = self.history.can_undo();
         true
     }
@@ -1271,6 +1449,7 @@ impl Editor {
         self.index_dirty_from = Some(0);
         self.nl_delta_known = false;
         self.walk_cache = None;
+        self.row_anchor = None;
         self.dirty = true;
         true
     }
@@ -1756,6 +1935,7 @@ impl Editor {
             self.nl_delta = 0;
             self.nl_delta_known = true;
             self.walk_cache = None;
+            self.row_anchor = None;
         }
         report
     }
@@ -2374,6 +2554,197 @@ mod tests {
         e.rebuild_index();
         assert!(e.has_current_index());
         assert_eq!(e.line_count(), 3);
+    }
+
+    /// A synthetic multi-MB document for the staged-open tests:
+    /// `lines` lines of 32 bytes each ("line NNNNNN" + padding +
+    /// newline) — 200,000 lines is 6.4 MB, past the 4 MB head
+    /// region, with every line start at `line * 32` by construction.
+    fn big_doc(lines: u64) -> Vec<u8> {
+        let mut data = Vec::new();
+        for i in 0..lines {
+            let mut line = format!("line {i:06}").into_bytes();
+            line.resize(31, b'.');
+            line.push(b'\n');
+            data.extend_from_slice(&line);
+        }
+        data
+    }
+
+    fn big_line_text(i: u64) -> String {
+        let mut line = format!("line {i:06}");
+        line.push_str(&".".repeat(20));
+        line
+    }
+
+    #[test]
+    fn staged_open_indexes_only_the_head_and_stays_exact() {
+        let data = big_doc(200_000);
+        let total = data.len() as u64;
+        let mut e = Editor::open_from_bytes(data.clone(), None, false);
+        // Nothing is indexed until the first line question, and
+        // that question pays only for the head region.
+        assert_eq!(e.index_frontier(), 0);
+        let prefix_count = e.line_count();
+        assert!(e.index_is_partial(), "open must not index the whole file");
+        assert!(!e.has_complete_index());
+        let frontier = e.index_frontier();
+        assert!(frontier >= INDEX_HEAD_BYTES && frontier < total);
+        // The reported count is the indexed prefix's own count
+        // (32-byte lines: the frontier is a whole number of lines).
+        assert_eq!(prefix_count, frontier / 32);
+        assert!(prefix_count < 200_000, "not a claimed document total");
+        // The first screen paints from the head region.
+        let rows = e.visible_text_rows(0, 40);
+        assert_eq!(rows.len(), 40);
+        assert_eq!(rows[0].text, big_line_text(0));
+        assert_eq!(rows[39].text, big_line_text(39));
+        // Lines past the frontier resolve exactly by forward scan.
+        assert_eq!(e.line_start_byte(150_000), Some(150_000 * 32));
+        // The resolution is memoized in the row anchor, so a paint
+        // pass asking for the same first row again is O(1) instead
+        // of a fresh scan across the unindexed gap.
+        assert_eq!(e.row_anchor, Some((150_000, 150_000 * 32)));
+        assert_eq!(e.line_start_byte(150_000), Some(150_000 * 32));
+        assert_eq!(e.line_text(199_999).unwrap(), big_line_text(199_999));
+        assert_eq!(e.line_text(200_000), None);
+        // The caret at the very end resolves exactly, and agrees
+        // with a fully indexed reference editor.
+        let mut reference = Editor::open_from_bytes(data.clone(), None, false);
+        reference.rebuild_index();
+        assert_eq!(e.line_col_of(total), reference.line_col_of(total));
+        assert_eq!(e.line_col_of(3_333_333), reference.line_col_of(3_333_333));
+    }
+
+    #[test]
+    fn staged_completion_attaches_and_matches_a_full_build() {
+        let data = big_doc(200_000);
+        let total = data.len() as u64;
+        let mut e = Editor::open_from_bytes(data.clone(), None, false);
+        e.seed_line_index();
+        assert!(e.index_is_partial());
+        // The background build's final snapshot attaches: the
+        // editor becomes complete with the document's true totals.
+        e.attach_line_index(LineIndex::build_from_bytes(&data));
+        assert!(e.has_complete_index());
+        assert!(!e.index_is_partial());
+        assert_eq!(e.index_frontier(), total);
+        assert_eq!(e.line_count(), 200_000);
+        // A late, smaller snapshot never shrinks the frontier.
+        e.attach_line_index(LineIndex::build_prefix(
+            total,
+            INDEX_HEAD_BYTES,
+            |offset, out| {
+                let start = offset as usize;
+                if start >= data.len() {
+                    return 0;
+                }
+                let n = out.len().min(data.len() - start);
+                out[..n].copy_from_slice(&data[start..start + n]);
+                n
+            },
+        ));
+        assert_eq!(e.index_frontier(), total);
+        assert_eq!(e.line_count(), 200_000);
+    }
+
+    #[test]
+    fn edit_during_staged_build_discards_it_and_stays_exact() {
+        let data = big_doc(200_000);
+        let mut e = Editor::open_from_bytes(data.clone(), None, false);
+        e.seed_line_index();
+        assert!(e.index_is_partial());
+        // An edit lands mid-document while the staged build is in
+        // flight (inside the indexed prefix, at line 100,000).
+        e.goto_line(100_001);
+        assert_eq!(e.caret(), 100_000 * 32);
+        e.insert_text("inserted line\n").unwrap();
+        // The in-flight build describes the pre-edit bytes: its
+        // final snapshot must be refused, exactly as the shell's
+        // generation rule discards it.
+        e.attach_line_index(LineIndex::build_from_bytes(&data));
+        assert!(!e.has_complete_index(), "stale build must not attach");
+        // The edited document, built from scratch as a reference.
+        let mut edited = data.clone();
+        edited.splice(3_200_000..3_200_000, b"inserted line\n".iter().copied());
+        let mut reference = Editor::open_from_bytes(edited.clone(), None, false);
+        reference.rebuild_index();
+        assert_eq!(reference.line_count(), 200_001);
+        // Positions and contents stay exact against the reference —
+        // before the edit, at it, and at the end of the file.
+        assert_eq!(e.line_text(100_000).unwrap(), "inserted line");
+        assert_eq!(e.line_text(100_001).unwrap(), big_line_text(100_000));
+        assert_eq!(e.line_text(200_000).unwrap(), big_line_text(199_999));
+        for offset in [0u64, 3_200_000, 3_200_014, 3_200_025, edited.len() as u64] {
+            assert_eq!(
+                e.line_col_of(offset),
+                reference.line_col_of(offset),
+                "offset {offset}"
+            );
+        }
+        // The count is the documented lower bound while partial and
+        // stale — never the pre-edit total presented as current.
+        assert!(e.line_count() <= reference.line_count());
+        // The explicit rebuild (the baseline the shell returns to
+        // at save/open) restores a complete, exact index of the
+        // edited bytes.
+        e.rebuild_index();
+        assert!(e.has_complete_index());
+        assert_eq!(e.line_count(), reference.line_count());
+        assert_eq!(e.line_text(100_000).unwrap(), "inserted line");
+        assert_eq!(e.line_text(200_001), None);
+        assert_eq!(reference.line_text(200_001), None);
+    }
+
+    /// Measured on this VM, not asserted: open-return timings over
+    /// a ~1 GB in-memory document. "Before" is the old open path —
+    /// the first line question paying for a full synchronous index
+    /// build (what `rebuild_index` still does on demand); "after"
+    /// is the staged open, where the first line question pays only
+    /// for the head region. Run with
+    /// `cargo test --release bench_editor_open -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_editor_open_1gb() {
+        // ~1 GB of 100-byte log-like lines, built by repeating a
+        // 1 MB block (generation speed is not what is measured).
+        let mut block = Vec::with_capacity(1_000_000);
+        let mut n = 0u64;
+        while block.len() < 1_000_000 {
+            let mut line = format!("2026-11-01T00:00:00Z INFO worker request {n} ok").into_bytes();
+            line.resize(99, b' ');
+            line.push(b'\n');
+            block.extend_from_slice(&line);
+            n += 1;
+        }
+        let mut data = Vec::with_capacity(1_000_000_000 + block.len());
+        while data.len() < 1_000_000_000 {
+            data.extend_from_slice(&block);
+        }
+        let total = data.len() as u64;
+        eprintln!("bench document: {total} bytes");
+
+        let t = std::time::Instant::now();
+        let mut e = Editor::open_from_bytes(data, None, false);
+        let count = e.line_count();
+        let after_ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "staged open, first line question: {after_ms:.2} ms \
+             (prefix count {count}, frontier {})",
+            e.index_frontier()
+        );
+        assert!(e.index_is_partial());
+
+        let t = std::time::Instant::now();
+        e.rebuild_index();
+        let before_ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "full synchronous build (old open): {before_ms:.1} ms \
+             ({:.0} MB/s)",
+            total as f64 / (before_ms / 1000.0) / 1e6
+        );
+        assert!(e.has_complete_index());
+        assert_eq!(e.line_count(), total / 100);
     }
 
     #[test]
