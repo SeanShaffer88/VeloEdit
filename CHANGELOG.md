@@ -158,15 +158,16 @@ release asset naming in the specification.
   keeping the caret, selection and scroll position — no reload.
   A file that shrank or changed size-for-size never takes this
   path; it stays with the external-change notice. Only an
-  unedited document may grow this way. The window's follow
-  watcher arrives in a later slice.
+  unedited document may grow this way. The window behaviour is
+  listed as Follow Tail with the view features below.
 - Log filter core: the model behind filter mode — given a literal
   or masked search, the ordered list of matching lines with their
   byte ranges and two-way mapping between filtered rows and
   full-file lines/offsets, for one-click jumps back into the full
   file. On a still-building (partial) line index the filter
   covers only the indexed prefix and reports that it is
-  incomplete. The filter window arrives in a later slice.
+  incomplete. The filter window is listed with the view
+  features below.
 - Multi-range slicing core: carve several ranges out of a
   document into one streamed output — a spec like
   `1,000,000-1,050,000; L100-L200` mixes byte ranges (both ends
@@ -192,29 +193,101 @@ release asset naming in the specification.
   UTF-16LE runs (minimum length in characters, default 4),
   returning each run's byte offset, byte length and a capped
   text preview — windowed, so the file is never loaded whole.
-  The strings pane arrives in a later slice.
+  The strings pane is listed with the view features below.
 - Entropy core: Shannon entropy per block over a document
   (block size a parameter, default 4096 bytes), returning one
   value per block in the range 0.0 to 8.0 — the data behind an
-  entropy strip. The strip arrives in a later slice.
+  entropy strip, listed with the view features below.
 - Pointer-following core: at a byte offset, the stored value
   read as a 32- or 64-bit integer in both byte orders, each
   marked when it lands inside the document (a plausible jump
   target); plus a jump-history stack (push on jump, back /
-  forward, capped at 128 entries) the window will own. The
-  jump surface arrives in a later slice.
+  forward, capped at 128 entries). The jump surface is listed
+  with the view features below.
 - Time-delta core: parse the timestamp at the start of a log
   line (ISO 8601 with `T` or space separator, and time-of-day
   only, each with an optional 1–3 digit fraction; invalid dates
   and times are rejected) and compute the millisecond delta
-  between consecutive lines. The delta gutter arrives in a
-  later slice.
+  between consecutive lines. The delta gutter is listed with
+  the view features below.
 - Delimiter grid core: detect a delimited file's delimiter
   (comma, tab, semicolon, pipe) by consistency scoring over a
   sample of lines, and split a line into column byte ranges —
   with CSV quoting (double-quote escapes) applied to comma
-  files only, as documented in the core. The grid mode arrives
-  in a later slice.
+  files only, as documented in the core. The grid mode is
+  listed with the view features below.
+- Follow Tail (window, Ghost Tail): View ▸ Follow Tail watches
+  the open file; while it is on and the document has no edits of
+  your own, a file that only grew on disk is adopted silently —
+  the new bytes join the document, line indexing resumes where
+  it stopped, and your caret, selection, scroll position and
+  mode are untouched (a view at the end stays at the end). The
+  status bar reads "Following" while the mode is on. A shrink or
+  a same-size rewrite still shows the external-change bar, as
+  does an edited document — growth is only ever adopted into a
+  document with no edit history.
+- Filter view (window): Search ▸ Filter… asks for a pattern and
+  switches the text view to only the lines that contain it, each
+  shown with its original line number under a banner naming the
+  pattern and the line count. Arrow keys walk the rows; Enter
+  returns to the full file at that line; Esc returns without
+  moving. The view is read-only — the status bar says so. On a
+  file whose line index is still building, the filter covers
+  the indexed prefix and the banner says matches so far are
+  partial; it rebuilds itself when the index completes.
+- Word Wrap (window): View ▸ Word Wrap folds long lines at the
+  window's edge in text mode. Wrapping is display only; clicks,
+  caret movement (Up/Down move by display row) and selection all
+  follow the wrapped rows.
+- Strings pane (window): View ▸ Strings Pane docks a list of the
+  readable text runs found in the document along the bottom,
+  each with its offset; the scan runs on a worker for large
+  files. Double-click a row to jump to the string, and the
+  header's min 4 / 6 / 8 chips set the shortest run listed.
+- Entropy strip (window): View ▸ Entropy Strip shows a thin
+  strip under the toolbar coloured per block from the panel
+  colour (low entropy) to the accent (packed or encrypted
+  data); clicking the strip seeks the view to that part of the
+  file. Computed on a worker for large files.
+- Time Deltas (window): View ▸ Time Deltas adds a gutter column
+  showing the time between consecutive timestamped log lines
+  (+45ms, +1.25s); lines without a timestamp show nothing.
+- Freeze Top Lines (window): View ▸ Freeze Top Lines… pins a
+  chosen number of top lines (0–50, 0 = off) while the rest
+  scrolls. Frozen lines can be viewed, clicked and jumped to,
+  but not edited; scrolling up stops at the first unfrozen
+  line. Plain text view only.
+- Dim Inactive Paragraphs (window): View ▸ Dim Inactive
+  Paragraphs paints paragraphs other than the caret's in the
+  muted colour, so the block being worked on stands out.
+- ANSI Colours and control-character tags (window): View ▸ ANSI
+  Colours renders SGR colour codes in the text (standard and
+  bright foregrounds, bold brightens) and consumes the escape
+  bytes; View ▸ Show Control Characters shows control bytes as
+  small tags (^A, ^?). Byte columns in the status bar stay
+  byte-true either way — painted widths can differ from byte
+  columns when sequences or tags are present.
+- Delimiter Grid (window): View ▸ Delimiter Grid aligns the
+  visible lines' fields into columns when a consistent
+  delimiter is detected in view. Alignment is paint-only: the
+  file's bytes never change, caret and status columns stay
+  byte-based, and Copy copies the raw text, never padded.
+- Pointer following and jump history (window): in hex mode,
+  Ctrl+click a byte (or place the caret and press Ctrl+Enter)
+  to read it as a 32/64-bit pointer in both byte orders and
+  jump to the first reading that lands inside the document;
+  the status bar names the value jumped through. Go To jumps,
+  filter jumps, bookmark jumps, strings jumps and pointer
+  jumps are recorded; Alt+Left / Alt+Right (Search ▸ Back /
+  Forward) walk the history. The history clears when a
+  document opens.
+- Bit editing in the Data Inspector (window): in hex mode the
+  inspector gains a Bits row — eight boxes for the byte at the
+  caret, bits 7 to 0; clicking a box flips that bit as a
+  normal undoable edit, without moving the caret.
+- Scrollbar tick previews (window): resting the pointer on the
+  scrollbar where a match or bookmark tick sits shows a tooltip
+  with the line number and the start of that line.
 
 ### Changed
 
