@@ -30,6 +30,12 @@ pub enum BufferSource {
     Original = 0,
     /// The append-only heap buffer holding edited-in bytes.
     Add = 1,
+    /// A run of zero bytes with no storage behind it (roadmap R4
+    /// zero-run insert): the piece's `source_offset` is meaningless
+    /// (kept 0) and every read path yields `length` zero bytes. A
+    /// save streams the zeros out like any other bytes; until then a
+    /// zero run of any size costs one 24-byte node.
+    Zeroes = 2,
 }
 
 /// One contiguous run of bytes in the visible document.
@@ -391,7 +397,9 @@ impl PieceTable {
         for piece in self.pieces.drain(..) {
             match merged.last_mut() {
                 Some(last)
-                    if last.source == piece.source && last.source_end() == piece.source_offset =>
+                    if last.source == piece.source
+                        && (piece.source == BufferSource::Zeroes
+                            || last.source_end() == piece.source_offset) =>
                 {
                     last.length += piece.length;
                     merges += 1;
@@ -436,6 +444,9 @@ impl PieceTable {
             let store_len = match piece.source {
                 BufferSource::Original => self.original_file_size,
                 BufferSource::Add => self.append_buffer.len() as u64,
+                // A zero run has no store to stay inside; any
+                // length is in bounds by construction.
+                BufferSource::Zeroes => u64::MAX,
             };
             if piece.source_end() > store_len {
                 return false;
@@ -512,6 +523,11 @@ impl PieceTable {
         let len = piece.length as usize;
         match piece.source {
             BufferSource::Add => Cow::Borrowed(&self.append_buffer[start..start + len]),
+            // No storage attached: yield correctly-sized zero bytes
+            // (the same materialisation the `LengthOnly` arm below
+            // performs; chunked readers — `read_into`, the extract
+            // and range writers — never take this path).
+            BufferSource::Zeroes => Cow::Owned(vec![0u8; len]),
             BufferSource::Original => match &self.original {
                 OriginalBuffer::Memory(bytes) => Cow::Borrowed(&bytes[start..start + len]),
                 // No storage attached: yield correctly-sized zero bytes.
@@ -530,6 +546,7 @@ impl PieceTable {
         let len = dst.len();
         match piece.source {
             BufferSource::Add => dst.copy_from_slice(&self.append_buffer[start..start + len]),
+            BufferSource::Zeroes => dst.fill(0),
             BufferSource::Original => match &self.original {
                 OriginalBuffer::Memory(bytes) => dst.copy_from_slice(&bytes[start..start + len]),
                 OriginalBuffer::LengthOnly { .. } => dst.fill(0),
@@ -618,6 +635,81 @@ impl PieceTable {
         debug_assert!(self.check_invariants());
     }
 
+    /// Insert `count` zero bytes at visible `offset` as a single
+    /// [`BufferSource::Zeroes`] piece (roadmap R4 zero-run insert):
+    /// no bytes are stored anywhere, however large `count` is.
+    /// When a zero piece already ends or starts exactly at `offset`
+    /// it is extended in place instead of adding a node, so repeated
+    /// zero inserts at one point stay one piece. Every read path
+    /// (`read`, `read_into`, `byte_at`, `iter_slices`, and through
+    /// them search, save streaming and extract) yields `0x00` for
+    /// the run.
+    ///
+    /// Panics if `offset` is past the end of the document.
+    pub fn insert_zeroes(&mut self, offset: u64, count: u64) {
+        assert!(
+            offset <= self.total_length,
+            "insert_zeroes offset {offset} past end {}",
+            self.total_length
+        );
+        if count == 0 {
+            return;
+        }
+        // Extend the zero piece ending exactly at `offset`.
+        if offset > 0 {
+            if let Some((idx, start)) = self.piece_at_offset(offset - 1) {
+                let piece = self.pieces[idx];
+                if piece.source == BufferSource::Zeroes && start + piece.length == offset {
+                    self.pieces[idx].length += count;
+                    self.weights_add(idx, count);
+                    self.total_length += count;
+                    debug_assert!(self.check_invariants());
+                    return;
+                }
+            }
+        }
+        // Extend the zero piece starting exactly at `offset`.
+        if offset < self.total_length {
+            if let Some((idx, start)) = self.piece_at_offset(offset) {
+                if start == offset && self.pieces[idx].source == BufferSource::Zeroes {
+                    self.pieces[idx].length += count;
+                    self.weights_add(idx, count);
+                    self.total_length += count;
+                    debug_assert!(self.check_invariants());
+                    return;
+                }
+            }
+        }
+        let new_piece = PieceNode::new(BufferSource::Zeroes, 0, count);
+        if offset == self.total_length {
+            self.pieces.push(new_piece);
+        } else if offset == 0 {
+            self.pieces.insert(0, new_piece);
+        } else {
+            let (idx, start) = self
+                .piece_at_offset(offset)
+                .expect("offset < total_length has a piece");
+            if offset == start {
+                self.pieces.insert(idx, new_piece);
+            } else {
+                let piece = self.pieces[idx];
+                let left_len = offset - start;
+                let right = PieceNode::new(
+                    piece.source,
+                    piece.source_offset + left_len,
+                    piece.length - left_len,
+                );
+                self.pieces[idx].length = left_len;
+                self.pieces.insert(idx + 1, new_piece);
+                self.pieces.insert(idx + 2, right);
+            }
+        }
+        self.total_length += count;
+        self.rebuild_weights();
+        self.maybe_auto_coalesce();
+        debug_assert!(self.check_invariants());
+    }
+
     /// Delete `len` bytes starting at visible `offset`. `len` is clamped at
     /// the end of the document. Returns the removed content as pieces
     /// (clipped to the deleted range, in document order) — exactly what the
@@ -687,7 +779,208 @@ impl PieceTable {
         debug_assert!(self.check_invariants());
         removed
     }
+
+    /// The piece a growth of the original store would extend: the
+    /// document's last piece, when it is an `Original` piece ending
+    /// exactly at the current end of the original store — or `None`
+    /// for the fresh piece an empty document over an empty original
+    /// gains. Anything else (the document's tail is an edit, or the
+    /// original's tail was deleted) has no unambiguous place to put
+    /// grown bytes and is refused.
+    fn growth_target(&self) -> Result<Option<usize>, ExtendOriginalError> {
+        if self.pieces.is_empty() {
+            if self.total_length == 0 && self.original_file_size == 0 {
+                return Ok(None);
+            }
+            return Err(ExtendOriginalError::NoTrailingPiece);
+        }
+        let last = self.pieces.last().expect("pieces not empty");
+        if last.source == BufferSource::Original && last.source_end() == self.original_file_size {
+            Ok(Some(self.pieces.len() - 1))
+        } else {
+            Err(ExtendOriginalError::NoTrailingPiece)
+        }
+    }
+
+    /// Apply a validated growth: the original store becomes
+    /// `new_len` bytes, the target piece (or a fresh sole piece)
+    /// covers the grown region, and the document grows by the same
+    /// amount. The caller has already made the backing store match.
+    fn apply_growth(&mut self, new_len: u64, target: Option<usize>) {
+        let delta = new_len - self.original_file_size;
+        self.original_file_size = new_len;
+        match target {
+            Some(idx) => self.pieces[idx].length += delta,
+            None => self
+                .pieces
+                .push(PieceNode::new(BufferSource::Original, 0, new_len)),
+        }
+        self.total_length += delta;
+        self.rebuild_weights();
+        debug_assert!(self.check_invariants());
+    }
+
+    /// Extend the original store to `new_len` after the backing
+    /// file grew on disk (roadmap item 22, Ghost Tail core). The
+    /// grown region joins the document at the original's tail: the
+    /// document's last piece must be the `Original` piece ending at
+    /// the old store end (see [`Self::growth_target`]), and it is
+    /// extended in place — no piece is added and no other piece
+    /// moves. `tail` supplies the grown bytes
+    /// (`[old_len, new_len)`); it is consumed only by the `Memory`
+    /// backing, whose length must match the growth exactly. The
+    /// `LengthOnly` backing ignores it (its reads are zeros by
+    /// contract, grown region included). The Windows `Mapped`
+    /// backing refuses: a mapping cannot grow in place, so the
+    /// shell re-maps and adopts the new backing through
+    /// [`Self::adopt_grown_original`] instead.
+    ///
+    /// A `new_len` at or below the current store length is a
+    /// shrink or a same-size change, never growth: it is refused
+    /// here so the caller routes it to the ordinary
+    /// external-change path.
+    pub fn extend_original(
+        &mut self,
+        new_len: u64,
+        tail: &[u8],
+    ) -> Result<Growth, ExtendOriginalError> {
+        let old_len = self.original_file_size;
+        if new_len <= old_len {
+            return Err(ExtendOriginalError::NotGrowth {
+                current: old_len,
+                requested: new_len,
+            });
+        }
+        let delta = new_len - old_len;
+        match &self.original {
+            OriginalBuffer::Memory(_) => {
+                if tail.len() as u64 != delta {
+                    return Err(ExtendOriginalError::TailLength {
+                        expected: delta,
+                        actual: tail.len() as u64,
+                    });
+                }
+            }
+            OriginalBuffer::LengthOnly { .. } => {}
+            #[cfg(windows)]
+            OriginalBuffer::Mapped(_) => return Err(ExtendOriginalError::MappedBacking),
+        }
+        let target = self.growth_target()?;
+        match &mut self.original {
+            OriginalBuffer::Memory(bytes) => bytes.extend_from_slice(tail),
+            OriginalBuffer::LengthOnly { len } => *len = new_len,
+            #[cfg(windows)]
+            OriginalBuffer::Mapped(_) => unreachable!("mapped backing refused above"),
+        }
+        self.apply_growth(new_len, target);
+        Ok(Growth {
+            old_len,
+            new_len,
+            added: delta,
+        })
+    }
+
+    /// Adopt a replacement backing of exactly `new_len` bytes as
+    /// the grown original store, extending the document's tail
+    /// piece exactly as [`Self::extend_original`] does. This is the
+    /// shell's half of Ghost Tail for the Windows mmap backing: it
+    /// re-maps the grown file, then calls this. The new backing's
+    /// first `old_len` bytes must be the old store's bytes — the
+    /// caller guarantees that by re-mapping the same file.
+    // Exercised by unit tests now; the shell call site lands with
+    // the R4b Ghost Tail watcher wiring.
+    #[allow(dead_code)]
+    pub(crate) fn adopt_grown_original(
+        &mut self,
+        new_len: u64,
+        backing: OriginalBuffer,
+    ) -> Result<Growth, ExtendOriginalError> {
+        let old_len = self.original_file_size;
+        if new_len <= old_len {
+            return Err(ExtendOriginalError::NotGrowth {
+                current: old_len,
+                requested: new_len,
+            });
+        }
+        if backing.len() != new_len {
+            return Err(ExtendOriginalError::BackingLength {
+                expected: new_len,
+                actual: backing.len(),
+            });
+        }
+        let target = self.growth_target()?;
+        self.original = backing;
+        self.apply_growth(new_len, target);
+        Ok(Growth {
+            old_len,
+            new_len,
+            added: new_len - old_len,
+        })
+    }
 }
+
+/// What a successful [`PieceTable::extend_original`] changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Growth {
+    /// Original store length before the growth.
+    pub old_len: u64,
+    /// Original store length after the growth.
+    pub new_len: u64,
+    /// Bytes added (`new_len - old_len`).
+    pub added: u64,
+}
+
+/// Why [`PieceTable::extend_original`] (or
+/// [`PieceTable::adopt_grown_original`]) refused. Every refusal
+/// leaves the table untouched.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExtendOriginalError {
+    /// `new_len` is not beyond the current store length: a shrink
+    /// or a same-size change is not growth and belongs to the
+    /// external-change path.
+    NotGrowth { current: u64, requested: u64 },
+    /// The `Memory` backing needs exactly the grown bytes as the
+    /// tail; a different number were supplied.
+    TailLength { expected: u64, actual: u64 },
+    /// An adopted backing's length is not the promised `new_len`.
+    BackingLength { expected: u64, actual: u64 },
+    /// The document's tail is not the original's tail (an edit
+    /// sits at the end, or the original's tail was deleted), so
+    /// grown bytes have no unambiguous place in the document.
+    NoTrailingPiece,
+    /// The Windows mapped backing cannot grow in place; re-map
+    /// and use [`PieceTable::adopt_grown_original`].
+    MappedBacking,
+}
+
+impl std::fmt::Display for ExtendOriginalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExtendOriginalError::NotGrowth { current, requested } => write!(
+                f,
+                "the file did not grow (it is {current} bytes, growth was claimed to {requested})"
+            ),
+            ExtendOriginalError::TailLength { expected, actual } => write!(
+                f,
+                "growth needs exactly {expected} tail bytes, {actual} were supplied"
+            ),
+            ExtendOriginalError::BackingLength { expected, actual } => write!(
+                f,
+                "the grown backing must be {expected} bytes, it is {actual}"
+            ),
+            ExtendOriginalError::NoTrailingPiece => write!(
+                f,
+                "the document's tail is not the file's tail, so grown bytes have no place to go"
+            ),
+            ExtendOriginalError::MappedBacking => write!(
+                f,
+                "a memory-mapped backing cannot grow in place; it must be re-mapped"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ExtendOriginalError {}
 
 #[cfg(test)]
 mod tests {
@@ -998,5 +1291,203 @@ mod tests {
         assert!(table.check_invariants());
         let text = String::from_utf8(table.read(0, table.len())).unwrap();
         assert_eq!(text, ">> The very quick fox <<");
+    }
+
+    // ---- Zero runs (roadmap R4) ------------------------------------
+
+    #[test]
+    fn zero_run_reads_as_zeroes_on_every_path() {
+        let mut table = doc(b"ab");
+        table.insert_zeroes(1, 3);
+        assert_eq!(table.len(), 5);
+        // read / read_into / byte_at agree.
+        assert_eq!(table.read(0, 99), vec![b'a', 0, 0, 0, b'b']);
+        let mut buf = [0xFFu8; 5];
+        assert_eq!(table.read_into(0, &mut buf), 5);
+        assert_eq!(buf, [b'a', 0, 0, 0, b'b']);
+        assert_eq!(table.byte_at(2), Some(0));
+        assert_eq!(table.byte_at(4), Some(b'b'));
+        // iter_slices (the save/extract streaming path) agrees.
+        let joined: Vec<u8> = table
+            .iter_slices()
+            .flat_map(|slice| slice.into_owned())
+            .collect();
+        assert_eq!(joined, vec![b'a', 0, 0, 0, b'b']);
+        // The run is one Zeroes piece with no storage behind it.
+        let zeroes: Vec<&PieceNode> = table
+            .pieces
+            .iter()
+            .filter(|p| p.source == BufferSource::Zeroes)
+            .collect();
+        assert_eq!(zeroes.len(), 1);
+        assert_eq!(zeroes[0].length, 3);
+        assert!(table.check_invariants());
+    }
+
+    #[test]
+    fn zero_run_extends_instead_of_fragmenting() {
+        let mut table = doc(b"");
+        table.insert_zeroes(0, 10);
+        table.insert_zeroes(10, 5); // at the run's end: extends it
+        table.insert_zeroes(0, 2); // at the run's start: extends it
+        assert_eq!(table.piece_count(), 1);
+        assert_eq!(table.pieces[0].source, BufferSource::Zeroes);
+        assert_eq!(table.pieces[0].length, 17);
+        assert_eq!(table.read(0, 99), vec![0u8; 17]);
+        // A huge run costs one node and no bytes.
+        table.insert_zeroes(17, 1_000_000_000);
+        assert_eq!(table.piece_count(), 1);
+        assert_eq!(table.len(), 1_000_000_017);
+        assert_eq!(table.byte_at(999_999_999), Some(0));
+        assert!(table.append_buffer.is_empty());
+        assert!(table.check_invariants());
+    }
+
+    #[test]
+    fn zero_run_splits_and_deletes_like_any_piece() {
+        let mut table = doc(b"xy");
+        table.insert_zeroes(1, 4); // x 0000 y
+        table.insert(3, b"Q"); // insert inside the run: x 00 Q 00 y
+        assert_eq!(table.read(0, 99), vec![b'x', 0, 0, b'Q', 0, 0, b'y']);
+        let removed = table.delete(2, 3); // remove "0 Q 0"
+        assert_eq!(removed.iter().map(|p| p.length).sum::<u64>(), 3);
+        assert_eq!(table.read(0, 99), vec![b'x', 0, 0, b'y']);
+        assert!(table.check_invariants());
+        // Zero-length insert is a no-op.
+        let before = table.piece_count();
+        table.insert_zeroes(1, 0);
+        assert_eq!(table.piece_count(), before);
+    }
+
+    #[test]
+    fn zero_neighbours_merge_on_coalesce() {
+        // Two zero pieces separated by a deleted byte become
+        // neighbours and coalesce into one run.
+        let mut table = doc(b"a");
+        table.insert_zeroes(0, 2);
+        table.insert_zeroes(3, 2);
+        assert_eq!(table.read(0, 99), vec![0, 0, b'a', 0, 0]);
+        table.delete(2, 1); // remove the 'a' between the runs
+        assert_eq!(table.read(0, 99), vec![0, 0, 0, 0]);
+        assert_eq!(table.coalesce(), 1);
+        assert_eq!(table.piece_count(), 1);
+        assert_eq!(table.pieces[0].length, 4);
+        assert!(table.check_invariants());
+    }
+
+    // ---- Growth of the original store (roadmap item 22) -----------
+
+    #[test]
+    fn growth_extends_the_trailing_original_piece() {
+        let mut table = doc(b"line one\n");
+        let growth = table.extend_original(18, b"line two\n").unwrap();
+        assert_eq!(
+            growth,
+            Growth {
+                old_len: 9,
+                new_len: 18,
+                added: 9
+            }
+        );
+        assert_eq!(table.len(), 18);
+        assert_eq!(table.original_file_size, 18);
+        assert_eq!(table.piece_count(), 1); // extended in place
+        assert_eq!(table.read(0, 99), b"line one\nline two\n");
+        assert!(table.check_invariants());
+    }
+
+    #[test]
+    fn growth_refuses_shrink_same_size_and_bad_tails() {
+        let mut table = doc(b"abc");
+        // Same size and shrink are not growth.
+        assert_eq!(
+            table.extend_original(3, b""),
+            Err(ExtendOriginalError::NotGrowth {
+                current: 3,
+                requested: 3
+            })
+        );
+        assert_eq!(
+            table.extend_original(2, b""),
+            Err(ExtendOriginalError::NotGrowth {
+                current: 3,
+                requested: 2
+            })
+        );
+        // The Memory backing needs exactly the grown bytes.
+        assert_eq!(
+            table.extend_original(6, b"xy"),
+            Err(ExtendOriginalError::TailLength {
+                expected: 3,
+                actual: 2
+            })
+        );
+        // Every refusal left the table untouched.
+        assert_eq!(table.read(0, 99), b"abc");
+        assert_eq!(table.original_file_size, 3);
+        assert!(table.check_invariants());
+    }
+
+    #[test]
+    fn growth_refused_when_the_tail_is_an_edit_or_deleted() {
+        // An Add piece at the document's end claims the tail.
+        let mut table = doc(b"abc");
+        table.insert(3, b"d");
+        assert_eq!(
+            table.extend_original(6, b"xyz"),
+            Err(ExtendOriginalError::NoTrailingPiece)
+        );
+        // A deleted original tail removes the anchor the same way.
+        let mut table = doc(b"abcdef");
+        table.delete(4, 2);
+        assert_eq!(
+            table.extend_original(9, b"xyz"),
+            Err(ExtendOriginalError::NoTrailingPiece)
+        );
+        assert!(table.check_invariants());
+    }
+
+    #[test]
+    fn growth_of_an_empty_document_and_length_only_backing() {
+        // Empty over empty: the grown region becomes the document.
+        let mut table = PieceTable::new(0);
+        let growth = table.extend_original(4, b"").unwrap();
+        assert_eq!(growth.added, 4);
+        assert_eq!(table.len(), 4);
+        assert_eq!(table.piece_count(), 1);
+        // LengthOnly ignores the tail; reads are its contract zeros.
+        assert_eq!(table.read(0, 99), vec![0u8; 4]);
+        // LengthOnly with content: the store length follows.
+        let mut table = PieceTable::new(10);
+        table.extend_original(15, b"").unwrap();
+        assert_eq!(table.original_file_size, 15);
+        assert_eq!(table.len(), 15);
+        assert_eq!(table.read(0, 99), vec![0u8; 15]);
+        assert!(table.check_invariants());
+    }
+
+    #[test]
+    fn adopt_grown_original_swaps_the_backing_and_extends() {
+        let mut table = PieceTable::new(5); // length-only placeholder
+        let growth = table
+            .adopt_grown_original(9, OriginalBuffer::Memory(b"123456789".to_vec()))
+            .unwrap();
+        assert_eq!(growth.added, 4);
+        assert_eq!(table.read(0, 99), b"123456789");
+        assert_eq!(
+            table.adopt_grown_original(9, OriginalBuffer::Memory(vec![0; 9])),
+            Err(ExtendOriginalError::NotGrowth {
+                current: 9,
+                requested: 9
+            })
+        );
+        assert_eq!(
+            table.adopt_grown_original(12, OriginalBuffer::Memory(vec![0; 10])),
+            Err(ExtendOriginalError::BackingLength {
+                expected: 12,
+                actual: 10
+            })
+        );
+        assert!(table.check_invariants());
     }
 }
