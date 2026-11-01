@@ -118,6 +118,59 @@ impl From<SaveError> for EditorError {
     }
 }
 
+/// What [`Editor::note_file_growth`] changed (roadmap item 22,
+/// Ghost Tail core).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GrowthReport {
+    /// Document (and original store) length before the growth.
+    pub old_len: u64,
+    /// Document (and original store) length after the growth.
+    pub new_len: u64,
+    /// Bytes the file grew by.
+    pub added: u64,
+    /// The line index's frontier after the growth: the grown index
+    /// is partial with this many bytes indexed, and the background
+    /// build resumes from exactly here.
+    pub index_frontier: u64,
+}
+
+/// Why [`Editor::note_file_growth`] refused. Every refusal leaves
+/// the editor untouched; the caller routes refused growths to the
+/// ordinary external-change path (reload prompt), which is also
+/// where shrinks and same-size changes belong.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GrowthError {
+    /// The file did not grow: `new_len` is at or below the current
+    /// length (a shrink or a same-size content change).
+    NotGrowth { current: u64, requested: u64 },
+    /// The document has been edited since it was opened (or carries
+    /// undo/redo history): grown bytes are only unambiguous in a
+    /// document that still is the file, byte for byte.
+    EditedDocument,
+    /// The piece table refused the extension (its tail is not the
+    /// file's tail, the tail bytes did not fit the backing, or the
+    /// backing is a mapping the shell must re-map first).
+    Backing(crate::piece_table::ExtendOriginalError),
+}
+
+impl fmt::Display for GrowthError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GrowthError::NotGrowth { current, requested } => write!(
+                f,
+                "the file did not grow (it is {current} bytes, growth was claimed to {requested})"
+            ),
+            GrowthError::EditedDocument => write!(
+                f,
+                "the document has unsaved edits, so grown bytes cannot be told apart from them"
+            ),
+            GrowthError::Backing(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for GrowthError {}
+
 /// One visible text row: its 0-based line number, the decoded display
 /// text (line ending stripped, truncated past [`MAX_ROW_CHARS`]), and
 /// the byte range of the line's content in the document (line ending
@@ -593,6 +646,70 @@ impl Editor {
         self.nl_delta_known = true;
         self.walk_cache = None;
         self.row_anchor = None;
+    }
+
+    /// Note that the file on disk GREW to `new_len` bytes by
+    /// appends (roadmap item 22, Ghost Tail core): the grown region
+    /// joins the document at the tail, the held line index is
+    /// extended over the new length (its checkpoints and frontier
+    /// carry over, so the background build resumes from the old
+    /// frontier — see [`crate::line_index::LineIndex::extended_to`]
+    /// and [`crate::line_index::LineIndexBuilder::resume_from`]),
+    /// and the caret, selection, scroll position and mode are all
+    /// left exactly as they were. `tail` supplies the grown bytes
+    /// for the piece table's backing (see
+    /// [`PieceTable::extend_original`]).
+    ///
+    /// Growth is only sound for a document that still is the file:
+    /// any edit since open (including recorded-but-undone history)
+    /// refuses with [`GrowthError::EditedDocument`], and a
+    /// `new_len` that is not beyond the current length refuses
+    /// with [`GrowthError::NotGrowth`] — shrinks and same-size
+    /// changes stay with the external-change detection, which this
+    /// method never replaces.
+    pub fn note_file_growth(
+        &mut self,
+        new_len: u64,
+        tail: &[u8],
+    ) -> Result<GrowthReport, GrowthError> {
+        let old_len = self.table.original_file_size;
+        if new_len <= old_len {
+            return Err(GrowthError::NotGrowth {
+                current: old_len,
+                requested: new_len,
+            });
+        }
+        if self.dirty
+            || self.history.can_undo()
+            || self.history.can_redo()
+            || self.index_dirty_from.is_some()
+        {
+            return Err(GrowthError::EditedDocument);
+        }
+        let growth = self
+            .table
+            .extend_original(new_len, tail)
+            .map_err(GrowthError::Backing)?;
+        // The held index was built over the old length: extend its
+        // promise to the new length so it stays the valid partial
+        // index of the grown document. An index describing anything
+        // else (which an unedited document cannot hold) is dropped
+        // and will rebuild lazily instead of lying.
+        match &self.index {
+            Some(index) if index.total_length() == old_len => {
+                self.index = index.extended_to(new_len);
+            }
+            Some(_) => self.index = None,
+            None => {}
+        }
+        self.walk_cache = None;
+        self.row_anchor = None;
+        Ok(GrowthReport {
+            old_len,
+            new_len,
+            added: growth.added,
+            index_frontier: self.index_frontier(),
+        })
     }
 
     /// Number of lines in the document (0 for an empty document).
@@ -1282,6 +1399,47 @@ impl Editor {
             self.note_newline_delta(bytes, &[]);
             self.history.do_insert(&mut self.table, at, bytes);
             self.caret += bytes.len() as u64;
+            self.anchor = None;
+            self.after_mutation(at);
+        }
+        Ok(())
+    }
+
+    /// Insert `count` zero bytes at the caret (roadmap R4 zero-run
+    /// insert): one undo entry, and no bytes are stored however
+    /// large `count` is — the run lives in the piece table as a
+    /// single [`BufferSource::Zeroes`](crate::piece_table::BufferSource::Zeroes)
+    /// piece until a save streams it out. With a selection, the
+    /// selection is replaced by the zero run (still one undo
+    /// entry).
+    pub fn insert_zeroes(&mut self, count: u64) -> Result<(), EditorError> {
+        self.require_writable()?;
+        if count == 0 {
+            return Ok(());
+        }
+        if let Some((start, end)) = self.selection_range() {
+            let removed = self.table.read(start, end - start);
+            // Zero bytes contain no '\n', so only the removed
+            // content moves the newline delta.
+            self.note_newline_delta(&[], &removed);
+            self.history
+                .do_segment_replace(&mut self.table, start, end, |table| {
+                    let previous = table.delete(start, end - start);
+                    table.insert_zeroes(start, count);
+                    crate::undo::EditAction::Replace {
+                        offset: start,
+                        previous_pieces: previous,
+                        inserted_length: count,
+                        replacements: 1,
+                    }
+                });
+            self.caret = start + count;
+            self.anchor = None;
+            self.after_mutation(start);
+        } else {
+            let at = self.caret;
+            self.history.do_insert_zeroes(&mut self.table, at, count);
+            self.caret += count;
             self.anchor = None;
             self.after_mutation(at);
         }
@@ -2771,5 +2929,139 @@ mod tests {
         assert!(e.backspace().unwrap());
         assert_eq!(e.line_count(), 4);
         assert_eq!(e.line_text(1).unwrap(), "twoinserted");
+    }
+
+    // ---- Zero-run insert (roadmap R4) ------------------------------
+
+    #[test]
+    fn editor_insert_zeroes_and_undo() {
+        let mut e = ed(b"ab");
+        e.move_doc_end(false);
+        e.insert_zeroes(3).unwrap();
+        assert_eq!(content(&e), vec![b'a', b'b', 0, 0, 0]);
+        assert_eq!(e.caret(), 5);
+        assert!(e.is_dirty());
+        // One undo entry removes the whole run.
+        assert!(e.undo());
+        assert_eq!(content(&e), b"ab");
+        assert!(!e.is_dirty());
+        assert!(e.redo());
+        assert_eq!(content(&e), vec![b'a', b'b', 0, 0, 0]);
+        // A huge run is one piece and stores nothing.
+        let mut e = ed(b"");
+        e.insert_zeroes(5_000_000).unwrap();
+        assert_eq!(e.total_len(), 5_000_000);
+        assert_eq!(e.table().piece_count(), 1);
+        assert!(e.table().append_buffer.is_empty());
+    }
+
+    #[test]
+    fn editor_insert_zeroes_replaces_selection_as_one_entry() {
+        let mut e = ed(b"hello world");
+        e.goto_line(1);
+        e.move_caret_to(0, false);
+        e.move_caret_to(5, true); // select "hello"
+        assert_eq!(e.selection_range(), Some((0, 5)));
+        e.insert_zeroes(2).unwrap();
+        assert_eq!(content(&e), vec![0, 0, b' ', b'w', b'o', b'r', b'l', b'd']);
+        assert_eq!(e.caret(), 2);
+        assert!(e.undo());
+        assert_eq!(content(&e), b"hello world");
+        assert!(e.redo());
+        assert_eq!(content(&e), vec![0, 0, b' ', b'w', b'o', b'r', b'l', b'd']);
+    }
+
+    // ---- Ghost Tail growth (roadmap item 22) ------------------------
+
+    #[test]
+    fn growth_appends_the_tail_and_keeps_position() {
+        let mut e = ed(b"line one\nline two\n");
+        e.seed_line_index();
+        assert!(e.has_complete_index());
+        e.move_caret_to(4, false);
+        let report = e.note_file_growth(29, b"line three\n").unwrap();
+        assert_eq!(
+            report,
+            GrowthReport {
+                old_len: 18,
+                new_len: 29,
+                added: 11,
+                index_frontier: 18,
+            }
+        );
+        assert_eq!(content(&e), b"line one\nline two\nline three\n");
+        assert_eq!(e.total_len(), 29);
+        // The caret did not move and the document is not dirty:
+        // growth is the file's own change, not an edit.
+        assert_eq!(e.caret(), 4);
+        assert!(!e.is_dirty());
+        assert!(!e.can_undo());
+        // The index is now the partial index of the grown source,
+        // holding the old frontier; line questions stay exact.
+        assert!(e.index_is_partial());
+        assert_eq!(e.index_frontier(), 18);
+        assert_eq!(e.line_text(2).unwrap(), "line three");
+    }
+
+    #[test]
+    fn growth_resumes_and_completes_the_staged_index() {
+        // Bigger than the head region so the open index is partial:
+        // growth must extend that partial index, and a resumed
+        // builder must finish it identically to a full build.
+        let mut data = Vec::new();
+        for i in 0..500_000u32 {
+            data.extend_from_slice(format!("row {i}\n").as_bytes());
+        }
+        let old_len = data.len() as u64;
+        let mut e = Editor::open_from_bytes(data.clone(), None, false);
+        e.seed_line_index();
+        assert!(e.index_is_partial());
+        let frontier_before = e.index_frontier();
+        // Grow by exactly one more line.
+        data.extend_from_slice(b"row 500000\n");
+        let report = e
+            .note_file_growth(data.len() as u64, b"row 500000\n")
+            .unwrap();
+        assert_eq!(report.old_len, old_len);
+        assert_eq!(report.index_frontier, frontier_before);
+        assert!(e.index_is_partial());
+        assert_eq!(e.line_text(500_000).unwrap(), "row 500000");
+    }
+
+    #[test]
+    fn growth_refuses_shrinks_and_edited_documents() {
+        // Shrink and same-size are not growth.
+        let mut e = ed(b"abc\n");
+        assert_eq!(
+            e.note_file_growth(4, b""),
+            Err(GrowthError::NotGrowth {
+                current: 4,
+                requested: 4
+            })
+        );
+        assert_eq!(
+            e.note_file_growth(2, b""),
+            Err(GrowthError::NotGrowth {
+                current: 4,
+                requested: 2
+            })
+        );
+        // An edited document refuses (and stays untouched).
+        let mut e = ed(b"abc\n");
+        e.move_doc_end(false);
+        e.insert_text("x").unwrap();
+        assert_eq!(
+            e.note_file_growth(9, b"more\n"),
+            Err(GrowthError::EditedDocument)
+        );
+        assert_eq!(content(&e), b"abc\nx");
+        // Even an edit that was undone leaves history behind, and
+        // history is enough to refuse.
+        assert!(e.undo());
+        assert_eq!(
+            e.note_file_growth(9, b"more\n"),
+            Err(GrowthError::EditedDocument)
+        );
+        assert_eq!(content(&e), b"abc\n");
     }
 }
