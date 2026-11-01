@@ -172,6 +172,145 @@ pub fn build_filter(table: &PieceTable, index: &LineIndex, query: FilterQuery) -
     }
 }
 
+/// An incremental filter build (slice R4c, item 13): the
+/// background form of [`build_filter`]. The worker drives
+/// [`FilterBuilder::advance`] window by window over a snapshot of
+/// the document; each call folds the matches starting inside the
+/// new window into the line list, and [`FilterBuilder::snapshot`]
+/// hands the UI thread the view built so far. Concatenated over
+/// consecutive windows the result equals [`build_filter`] over a
+/// complete index exactly — the windowed find concatenates to the
+/// whole-document find (see `crate::search`), and line numbers
+/// come from counting newlines forward from position 0, which is
+/// what the index's checkpoints summarise.
+///
+/// No line index is involved at all, so the build never waits for
+/// one; the trade is that the newline counting is part of the
+/// worker's scan (it shares the pass with the match scan and never
+/// runs on the UI thread).
+pub struct FilterBuilder {
+    /// Lines found so far, in document order.
+    lines: Vec<FilterLine>,
+    total_length: u64,
+    /// Match-scan frontier: matches starting in `[0, scanned)`
+    /// have been folded in.
+    scanned: u64,
+    /// Newline-counting frontier: newlines in `[0, count_pos)`
+    /// have been counted into `count_lines`.
+    count_pos: u64,
+    /// Newlines in `[0, count_pos)` — the number of the line the
+    /// counting frontier sits in.
+    count_lines: u64,
+    /// Start offset of the line the counting frontier sits in.
+    line_start: u64,
+}
+
+impl FilterBuilder {
+    pub fn new(total_length: u64) -> Self {
+        Self {
+            lines: Vec::new(),
+            total_length,
+            scanned: 0,
+            count_pos: 0,
+            count_lines: 0,
+            line_start: 0,
+        }
+    }
+
+    /// Bytes of the document the match scan has covered so far —
+    /// the progress numerator.
+    pub fn scanned(&self) -> u64 {
+        self.scanned
+    }
+
+    pub fn total_length(&self) -> u64 {
+        self.total_length
+    }
+
+    /// True once the scan has covered the whole document.
+    pub fn is_done(&self) -> bool {
+        self.scanned >= self.total_length
+    }
+
+    /// Count newlines forward until the counting frontier reaches
+    /// `target`, keeping `line_start` on the start of the line the
+    /// frontier ends in.
+    fn count_to(&mut self, table: &PieceTable, target: u64) {
+        let mut buffer = vec![0u8; 65536];
+        while self.count_pos < target {
+            let want = ((target - self.count_pos).min(buffer.len() as u64)) as usize;
+            let read = table.read_into(self.count_pos, &mut buffer[..want]);
+            if read == 0 {
+                break;
+            }
+            let chunk = &buffer[..read];
+            let newlines = crate::line_index::count_newlines_in(chunk);
+            if newlines > 0 {
+                let last = chunk
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .expect("counted newlines are present");
+                self.line_start = self.count_pos + last as u64 + 1;
+                self.count_lines += newlines;
+            }
+            self.count_pos += read as u64;
+        }
+    }
+
+    /// Advance the build to `window_end` (clamped to the document
+    /// length): find the matches starting in the new window and
+    /// fold their lines in. Returns how many NEW lines this window
+    /// added. A `window_end` at or behind the current frontier is
+    /// a no-op.
+    pub fn advance(
+        &mut self,
+        table: &PieceTable,
+        window_end: u64,
+        needle: &[u8],
+        options: &SearchOptions,
+    ) -> usize {
+        let window_end = window_end.min(self.total_length);
+        if window_end <= self.scanned {
+            return 0;
+        }
+        let matches = search::find_in_window(table, needle, options, self.scanned, window_end);
+        let added_before = self.lines.len();
+        for m in matches {
+            self.count_to(table, m);
+            let line_no = self.count_lines;
+            if self
+                .lines
+                .last()
+                .is_some_and(|l: &FilterLine| l.line_no == line_no)
+            {
+                continue;
+            }
+            let start = self.line_start;
+            let end = line_content_end(table, start);
+            self.lines.push(FilterLine {
+                line_no,
+                start,
+                end,
+            });
+        }
+        self.scanned = window_end;
+        self.lines.len() - added_before
+    }
+
+    /// The view built so far. While the build runs
+    /// (`complete == false`) `indexed_bytes` reports the covered
+    /// prefix, exactly like a partial-index view; the final
+    /// snapshot passes `complete == true`.
+    pub fn snapshot(&self, complete: bool) -> FilterView {
+        FilterView {
+            lines: self.lines.clone(),
+            complete,
+            indexed_bytes: self.scanned,
+            total_length: self.total_length,
+        }
+    }
+}
+
 /// Search the document (or its indexed prefix) for the query.
 fn collect_matches(
     table: &PieceTable,
@@ -372,6 +511,45 @@ mod tests {
         assert!(view.is_complete());
         let view = view_for(&data, FilterQuery::literal(b"", SearchOptions::default()));
         assert!(view.is_empty());
+    }
+
+    // (Item 13) The incremental builder, driven window by window,
+    // lands on exactly the view the one-shot build produces —
+    // including with windows so small the needle straddles them.
+    #[test]
+    fn incremental_builder_matches_the_one_shot_build() {
+        let data = log();
+        let table = PieceTable::from_original(data.clone());
+        let expected = view_for(
+            &data,
+            FilterQuery::literal(b"ERROR", SearchOptions::default()),
+        );
+        for window in [1u64, 3, 7, 64, 4096] {
+            let mut builder = FilterBuilder::new(data.len() as u64);
+            let mut end = 0u64;
+            while !builder.is_done() {
+                end += window;
+                builder.advance(&table, end, b"ERROR", &SearchOptions::default());
+            }
+            let view = builder.snapshot(true);
+            assert_eq!(view, expected, "window {window}");
+            assert!(view.is_complete());
+            assert_eq!(view.indexed_bytes(), data.len() as u64);
+        }
+        // A mid-build snapshot is honest about its coverage.
+        let mut builder = FilterBuilder::new(data.len() as u64);
+        builder.advance(&table, 20, b"ERROR", &SearchOptions::default());
+        let partial = builder.snapshot(false);
+        assert!(!partial.is_complete());
+        assert_eq!(partial.indexed_bytes(), 20);
+        // No-match and empty-needle builds complete empty.
+        let mut builder = FilterBuilder::new(data.len() as u64);
+        builder.advance(&table, u64::MAX, b"ZZZ", &SearchOptions::default());
+        assert!(builder.is_done());
+        assert!(builder.snapshot(true).is_empty());
+        let mut builder = FilterBuilder::new(data.len() as u64);
+        builder.advance(&table, u64::MAX, b"", &SearchOptions::default());
+        assert!(builder.snapshot(true).is_empty());
     }
 
     #[test]
