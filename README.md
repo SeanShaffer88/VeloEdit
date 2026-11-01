@@ -85,9 +85,18 @@ Working in this build:
   built-in themes (the black-and-red Obsidian from the specification is
   the default), and View ▸ Accent recolours the highlight colour on top
   of any theme: theme default, 11 presets, or a custom colour.
-- **Crash recovery** — while you edit a document up to 16 MB, a snapshot
-  is kept next to the program and offered back if the program closes
-  unexpectedly. Larger documents rely on the atomic save alone.
+- **Crash recovery** — while you edit a document that lives in a
+  file, your edits are recorded next to the program (just the edits,
+  plus a fingerprint of the original file) and offered back if the
+  program closes unexpectedly; files of any size are covered. An
+  untitled document instead keeps a snapshot of its contents, up to
+  16 MB.
+- **Bookmarks and big-file find** — Ctrl+F2 marks the caret's place
+  in a file (F2 / Shift+F2 hop between marks; a marked line shows a
+  square in the gutter). On files over 4 MB the find count fills in
+  as the search works through the file, and matches and bookmarks
+  draw as ticks in the scrollbar. If the open file changes on disk,
+  a bar under the toolbar offers Reload or Ignore.
 
 ## Requirements
 
@@ -173,9 +182,10 @@ Once the window is open:
 - **Help**: press F1 for the built-in guide. It works offline.
 
 Everything is stored in the `data/` folder next to the program:
-settings (theme, accent, font size, window position, recent files) and,
-while you edit a document up to 16 MB, a recovery snapshot that is
-offered back after an unexpected close.
+settings (theme, accent, font size, window position, recent files),
+per-file bookmarks, and — while you edit — a recovery record (your
+edits for a file-backed document, or a content snapshot for an
+untitled one) that is offered back after an unexpected close.
 
 ### From the command line (headless)
 
@@ -315,8 +325,11 @@ default 256, range 1–4096) — and the column ruler, `ruler_column`
 (0 = off, otherwise the character column of the guideline). It is
 written by the program (editing it by hand works too — a damaged file
 falls back to defaults and is kept as `settings.json.bad`). While you
-edit, `data/recovery.bin` / `data/recovery.json` hold the crash
-recovery snapshot described above.
+edit a file-backed document, `data/recovery2.bin` holds the crash
+recovery record (the edit log and the original file's fingerprint);
+for a document with no backing file, `data/recovery.bin` /
+`data/recovery.json` hold a content snapshot instead, and
+`data/bookmarks.json` holds your per-file bookmarks.
 
 ## Building from source
 
@@ -442,8 +455,13 @@ theme, and the installer.
   from the window, the find bar, theme switching, and the recovery
   prompt; the installers have been built and hash-verified but not
   yet run through a full install on a real machine.
-- Recovery snapshots cover documents up to 16 MB. Larger documents rely
-  on the atomic save alone.
+- Crash recovery for a document with no backing file (a new,
+  never-saved document) keeps a content snapshot and so covers
+  documents up to 16 MB. File-backed documents of any size are
+  covered by the delta record described above. One edge: a document
+  restored from a delta record and then edited further without
+  being saved keeps the original recovery record rather than
+  recapturing the new edits as a delta.
 - Long lines are shown clipped at the window edge (no horizontal
   scrolling yet), and a line longer than 4096 characters is shown
   truncated with a marker. There is no word wrap.
