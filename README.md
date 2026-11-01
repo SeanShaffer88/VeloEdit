@@ -15,12 +15,12 @@ tenth of a second while using less than 35 MB of memory. It is one portable
 program file for Windows 11: no installer needed, no internet, no accounts,
 nothing sent anywhere.
 
-**Current status: 1.0.0, unreleased.** The editing core, the command-line
-tools, the graphical editor window, and the packaging (installer scripts
-and the release workflow) are built. The core and tools are
-covered by the automated test gate; the window is compile-verified and
-still needs its first run on a real Windows 11 machine — see "Known
-limitations". No release has been published yet.
+**Current status: 1.0.0, released 2026-10-31.** The editing core, the
+command-line tools, the graphical editor window, and the packaging
+(installer scripts and the release workflow) are built and shipped as
+the v1.0.0 release. The core and tools are covered by the automated
+test gate; the window is compile-verified and still needs its first run
+on a real Windows 11 machine — see "Known limitations".
 
 ## Features
 
@@ -84,9 +84,9 @@ Working in this build:
 
 ## Install
 
-No release has been published yet. Releases are built by the release
-workflow (`.github/workflows/release.yml`) on a Windows runner when a
-version tag is published, and each release ships exactly these assets:
+Releases are built by the release workflow
+(`.github/workflows/release.yml`) on a Windows runner when a version
+tag is published, and each release ships exactly these assets:
 
 - `VeloEdit-v<version>-x64-Setup.exe` — the installer (NSIS script:
   `installer/VeloEdit.nsi`). Per-user install to
