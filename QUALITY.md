@@ -1346,6 +1346,15 @@ scored from real Windows evidence before any release.
   - Honest status: GUI compile-verified only; every R4c
     surface's Windows runtime is **Unverified** until the
     owner's machine runs it.
+  - CI correction (same day): the first R4c publish's CI run
+    failed one Windows test —
+    `save::tests::fast_clone_request_falls_back_to_a_correct_save`
+    deleted its temp directory while the table still held the
+    saved file's live mapping, which Windows refuses with
+    ERROR_SHARING_VIOLATION (the host gate cannot see this;
+    Unix permits the unlink). The test now drops the table
+    before cleanup, the rule the neighbouring save_to tests
+    already document. Test-only change; no product code moved.
 
 ## Known gaps (honest list)
 
