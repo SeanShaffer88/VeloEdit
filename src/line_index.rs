@@ -18,6 +18,39 @@
 /// Distance between line checkpoints: 64 KB (SPEC.md section 3.1).
 pub const CHECKPOINT_INTERVAL: u64 = 64 * 1024;
 
+/// Bytes of index built synchronously when a document is opened
+/// (the staged-open head region). The first screens need only a few
+/// hundred lines; 4 MB of checkpoints covers tens of thousands of
+/// typical lines, so the window can paint and take input while the
+/// background build finishes the rest. A document no larger than
+/// this is indexed whole by the head build — its behaviour is
+/// exactly the old synchronous one.
+pub const INDEX_HEAD_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Completion percentage of a staged index build, for the status
+/// readout: whole percent of `total` covered by `indexed`, capped
+/// at 100; a zero-length source is trivially complete.
+pub fn indexing_percent(indexed: u64, total: u64) -> u32 {
+    if total == 0 {
+        return 100;
+    }
+    ((indexed.min(total) as u128 * 100) / total as u128) as u32
+}
+
+/// The status-bar suffix for an in-progress staged build —
+/// `" · Indexing NN%"` — or `None` when there is nothing to report
+/// (no document, or the build has covered the whole source).
+pub fn indexing_status_suffix(indexed: u64, total: u64) -> Option<String> {
+    if total == 0 || indexed >= total {
+        None
+    } else {
+        Some(format!(
+            " \u{00B7} Indexing {}%",
+            indexing_percent(indexed, total)
+        ))
+    }
+}
+
 /// Buffer size for the forward scan in
 /// [`LineIndex::line_start_offset`] (kept separate from
 /// `CHECKPOINT_INTERVAL`: it bounds one resolver step, not the index
@@ -71,22 +104,64 @@ pub fn count_newlines_in(data: &[u8]) -> u64 {
     count_byte_swar(data, b'\n')
 }
 
-/// The sparse checkpoint index over one byte source.
+/// A resumable line-index build: the scan behind
+/// [`LineIndex::build`], exposed in stages so a huge source can be
+/// indexed a piece at a time — a head region synchronously at open,
+/// the rest on a background thread — with snapshots taken along the
+/// way. Every stage uses the same round machinery, so a staged
+/// build's checkpoints are identical to a one-shot build's, prefix
+/// for prefix (pinned by tests).
 #[derive(Debug)]
-pub struct LineIndex {
+pub struct LineIndexBuilder {
+    total_len: u64,
     checkpoints: Vec<LineCheckpoint>,
-    total_length: u64,
-    total_newlines: u64,
-    ends_with_newline: bool,
+    lines_before: u64,
+    prev_byte: Option<u8>,
+    /// Frontier: bytes fully indexed so far.
+    offset: u64,
+    /// The source ended earlier than promised (a read returned 0).
+    stopped: bool,
 }
 
-impl LineIndex {
-    /// Build the index over a byte source of `total_len` bytes. `read_at`
-    /// fills the provided buffer with bytes starting at the given offset and
-    /// returns how many bytes it wrote; it must return 0 only at the end of
-    /// the source. The scan proceeds one checkpoint interval at a time, so
-    /// the live memory cost is one 64 KB buffer regardless of file size.
-    pub fn build(total_len: u64, mut read_at: impl FnMut(u64, &mut [u8]) -> usize) -> Self {
+impl LineIndexBuilder {
+    pub fn new(total_len: u64) -> Self {
+        Self {
+            total_len,
+            checkpoints: Vec::new(),
+            lines_before: 0,
+            prev_byte: None,
+            offset: 0,
+            stopped: false,
+        }
+    }
+
+    /// The promised length of the source being indexed.
+    pub fn total_len(&self) -> u64 {
+        self.total_len
+    }
+
+    /// Bytes indexed so far (the frontier).
+    pub fn indexed_bytes(&self) -> u64 {
+        self.offset
+    }
+
+    /// True when the whole source has been indexed — the frontier
+    /// reached the promised length, or the source ended early (in
+    /// which case everything that exists is indexed).
+    pub fn is_complete(&self) -> bool {
+        self.stopped || self.offset >= self.total_len
+    }
+
+    /// Index forward until the frontier reaches `limit` (or the
+    /// source is complete). Work proceeds in the same rounds as the
+    /// one-shot build, so the frontier may overshoot `limit` by up
+    /// to one round (at most 8 × 64 KB). `read_at` follows the
+    /// contract of [`LineIndex::build`]. Returns [`Self::is_complete`].
+    pub fn advance(
+        &mut self,
+        limit: u64,
+        mut read_at: impl FnMut(u64, &mut [u8]) -> usize,
+    ) -> bool {
         // Worker count for the parallel counting: the machine's
         // parallelism, capped at 8 (roadmap item 3).
         let workers = std::thread::available_parallelism()
@@ -94,22 +169,16 @@ impl LineIndex {
             .unwrap_or(1)
             .clamp(1, 8);
 
-        let mut checkpoints: Vec<LineCheckpoint> = Vec::new();
-        let mut lines_before: u64 = 0;
-        let mut prev_byte: Option<u8> = None;
-        let mut offset: u64 = 0;
-        let mut stopped = false;
-
         // Blocks are read serially (the `read_at` contract is a
         // single-threaded cursor) in rounds of up to `workers` blocks
         // — at most 8 × 64 KB of live memory — and each round's
         // newline counts are computed in parallel, then assembled in
         // order. The checkpoint stream is exactly the serial one.
-        while offset < total_len && !stopped {
+        while self.offset < self.total_len && !self.stopped && self.offset < limit {
             let mut blocks: Vec<(u64, Vec<u8>)> = Vec::with_capacity(workers);
-            let mut round_offset = offset;
-            while blocks.len() < workers && round_offset < total_len {
-                let want = (CHECKPOINT_INTERVAL).min(total_len - round_offset) as usize;
+            let mut round_offset = self.offset;
+            while blocks.len() < workers && round_offset < self.total_len {
+                let want = (CHECKPOINT_INTERVAL).min(self.total_len - round_offset) as usize;
                 let mut buffer = vec![0u8; want];
                 let read = read_at(round_offset, &mut buffer);
                 buffer.truncate(read);
@@ -140,20 +209,28 @@ impl LineIndex {
                     .collect()
             };
             for ((block_offset, data), (count, last)) in blocks.iter().zip(results.iter()) {
-                checkpoints.push(LineCheckpoint {
+                self.checkpoints.push(LineCheckpoint {
                     byte_offset: *block_offset,
-                    line_number: lines_before,
-                    at_line_start: *block_offset == 0 || prev_byte == Some(b'\n'),
+                    line_number: self.lines_before,
+                    at_line_start: *block_offset == 0 || self.prev_byte == Some(b'\n'),
                 });
                 if data.is_empty() {
-                    stopped = true; // the read==0 block: index what we saw
+                    self.stopped = true; // the read==0 block: index what we saw
                     break;
                 }
-                lines_before += count;
-                prev_byte = *last;
-                offset = block_offset + data.len() as u64;
+                self.lines_before += count;
+                self.prev_byte = *last;
+                self.offset = block_offset + data.len() as u64;
             }
         }
+        self.is_complete()
+    }
+
+    /// The index as it stands: every checkpoint so far, marked
+    /// partial unless the build is complete. For a partial snapshot
+    /// the totals describe the indexed prefix only.
+    pub fn snapshot(&self) -> LineIndex {
+        let mut checkpoints = self.checkpoints.clone();
         if checkpoints.is_empty() {
             checkpoints.push(LineCheckpoint {
                 byte_offset: 0,
@@ -161,13 +238,80 @@ impl LineIndex {
                 at_line_start: true,
             });
         }
-
-        Self {
+        LineIndex {
             checkpoints,
-            total_length: total_len,
-            total_newlines: lines_before,
-            ends_with_newline: prev_byte == Some(b'\n'),
+            total_length: self.total_len,
+            total_newlines: self.lines_before,
+            ends_with_newline: self.prev_byte == Some(b'\n'),
+            indexed_bytes: self.offset,
+            complete: self.is_complete(),
         }
+    }
+
+    /// Consume the builder into its final snapshot. Callers that
+    /// need a complete index drive [`Self::advance`] to completion
+    /// first; finishing early yields the partial snapshot.
+    pub fn finish(self) -> LineIndex {
+        self.snapshot()
+    }
+}
+
+/// The sparse checkpoint index over one byte source.
+///
+/// An index is either *complete* (it describes the whole source) or
+/// *partial* — a staged build in progress, whose checkpoints cover
+/// only the prefix `[0, indexed_bytes)`. For a partial index,
+/// [`LineIndex::total_newlines`] and [`LineIndex::line_count`]
+/// describe that prefix, never the whole source; consumers that
+/// present totals must check [`LineIndex::is_complete`] first.
+#[derive(Debug, Clone)]
+pub struct LineIndex {
+    checkpoints: Vec<LineCheckpoint>,
+    total_length: u64,
+    total_newlines: u64,
+    ends_with_newline: bool,
+    indexed_bytes: u64,
+    complete: bool,
+}
+
+impl LineIndex {
+    /// Build the index over a byte source of `total_len` bytes. `read_at`
+    /// fills the provided buffer with bytes starting at the given offset and
+    /// returns how many bytes it wrote; it must return 0 only at the end of
+    /// the source. The scan proceeds one checkpoint interval at a time, so
+    /// the live memory cost is one 64 KB buffer regardless of file size.
+    pub fn build(total_len: u64, read_at: impl FnMut(u64, &mut [u8]) -> usize) -> Self {
+        let mut builder = LineIndexBuilder::new(total_len);
+        builder.advance(u64::MAX, read_at);
+        builder.finish()
+    }
+
+    /// Build only the index of the prefix `[0, limit)` of a source
+    /// (up to one build round past `limit`): the staged-open head
+    /// build. The result is complete when the source is no larger
+    /// than the head region, partial otherwise; a
+    /// [`LineIndexBuilder`] can later continue the same scan to
+    /// completion with identical checkpoints.
+    pub fn build_prefix(
+        total_len: u64,
+        limit: u64,
+        read_at: impl FnMut(u64, &mut [u8]) -> usize,
+    ) -> Self {
+        let mut builder = LineIndexBuilder::new(total_len);
+        builder.advance(limit, read_at);
+        builder.finish()
+    }
+
+    /// Bytes covered by this index: the whole source for a complete
+    /// index, the staged frontier for a partial one.
+    pub fn indexed_bytes(&self) -> u64 {
+        self.indexed_bytes
+    }
+
+    /// True when this index describes the whole source. A partial
+    /// index's totals are prefix totals (see the type docs).
+    pub fn is_complete(&self) -> bool {
+        self.complete
     }
 
     /// Build the index over an in-memory byte slice (tests, small files).
@@ -195,11 +339,15 @@ impl LineIndex {
         self.total_newlines
     }
 
-    /// Number of lines: every newline-terminated line, plus one final
-    /// partial line when the source does not end with a newline. An empty
-    /// source has zero lines.
+    /// Number of lines in the region this index describes: every
+    /// newline-terminated line, plus one final partial line when
+    /// the region does not end with a newline. An empty region has
+    /// zero lines. For a complete index the region is the whole
+    /// source; for a partial one it is the indexed prefix, so the
+    /// count is the prefix's line count — never a claimed total
+    /// for the whole source.
     pub fn line_count(&self) -> u64 {
-        if self.total_length == 0 {
+        if self.indexed_bytes == 0 {
             0
         } else if self.ends_with_newline {
             self.total_newlines
@@ -221,6 +369,22 @@ impl LineIndex {
         }
     }
 
+    /// The best checkpoint to resolve `line_no` from: the last one
+    /// that either sits exactly on the start of `line_no` or counts
+    /// fewer lines. The predicate is monotonic over the checkpoint
+    /// list: checkpoints are ordered by line_number, and within one
+    /// line_number the at-line-start checkpoints come first.
+    fn start_checkpoint(&self, line_no: u64) -> Option<LineCheckpoint> {
+        let idx = self.checkpoints.partition_point(|cp| {
+            cp.line_number < line_no || (cp.line_number == line_no && cp.at_line_start)
+        });
+        if idx == 0 {
+            None
+        } else {
+            Some(self.checkpoints[idx - 1])
+        }
+    }
+
     /// Byte offset where 0-based line `line_no` starts.
     ///
     /// Picks the best checkpoint — the last one that either sits exactly on
@@ -239,16 +403,7 @@ impl LineIndex {
         if line_no >= self.line_count() {
             return None;
         }
-        // The predicate is monotonic over the checkpoint list: checkpoints
-        // are ordered by line_number, and within one line_number the
-        // at-line-start checkpoints come first.
-        let idx = self.checkpoints.partition_point(|cp| {
-            cp.line_number < line_no || (cp.line_number == line_no && cp.at_line_start)
-        });
-        if idx == 0 {
-            return None;
-        }
-        let cp = self.checkpoints[idx - 1];
+        let cp = self.start_checkpoint(line_no)?;
         if cp.line_number == line_no && cp.at_line_start {
             return Some(cp.byte_offset);
         }
@@ -270,6 +425,72 @@ impl LineIndex {
                 }
             }
             pos += read as u64;
+        }
+        None
+    }
+
+    /// Byte offset where 0-based line `line_no` starts, resolved
+    /// from a *partial* index: the best checkpoint is picked exactly
+    /// as in [`LineIndex::line_start_offset`], but there is no
+    /// line-count gate — the target line may lie past the indexed
+    /// frontier, so the scan walks forward from the last checkpoint,
+    /// counting newlines a 64 KB block at a time (the same SWAR
+    /// counter the build uses) and scanning byte-wise only inside
+    /// the block where the line starts. Returns `None` only when
+    /// the scan reaches the end of the source without finding the
+    /// line. The cost is the distance from the nearest checkpoint,
+    /// paid at scan speed; for lines inside the indexed prefix that
+    /// distance is under one checkpoint interval, exactly as with a
+    /// complete index.
+    pub fn line_start_offset_forward(
+        &self,
+        line_no: u64,
+        mut read_at: impl FnMut(u64, &mut [u8]) -> usize,
+    ) -> Option<u64> {
+        if line_no == 0 {
+            return Some(0);
+        }
+        let cp = self.start_checkpoint(line_no)?;
+        if cp.line_number == line_no && cp.at_line_start {
+            return Some(cp.byte_offset);
+        }
+        let mut remaining = line_no - cp.line_number;
+        let mut pos = cp.byte_offset;
+        let mut buffer = vec![0u8; CHECKPOINT_INTERVAL as usize];
+        while pos < self.total_length {
+            let want = (CHECKPOINT_INTERVAL).min(self.total_length - pos) as usize;
+            let read = read_at(pos, &mut buffer[..want]);
+            if read == 0 {
+                return None;
+            }
+            let data = &buffer[..read];
+            let in_block = count_newlines_in(data);
+            if in_block < remaining {
+                remaining -= in_block;
+                pos += read as u64;
+                continue;
+            }
+            // The line starts inside this block: find the
+            // `remaining`-th newline byte-wise.
+            let mut seen: u64 = 0;
+            for (i, &b) in data.iter().enumerate() {
+                if b == b'\n' {
+                    seen += 1;
+                    if seen == remaining {
+                        let start = pos + i as u64 + 1;
+                        // A start exactly at the end of the source
+                        // is the phantom line after a trailing
+                        // newline: the line-count model says it
+                        // does not exist (the bounded resolver's
+                        // gate rejects it the same way).
+                        if start >= self.total_length {
+                            return None;
+                        }
+                        return Some(start);
+                    }
+                }
+            }
+            return None; // the block count said the newline is here
         }
         None
     }
@@ -513,6 +734,198 @@ mod tests {
             );
         }
         assert_eq!(index.line_start_offset(6000, reader_for(&data)), None);
+    }
+
+    #[test]
+    fn indexing_percent_and_suffix() {
+        assert_eq!(indexing_percent(0, 0), 100);
+        assert_eq!(indexing_percent(0, 200), 0);
+        assert_eq!(indexing_percent(50, 200), 25);
+        assert_eq!(indexing_percent(199, 200), 99);
+        assert_eq!(indexing_percent(200, 200), 100);
+        assert_eq!(indexing_percent(300, 200), 100); // capped
+                                                     // Huge values must not overflow the multiply (and
+                                                     // u64::MAX / 2 is just under half of u64::MAX, hence 49).
+        assert_eq!(indexing_percent(u64::MAX / 2, u64::MAX), 49);
+        assert_eq!(indexing_percent(u64::MAX, u64::MAX), 100);
+
+        assert_eq!(indexing_status_suffix(0, 0), None);
+        assert_eq!(indexing_status_suffix(10, 10), None);
+        assert_eq!(
+            indexing_status_suffix(1, 4).as_deref(),
+            Some(" \u{00B7} Indexing 25%")
+        );
+        assert_eq!(
+            indexing_status_suffix(0, 4).as_deref(),
+            Some(" \u{00B7} Indexing 0%")
+        );
+    }
+
+    #[test]
+    fn staged_build_prefixes_match_the_one_shot_build() {
+        // Staged open, core level: build a head prefix, then keep
+        // advancing in steps — every snapshot's checkpoints must be
+        // a prefix of the one-shot build's, and the finished staged
+        // build must equal it exactly.
+        let data = synthetic_doc(200_000); // 6.4 MB, 200 checkpoints
+        let full = LineIndex::build_from_bytes(&data);
+        assert!(full.is_complete());
+        assert_eq!(full.indexed_bytes(), data.len() as u64);
+
+        let mut builder = LineIndexBuilder::new(data.len() as u64);
+        let mut reader = reader_for(&data);
+        assert!(!builder.advance(INDEX_HEAD_BYTES, &mut reader));
+        let head = builder.snapshot();
+        assert!(!head.is_complete());
+        assert!(head.indexed_bytes() >= INDEX_HEAD_BYTES);
+        assert!(head.indexed_bytes() < data.len() as u64);
+        // The head snapshot's checkpoints are the full build's prefix.
+        assert_eq!(
+            head.checkpoints(),
+            &full.checkpoints()[..head.checkpoints().len()]
+        );
+        // Its totals describe the prefix only: the newlines in
+        // [0, indexed_bytes) and that region's line count.
+        let prefix = &data[..head.indexed_bytes() as usize];
+        assert_eq!(
+            head.total_newlines(),
+            prefix.iter().filter(|&&b| b == b'\n').count() as u64
+        );
+        assert_eq!(
+            head.line_count(),
+            LineIndex::build_from_bytes(prefix).line_count()
+        );
+
+        // Advance in uneven steps; identity must hold at the end.
+        while !builder.advance(builder.indexed_bytes() + 1_000_000, &mut reader) {}
+        let staged = builder.finish();
+        assert!(staged.is_complete());
+        assert_eq!(staged.checkpoints(), full.checkpoints());
+        assert_eq!(staged.total_newlines(), full.total_newlines());
+        assert_eq!(staged.line_count(), full.line_count());
+
+        // build_prefix is the one-call form of the head stage.
+        let head2 = LineIndex::build_prefix(data.len() as u64, INDEX_HEAD_BYTES, reader_for(&data));
+        assert_eq!(head2.checkpoints(), head.checkpoints());
+        assert_eq!(head2.indexed_bytes(), head.indexed_bytes());
+    }
+
+    #[test]
+    fn small_sources_complete_in_the_head_build() {
+        // Item: small files keep the old behaviour — the head build
+        // is the whole build.
+        for data in [&b""[..], b"one\ntwo\nthree", b"no newline at all"] {
+            let index =
+                LineIndex::build_prefix(data.len() as u64, INDEX_HEAD_BYTES, reader_for(data));
+            assert!(index.is_complete(), "len {}", data.len());
+            assert_eq!(
+                index.checkpoints(),
+                LineIndex::build_from_bytes(data).checkpoints()
+            );
+        }
+    }
+
+    #[test]
+    fn forward_resolver_matches_bounded_within_and_beyond_the_prefix() {
+        // 100-byte lines over ~2 MB: a head prefix covers only the
+        // first part; the forward resolver must agree with the
+        // bounded resolver on the full index for every line —
+        // inside the prefix, past the frontier, and at the edges.
+        let mut data = Vec::new();
+        for _ in 0..20_000 {
+            let mut line = vec![b'x'; 99];
+            line.push(b'\n');
+            data.extend_from_slice(&line);
+        }
+        let full = LineIndex::build_from_bytes(&data);
+        let partial =
+            LineIndex::build_prefix(data.len() as u64, INDEX_HEAD_BYTES / 4, reader_for(&data));
+        assert!(!partial.is_complete());
+        for line in [0u64, 1, 100, 5_000, 10_000, 19_999] {
+            let want = full.line_start_offset(line, reader_for(&data));
+            let got = partial.line_start_offset_forward(line, reader_for(&data));
+            assert_eq!(got, want, "line {line}");
+            assert_eq!(got, Some(line * 100));
+        }
+        // Past the last line: no phantom start at the end of a
+        // newline-terminated source.
+        assert_eq!(
+            partial.line_start_offset_forward(20_000, reader_for(&data)),
+            None
+        );
+        // A source without a trailing newline: the final partial
+        // line resolves, and one past it does not.
+        let mut data2 = data.clone();
+        data2.truncate(data2.len() - 1); // last line loses its '\n'
+        let partial2 =
+            LineIndex::build_prefix(data2.len() as u64, INDEX_HEAD_BYTES / 4, reader_for(&data2));
+        assert_eq!(
+            partial2.line_start_offset_forward(19_999, reader_for(&data2)),
+            Some(19_999 * 100)
+        );
+        assert_eq!(
+            partial2.line_start_offset_forward(20_000, reader_for(&data2)),
+            None
+        );
+    }
+
+    /// Measured on this VM, not asserted: the staged-open timings
+    /// over a ~1 GB in-memory source. Run with
+    /// `cargo test --release bench_staged_open -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_staged_open_1gb() {
+        // Log-like lines of 100 bytes, ~1 GB total.
+        let mut data = Vec::with_capacity(1_050_000_000);
+        let mut line = Vec::with_capacity(100);
+        let mut n = 0u64;
+        while data.len() < 1_000_000_000 {
+            line.clear();
+            line.extend_from_slice(
+                format!("2026-11-01T00:00:00Z INFO worker request {n} ok").as_bytes(),
+            );
+            line.resize(99, b' ');
+            line.push(b'\n');
+            data.extend_from_slice(&line);
+            n += 1;
+        }
+        let total = data.len() as u64;
+        eprintln!("bench source: {total} bytes, {n} lines");
+
+        // The old open path: a full synchronous build before the
+        // first line question could be answered.
+        let t = std::time::Instant::now();
+        let full = LineIndex::build_from_bytes(&data);
+        let full_ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "full build (old open): {full_ms:.1} ms ({:.0} MB/s)",
+            total as f64 / (full_ms / 1000.0) / 1e6
+        );
+
+        // The staged open: head prefix only, then the editor can
+        // paint; and the staged completion for comparison.
+        let t = std::time::Instant::now();
+        let head = LineIndex::build_prefix(total, INDEX_HEAD_BYTES, reader_for(&data));
+        let head_ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "head prefix ({} bytes): {head_ms:.2} ms",
+            head.indexed_bytes()
+        );
+        assert!(!head.is_complete());
+        assert_eq!(
+            head.checkpoints(),
+            &full.checkpoints()[..head.checkpoints().len()]
+        );
+
+        let mut builder = LineIndexBuilder::new(total);
+        let t = std::time::Instant::now();
+        while !builder.advance(
+            builder.indexed_bytes() + 32 * 1024 * 1024,
+            reader_for(&data),
+        ) {}
+        let staged_ms = t.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("staged full build (32 MB steps): {staged_ms:.1} ms");
+        assert_eq!(builder.finish().checkpoints(), full.checkpoints());
     }
 
     #[test]
