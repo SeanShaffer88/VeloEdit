@@ -69,10 +69,10 @@ Working in this build:
   button, drag-and-drop opening, a recent-files list, and a built-in
   guide (F1). Editing is byte-based, so binary files work regardless of
   encoding, and files open memory-mapped through the window too.
-- **18 colour themes** — View ▸ Theme switches instantly between 18
+- **20 colour themes** — View ▸ Theme switches instantly between 20
   built-in themes (the black-and-red Obsidian from the specification is
   the default), and View ▸ Accent recolours the highlight colour on top
-  of any theme: theme default, 8 presets, or a custom colour.
+  of any theme: theme default, 11 presets, or a custom colour.
 - **Crash recovery** — while you edit a document up to 16 MB, a snapshot
   is kept next to the program and offered back if the program closes
   unexpectedly. Larger documents rely on the atomic save alone.
@@ -139,9 +139,14 @@ Once the window is open:
 - **Hex mode**: press F6 (or the Hex button) to see the raw bytes —
   16 per row, with the same bytes as characters on the right. Typing a
   hex digit (0–9, A–F) changes the byte under the caret.
-- **Themes**: View ▸ Theme picks from 18 built-in themes; View ▸
+- **Themes**: View ▸ Theme picks from 20 built-in themes; View ▸
   Accent changes just the highlight colour. Font size is in the same
   menu (or Ctrl+ '+' / Ctrl+ '-').
+- **Column ruler**: View ▸ Column Ruler cycles a vertical guideline
+  at column 80 or 120 (or off), for keeping lines to a set length.
+- **Save selection**: File ▸ Save Selection to File… writes just the
+  selected bytes to a file, streamed — a selection of any size can be
+  exported.
 - **Help**: press F1 for the built-in guide. It works offline.
 
 Everything is stored in the `data/` folder next to the program:
@@ -159,7 +164,8 @@ The headless tools run without opening a window:
    VeloEdit.exe --diff "A.bin" "B.bin" --output "report.json" --headless
    ```
 
-   Exit code 0 means the files are identical; 3 means they differ; the
+   Exit code 0 means the files are identical; 1 means they differ; 2
+   means an error (for example a file that cannot be opened). The
    report lists both sizes, the first differing byte offset, and how many
    bytes differ.
 
@@ -176,8 +182,8 @@ The headless tools run without opening a window:
    ```
 
    This prints `{"count":2,"offsets":[0,31]}`-style output (byte
-   offsets in the file) and exits with code 0 whether or not anything
-   matches. The encoding is detected from the file's first 64 KB; force
+   offsets in the file) and exits with code 0 when at least one match
+   is found, 1 when nothing matches. The encoding is detected from the file's first 64 KB; force
    it with `--encoding utf8`, `utf16le`, `utf16be`, or `ansi`.
 
 4. Save a copy of a file through the atomic save pipeline:
@@ -191,22 +197,36 @@ The headless tools run without opening a window:
    then swapped into place; the file itself is never modified, and the
    destination must be a different path from the source.
 
-5. See everything the program can do from the command line:
+5. Copy one byte range out of a file (carve a slice from a disk image,
+   pull a header out of a binary):
+
+   ```bash
+   VeloEdit.exe extract "image.bin" --start 0x1000 --length 4096 --out "slice.bin"
+   ```
+
+   `--start` defaults to 0 and `--length` to the rest of the file;
+   numbers are decimal or `0x`-hex. The range is clamped to the file,
+   a start past the end of the file is an error (exit 2), and the
+   bytes are streamed in 4 MB chunks, so the source can be huge.
+
+6. See everything the program can do from the command line:
 
    ```bash
    VeloEdit.exe --help
    VeloEdit.exe --version
    ```
 
-6. Remove the portable data folder (with a safe preview first):
+7. Remove the portable data folder (with a safe preview first):
 
    ```bash
    VeloEdit.exe --clean --dry-run
    VeloEdit.exe --clean
    ```
 
-The program is a console-subsystem executable, so the same
-`VeloEdit.exe` serves both the window and the terminal.
+The program is a GUI-subsystem executable, so opening the window
+never flashes a console; started from a terminal, it borrows that
+terminal for the command-line tools, so the same `VeloEdit.exe`
+serves both.
 
 ## Command line reference
 
@@ -217,9 +237,10 @@ The program is a console-subsystem executable, so the same
 | `--mode <hex\|text>` | Open in hex or text mode (default: text) |
 | `--read-only` | Open without allowing edits |
 | `--diff <A> <B>` | Compare two files byte by byte |
-| `--find <TEXT>` | Find TEXT in the file; prints match count and byte offsets as JSON (exit 0 even with no matches) |
+| `--find <TEXT>` | Find TEXT in the file; prints match count and byte offsets as JSON (exit 0 with matches, 1 with none) |
 | `--encoding <NAME>` | Force the file encoding for `--find`: `utf8`, `utf16le`, `utf16be`, or `ansi` (default: detect) |
 | `--save-copy <DEST>` | Save a copy of the file to DEST through the atomic save pipeline (destination must differ from the source) |
+| `extract <file> --start <N> --length <M> --out <DEST>` | Copy one byte range of the file to DEST, streamed in 4 MB chunks; numbers are decimal or `0x`-hex, range clamped to the file |
 | `--output <PATH>` | Write the JSON report (diff or save-copy) to a file |
 | `--headless` | Run without opening a window |
 | `--clean`, `--uninstall` | Remove the adjacent `data/` folder only |
@@ -229,16 +250,21 @@ The program is a console-subsystem executable, so the same
 | `--verbose`, `--debug`, `--trace` | Print extra detail |
 | `--help`, `--version` | Show help or the version |
 
-Exit codes: 0 success (diff: identical), 1 error, 2 graphical editor
-requested on a build without window code (for example a non-Windows
-build), 3 files differ (diff only).
+Exit codes: 0 success (find: at least one match; diff: files
+identical), 1 find found nothing / diff found differences, 2 usage or
+I/O error — also used when the graphical editor is requested on a
+build without window code (for example a non-Windows build).
 
 ## Configuration
 
 All configuration and state live in the `data/` folder next to the
 program file — never in `%APPDATA%` or the registry — so the program
 stays fully portable. `data/settings.json` holds the theme, accent
-colour, font size, window position, and recent-files list; it is
+colour, font size, window position, and recent-files list, plus the
+undo limits — `undo_limit` (steps kept, default 1024, range
+16–65536) and `undo_byte_budget_mb` (megabytes of stored changes,
+default 256, range 1–4096) — and the column ruler, `ruler_column`
+(0 = off, otherwise the character column of the guideline). It is
 written by the program (editing it by hand works too — a damaged file
 falls back to defaults and is kept as `settings.json.bad`). While you
 edit, `data/recovery.bin` / `data/recovery.json` hold the crash
@@ -275,7 +301,7 @@ installer/            Release packaging: VeloEdit.nsi (NSIS Setup exe),
 src/lib.rs            Library root and the operation (op_*) surface
 src/editor.rs         Editor state machine the window is built on (caret,
                       selection, scroll, viewport rows, find state)
-src/theme.rs          The 18 built-in themes and accent presets
+src/theme.rs          The 20 built-in themes and accent presets
 src/settings.rs       Portable settings (hand-rolled JSON, data/ folder)
 src/gui_win.rs        Win32 + Direct2D/DirectWrite window (Windows only)
 src/piece_table.rs    Memory-mapped piece table engine
@@ -314,7 +340,7 @@ original untouched with no staging file behind. The newest suites cover
 the editor core (open → type → undo → redo → save round trips, caret
 and selection behaviour, hex row formatting, find navigation and
 read-only refusals, exact line positions after mid-document edits), the
-18 themes (token validity and text contrast), and settings (round
+20 themes (token validity and text contrast), and settings (round
 trips, corruption handling, recent-file rules).
 
 ## Troubleshooting
@@ -322,9 +348,10 @@ trips, corruption handling, recent-file rules).
 - **Exit code 2 when opening a file** — the graphical editor exists only
   in the Windows build; on another platform the file argument is
   understood but there is no window code to open it with.
-- **`--diff` reports exit code 1** — one of the two files could not be
+- **`--diff` reports exit code 2** — one of the two files could not be
   opened; the error message names the problem (for example a missing
-  file). Check both paths.
+  file). Check both paths. (Exit code 1 from `--diff` simply means the
+  files differ.)
 - **`--clean` refuses to remove the data folder** — it only ever removes a
   folder literally named `data` directly next to the program file, and
   refuses when that path is a file instead of a folder. Nothing is deleted
