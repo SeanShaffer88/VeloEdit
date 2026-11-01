@@ -43,6 +43,10 @@ use windows_sys::Win32::System::DataExchange::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::Registry::{
+    RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
+};
 use windows_sys::Win32::UI::Controls::Dialogs::{
     ChooseColorW, GetOpenFileNameW, GetSaveFileNameW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT,
     CHOOSECOLORW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT,
@@ -55,7 +59,7 @@ use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus,
+    EnableWindow, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
 };
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -67,7 +71,7 @@ use crate::hexview;
 use crate::line_index::LineIndex;
 use crate::mmap_win::MmapFile;
 use crate::piece_table::PieceTable;
-use crate::search::SearchOptions;
+use crate::search::{self, SearchOptions};
 use crate::settings::Settings;
 use crate::theme::{Theme, ACCENT_PRESETS};
 
@@ -81,6 +85,8 @@ const CMD_SAVE: usize = 1002;
 const CMD_SAVE_AS: usize = 1003;
 const CMD_EXIT: usize = 1004;
 const CMD_SAVE_SELECTION: usize = 1005;
+const CMD_SPLIT_FILE: usize = 1006;
+const CMD_EXPLORER_MENU: usize = 1007;
 const CMD_UNDO: usize = 1011;
 const CMD_REDO: usize = 1012;
 const CMD_CUT: usize = 1013;
@@ -89,6 +95,8 @@ const CMD_PASTE: usize = 1015;
 const CMD_FIND: usize = 1016;
 const CMD_REPLACE: usize = 1017;
 const CMD_SELECT_ALL: usize = 1018;
+const CMD_SORT_LINES: usize = 1019;
+const CMD_DEDUP_LINES: usize = 1020;
 const CMD_MODE_TEXT: usize = 1021;
 const CMD_MODE_HEX: usize = 1022;
 const CMD_MODE_TOGGLE: usize = 1025;
@@ -102,6 +110,7 @@ const CMD_FIND_PREV: usize = 1042;
 const CMD_DO_REPLACE: usize = 1043;
 const CMD_DO_REPLACE_ALL: usize = 1044;
 const CMD_FIND_CLOSE: usize = 1045;
+const CMD_FIND_SCOPE: usize = 1046;
 const CMD_THEME_BASE: usize = 3000; // + theme index (20 themes)
 const CMD_ACCENT_BASE: usize = 3100; // 0 = theme default, 1..=11 presets, then Custom…
 const CMD_ACCENT_CUSTOM: usize = CMD_ACCENT_BASE + 1 + ACCENT_PRESETS.len();
@@ -289,6 +298,19 @@ leave a half-written file. Undo history is cleared when you save.\r\n\
 For files up to 16 MB, VeloEdit also keeps a recovery snapshot next\r\n\
 to the program while you edit, and offers it back if the program\r\n\
 closes unexpectedly. Larger files rely on the safe save alone.\r\n\
+\r\n\
+FINDING MORE\r\n\
+Tick \"In selection\" on the find bar to search and replace only\r\n\
+inside the part of the document you selected first. In hex mode\r\n\
+you can also search for byte patterns with wildcards, like\r\n\
+4A ?? FF 00 2B — a ? stands for any nibble, so 4? finds 40 to 4F.\r\n\
+Patterns are for finding only; replace does not use them.\r\n\
+The Edit menu can sort the lines in a selection, or remove\r\n\
+duplicate lines from it. File \u{25B8} Split File Copy\u{2026} writes a\r\n\
+large file out as numbered parts (part001, part002, \u{2026}) so it\r\n\
+can be moved in pieces. File \u{25B8} Explorer Menu Item adds an\r\n\
+\"Open in VeloEdit\" entry to the right-click menu in Explorer;\r\n\
+it is off until you turn it on, and turning it off removes it.\r\n\
 \r\n\
 THEMES\r\n\
 View ▸ Theme offers 20 built-in colour themes; View ▸ Accent recolours\r\n\
@@ -565,6 +587,17 @@ impl Brushes {
     }
 }
 
+/// Which kind of find produced the editor's current match list —
+/// the find bar re-runs the search when the kind changes, even for
+/// unchanged text (a pattern can be plain in one mode and masked in
+/// another, and a scoped list must never be advanced as a plain one).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FindKind {
+    Plain,
+    Scoped,
+    Masked,
+}
+
 struct App {
     hwnd: HWND,
     editor: Editor,
@@ -591,6 +624,20 @@ struct App {
     find_count: HWND,
     find_label: HWND,
     replace_label: HWND,
+    /// The find bar's "In selection" toggle (an owner-drawn button,
+    /// drawn like the other find-bar buttons; its text carries the
+    /// ☐/☑ state glyph).
+    find_scope_check: HWND,
+    /// Whether the find bar is scoped to a selection (roadmap 11).
+    find_in_selection: bool,
+    /// The selection captured as the active find scope. Kept after a
+    /// scoped find selects a match (the selection is then the match,
+    /// not the scope), and used by scoped Replace All.
+    find_scope_range: Option<(u64, u64)>,
+    /// The scope the current match list was computed for; a different
+    /// scope forces a re-run instead of an advance.
+    last_scope_range: Option<(u64, u64)>,
+    last_find_kind: FindKind,
     status: HWND,
     status_right: HWND,
     /// Line-ending style detected at open ("LF" or "CRLF").
@@ -599,6 +646,7 @@ struct App {
     /// thumb's top, while a drag is in progress.
     scroll_drag: Option<f32>,
     help_hwnd: HWND,
+    file_menu: HMENU,
     view_menu: HMENU,
     recent_menu: HMENU,
     theme_menu: HMENU,
@@ -1011,6 +1059,13 @@ fn layout_children(app: &mut App) {
         ];
         for (hwnd, w) in order {
             place(app, hwnd, &mut fx, w);
+        }
+        // The scope toggle follows the action buttons; the close
+        // button stays last (find_controls[8] is the toggle, appended
+        // after the original eight controls).
+        if app.find_controls.len() > 8 {
+            let scope_btn = app.find_controls[8];
+            place(app, scope_btn, &mut fx, 124.0);
         }
         let close_btn = app.find_controls[7];
         place(app, close_btn, &mut fx, 30.0);
@@ -2071,6 +2126,316 @@ fn do_save_selection(app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
+// Split File Copy dialog (roadmap item 36): a small modal window in
+// the same hand-built style as the Help window — a label, one edit
+// for the part size in megabytes, and Split / Cancel buttons. A
+// nested message loop makes it modal to the main window.
+// ---------------------------------------------------------------------------
+
+const SPLIT_CLASS: &str = "VeloEditSplit";
+const ID_SPLIT_SIZE_EDIT: usize = 5101;
+const ID_SPLIT_GO: usize = 5102;
+const ID_SPLIT_CANCEL: usize = 5103;
+
+struct SplitDialogState {
+    /// The main window's App (UI thread only; the dialog is modal,
+    /// so nothing else can mutate it while the dialog is up).
+    app: *mut App,
+    edit: HWND,
+    /// The part size in MB the user confirmed, if any.
+    result: Option<u64>,
+}
+
+unsafe extern "system" fn split_dialog_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CREATE {
+        // SAFETY: lparam is the CREATESTRUCTW from CreateWindowExW,
+        // whose lpCreateParams is the caller's SplitDialogState.
+        let create = unsafe { &*(lparam as *const CREATESTRUCTW) };
+        let state_ptr = create.lpCreateParams as *mut SplitDialogState;
+        // SAFETY: storing the state pointer for the dialog's life.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
+        // SAFETY: the state outlives the dialog (it lives in the
+        // caller's stack frame, which waits in the modal loop).
+        let state = unsafe { &mut *state_ptr };
+        // SAFETY: the App is alive and exclusively ours on this thread.
+        let app = unsafe { &*state.app };
+        let scale = app.scale();
+        let px = |dip: f32| (dip * scale).round() as i32;
+        let label = create_child(
+            app,
+            "Static",
+            "Part size in megabytes (MB). A copy is split; the original file is not changed.",
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+        );
+        // The child helper parents to the main window's App handle —
+        // reparent the label and the rest to the dialog explicitly.
+        // SAFETY: `label` is a fresh child window of ours.
+        unsafe { SetParent(label, hwnd) };
+        // SAFETY: position the label inside the dialog.
+        unsafe { MoveWindow(label, px(12.0), px(10.0), px(330.0), px(30.0), 1) };
+        let edit_style = WS_CHILD | WS_VISIBLE | 0x80; // ES_AUTOHSCROLL
+        let edit = create_child(
+            app,
+            "Edit",
+            "4096",
+            edit_style,
+            WS_EX_CLIENTEDGE,
+            ID_SPLIT_SIZE_EDIT,
+        );
+        // SAFETY: as above — reparent and position our child window.
+        unsafe {
+            SetParent(edit, hwnd);
+            MoveWindow(edit, px(12.0), px(44.0), px(120.0), px(24.0), 1);
+            SetFocus(edit);
+        }
+        state.edit = edit;
+        let button_style = WS_CHILD | WS_VISIBLE | 0xB; // BS_OWNERDRAW, like the find bar
+        let go = create_child(app, "Button", "Split", button_style, 0, ID_SPLIT_GO);
+        let cancel = create_child(app, "Button", "Cancel", button_style, 0, ID_SPLIT_CANCEL);
+        // SAFETY: as above — reparent and position our child windows.
+        unsafe {
+            SetParent(go, hwnd);
+            MoveWindow(go, px(196.0), px(44.0), px(70.0), px(24.0), 1);
+            SetParent(cancel, hwnd);
+            MoveWindow(cancel, px(274.0), px(44.0), px(70.0), px(24.0), 1);
+        }
+        return 0;
+    }
+    // SAFETY: the state pointer was stored at WM_CREATE; messages
+    // before it (or after the dialog is gone) get default handling.
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut SplitDialogState;
+    if state_ptr.is_null() {
+        // SAFETY: default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    // SAFETY: the state outlives the dialog (see WM_CREATE).
+    let state = unsafe { &mut *state_ptr };
+    match msg {
+        WM_COMMAND => {
+            match wparam & 0xFFFF {
+                ID_SPLIT_GO => {
+                    // SAFETY: our edit control.
+                    let text = unsafe { window_text(state.edit) };
+                    match text.trim().parse::<u64>() {
+                        Ok(mb) if mb > 0 => {
+                            state.result = Some(mb);
+                            // SAFETY: our dialog window.
+                            unsafe { DestroyWindow(hwnd) };
+                        }
+                        _ => {
+                            message_box(
+                                hwnd,
+                                "Enter a part size in megabytes — a whole number of 1 or more.",
+                                "VeloEdit",
+                                MB_OK | MB_ICONERROR,
+                            );
+                        }
+                    }
+                }
+                ID_SPLIT_CANCEL => {
+                    // SAFETY: our dialog window.
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            // SAFETY: our dialog window; closing is cancelling.
+            unsafe { DestroyWindow(hwnd) };
+            0
+        }
+        // The buttons are owner-drawn; reuse the main window's themed
+        // drawing by forwarding to its stored App is not possible
+        // from another window proc, so the dialog's buttons fall back
+        // to a plain frame-and-text draw here.
+        WM_DRAWITEM => {
+            // SAFETY: lparam is a DRAWITEMSTRUCT for one of our buttons.
+            let dis = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
+            // SAFETY: the App is alive (modal dialog, UI thread).
+            let app = unsafe { &*state.app };
+            let mut rect = dis.rcItem;
+            // SAFETY: GDI drawing on the button's own DC, colours from
+            // the active theme like the find-bar buttons.
+            unsafe {
+                FillRect(dis.hDC, &rect, app.panel_brush);
+                FrameRect(dis.hDC, &rect, app.line_brush);
+                SetBkMode(dis.hDC, TRANSPARENT as i32);
+                SetTextColor(dis.hDC, colorref(app.theme.text));
+                let text = window_text(dis.hwndItem);
+                let mut wide: Vec<u16> = text.encode_utf16().collect();
+                if !wide.is_empty() {
+                    DrawTextW(
+                        dis.hDC,
+                        wide.as_mut_ptr(),
+                        wide.len() as i32,
+                        &mut rect,
+                        0x1 | 0x4 | 0x20,
+                    );
+                }
+            }
+            1
+        }
+        // SAFETY: default handling for everything else.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Show the Split dialog modally; returns the part size in MB, or
+/// `None` when the user cancelled.
+fn show_split_dialog(app: &mut App) -> Option<u64> {
+    let mut state = SplitDialogState {
+        app: app as *mut App,
+        edit: std::ptr::null_mut(),
+        result: None,
+    };
+    let class = wstr(SPLIT_CLASS);
+    let title = wstr("Split File Copy");
+    // SAFETY: the split class is registered in run_gui; the state
+    // travels in lpCreateParams and lives in this stack frame until
+    // the dialog is destroyed (the modal loop below).
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            app.px(368.0),
+            app.px(116.0),
+            app.hwnd,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            &mut state as *mut SplitDialogState as *const c_void,
+        )
+    };
+    if hwnd.is_null() {
+        return None;
+    }
+    // SAFETY: modal behaviour — the main window is disabled while the
+    // dialog is up and re-enabled as soon as it is destroyed.
+    unsafe {
+        EnableWindow(app.hwnd, 0);
+        ShowWindow(hwnd, SW_SHOW);
+    }
+    loop {
+        // SAFETY: MSG is a plain C struct; GetMessageW fills it.
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; 0 = WM_QUIT, -1 = error — either ends the
+        // modal wait (a quit is re-posted so the app still exits).
+        let result = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+        if result <= 0 {
+            // SAFETY: preserve the quit for the main loop.
+            unsafe { PostQuitMessage(0) };
+            break;
+        }
+        // SAFETY: standard message pumping.
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        // SAFETY: a plain liveness query on our dialog.
+        if unsafe { IsWindow(hwnd) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: restore the main window and give it the focus back.
+    unsafe {
+        EnableWindow(app.hwnd, 1);
+        SetFocus(app.hwnd);
+    }
+    state.result
+}
+
+/// File ▸ Split File Copy… (roadmap item 36): write the current
+/// document to a copy inside a new `<name>-parts` folder next to the
+/// file and split that copy into numbered parts, leaving the original
+/// file untouched. The transient copy is removed once the parts
+/// exist; the part count is reported when done.
+fn do_split_file(app: &mut App) {
+    let Some(src) = app.editor.path().map(|p| p.to_path_buf()) else {
+        message_box(
+            app.hwnd,
+            "Save the document to a file first, then split it.",
+            "VeloEdit",
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    };
+    let Some(mb) = show_split_dialog(app) else {
+        return;
+    };
+    let part_size = mb.saturating_mul(1024 * 1024);
+    let parent = src.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let stem = src
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "veloedit".to_string());
+    let file_name = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "veloedit".to_string());
+    let folder = parent.join(format!("{stem}-parts"));
+    if let Err(e) = std::fs::create_dir_all(&folder) {
+        message_box(
+            app.hwnd,
+            &format!("Could not create {}:\n{e}", folder.display()),
+            "VeloEdit",
+            MB_OK | MB_ICONERROR,
+        );
+        return;
+    }
+    // The copy: the document as it stands in the editor (unsaved
+    // edits included), written with the atomic save pipeline.
+    let copy_path = folder.join(&file_name);
+    if let Err(err) = crate::save::save_atomic(
+        app.editor.table(),
+        &copy_path,
+        &crate::save::SaveOptions::default(),
+    ) {
+        message_box(
+            app.hwnd,
+            &format!("Could not write the copy to split:\n{err}"),
+            "VeloEdit",
+            MB_OK | MB_ICONERROR,
+        );
+        return;
+    }
+    match crate::save::split_file(&copy_path, part_size, &folder) {
+        Ok(parts) => {
+            let count = parts.len();
+            let _ = std::fs::remove_file(&copy_path);
+            message_box(
+                app.hwnd,
+                &format!(
+                    "Split {file_name} into {count} part(s) of at most {mb} MB in:\n{}",
+                    folder.display()
+                ),
+                "VeloEdit",
+                MB_OK | MB_ICONINFORMATION,
+            );
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&copy_path);
+            message_box(
+                app.hwnd,
+                &format!("Could not split the copy:\n{e}"),
+                "VeloEdit",
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Find bar
 // ---------------------------------------------------------------------------
 
@@ -2123,34 +2488,124 @@ fn hide_find_bar(app: &mut App) {
     unsafe { SetFocus(app.hwnd) };
 }
 
+/// Set the find bar's count/notice label.
+fn set_find_label(app: &App, text: &str) {
+    let wide = wstr(text);
+    // SAFETY: our static control; the string outlives the call.
+    unsafe { SetWindowTextW(app.find_count, wide.as_ptr()) };
+}
+
+/// The masked pattern the find text names, when there is one
+/// (roadmap item 12): hex mode only, the text must parse as a masked
+/// pattern AND look like one — it contains a space or a `?` — so an
+/// ordinary hex-mode text search keeps its current behaviour.
+fn masked_pattern_for(app: &App, text: &str) -> Option<search::MaskedPattern> {
+    if app.editor.mode() != EditorMode::Hex {
+        return None;
+    }
+    if !text.contains(' ') && !text.contains('?') {
+        return None;
+    }
+    search::parse_masked_pattern(text).ok()
+}
+
+/// Which kind of find the find-bar state asks for right now.
+fn find_kind_for(app: &App, text: &str) -> FindKind {
+    if masked_pattern_for(app, text).is_some() {
+        FindKind::Masked
+    } else if app.find_in_selection {
+        FindKind::Scoped
+    } else {
+        FindKind::Plain
+    }
+}
+
 /// Run (or re-run) the find from the find-bar text and update the count
 /// label. `advance`: 1 = next match, -1 = previous, 0 = stay.
+///
+/// Three kinds of find share this flow (see [`FindKind`]): the plain
+/// whole-document find; the scoped find (roadmap item 11 — the "In
+/// selection" toggle: the selection is captured as the scope, and
+/// Find Next / the count stay inside it); and the masked hex find
+/// (roadmap item 12), whose matches drive the same caret, selection
+/// and highlight flow as a plain hex find. With the toggle on but no
+/// selection and no captured scope, the count label carries the
+/// notice — the same place "No matches" appears.
 fn find_from_bar(app: &mut App, advance: i32) {
     // SAFETY: our edit controls.
     let text = unsafe { window_text(app.find_edit) };
     if text.is_empty() {
-        let wide = wstr("");
-        // SAFETY: our static control.
-        unsafe { SetWindowTextW(app.find_count, wide.as_ptr()) };
+        set_find_label(app, "");
         app.last_find_text.clear();
+        app.last_find_kind = FindKind::Plain;
+        app.last_scope_range = None;
         return;
     }
-    if text != app.last_find_text || app.editor.matches().is_empty() {
-        app.last_find_text = text.clone();
-        match app.editor.set_find(&text, SearchOptions::default()) {
-            Ok(_) => {}
-            Err(err) => {
-                let wide = wstr(&format!("{err}"));
-                // SAFETY: our static control.
-                unsafe { SetWindowTextW(app.find_count, wide.as_ptr()) };
-                return;
+    let kind = find_kind_for(app, &text);
+    let rerun =
+        text != app.last_find_text || kind != app.last_find_kind || app.editor.matches().is_empty();
+    match kind {
+        FindKind::Masked => {
+            let pattern = masked_pattern_for(app, &text).expect("kind checked above");
+            if rerun {
+                app.editor.set_find_masked(&pattern);
+            } else if advance > 0 {
+                app.editor.find_next();
+            } else if advance < 0 {
+                app.editor.find_prev();
             }
         }
-    } else if advance > 0 {
-        app.editor.find_next();
-    } else if advance < 0 {
-        app.editor.find_prev();
+        FindKind::Scoped => {
+            // Capture the scope: a fresh selection (one that is not
+            // just the current match a scoped find selected) becomes
+            // the scope; after that the captured range rules, because
+            // a find moves the selection onto the match itself.
+            if let Some(sel) = app.editor.selection_range() {
+                if Some(sel) != app.editor.current_match() {
+                    app.find_scope_range = Some(sel);
+                }
+            }
+            let Some(scope) = app.find_scope_range else {
+                set_find_label(app, "Select text first");
+                return;
+            };
+            if rerun || app.last_scope_range != Some(scope) {
+                match app.editor.set_find_in_range(
+                    &text,
+                    SearchOptions::default(),
+                    scope.0,
+                    scope.1,
+                ) {
+                    Ok(_) => app.last_scope_range = Some(scope),
+                    Err(err) => {
+                        set_find_label(app, &format!("{err}"));
+                        return;
+                    }
+                }
+            } else if advance > 0 {
+                app.editor.find_next();
+            } else if advance < 0 {
+                app.editor.find_prev();
+            }
+        }
+        FindKind::Plain => {
+            if rerun {
+                match app.editor.set_find(&text, SearchOptions::default()) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        set_find_label(app, &format!("{err}"));
+                        return;
+                    }
+                }
+            } else if advance > 0 {
+                app.editor.find_next();
+            } else if advance < 0 {
+                app.editor.find_prev();
+            }
+        }
     }
+    app.last_find_text = text;
+    app.last_find_kind = kind;
     let count = app.editor.matches().len();
     let label = if count == 0 {
         "No matches".to_string()
@@ -2173,9 +2628,34 @@ fn find_from_bar(app: &mut App, advance: i32) {
 fn do_replace(app: &mut App, all: bool) {
     // SAFETY: our edit controls.
     let replacement = unsafe { window_text(app.replace_edit) };
+    // Masked patterns are find-only (roadmap item 12): replacing
+    // "whatever the wildcards matched" has no single meaning, so say
+    // so instead of replacing the pattern text literally.
+    // SAFETY: our edit control.
+    let find_text = unsafe { window_text(app.find_edit) };
+    if masked_pattern_for(app, &find_text).is_some() {
+        message_box(
+            app.hwnd,
+            "Masked patterns (like 4A ?? FF) are for finding only — replace does not use them.",
+            "VeloEdit",
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    }
     // Make sure the needle is current before replacing.
     find_from_bar(app, 0);
-    let result = if all {
+    let result = if all && app.find_in_selection {
+        // Scoped replace-all (roadmap item 11): one undo entry, only
+        // inside the captured scope. With no scope, find_from_bar
+        // has already put the notice in the count label.
+        match app.find_scope_range {
+            Some((start, end)) => app
+                .editor
+                .replace_all_in_range(&replacement, start, end)
+                .map(|n| n > 0),
+            None => return,
+        }
+    } else if all {
         app.editor.replace_all(&replacement).map(|n| n > 0)
     } else {
         app.editor.replace_current(&replacement)
@@ -2639,6 +3119,25 @@ fn create_children(app: &mut App) {
         "Replace every match (one undo step)",
     );
     add_tooltip(tooltip, app.hwnd, close, "Close the find bar (Esc)");
+    // The "In selection" scope toggle (roadmap item 11): an
+    // owner-drawn button like the others, so it draws in the same
+    // themed style; its state lives in `app.find_in_selection` and
+    // its text carries the ☐/☑ glyph the draw pass renders.
+    app.find_scope_check = create_child(
+        app,
+        "Button",
+        "\u{2610} In selection",
+        button_style,
+        0,
+        CMD_FIND_SCOPE,
+    );
+    app.find_controls.push(app.find_scope_check);
+    add_tooltip(
+        tooltip,
+        app.hwnd,
+        app.find_scope_check,
+        "Search and replace only inside the current selection",
+    );
     subclass_edit(app.find_edit, app.hwnd);
     subclass_edit(app.replace_edit, app.hwnd);
 
@@ -2673,12 +3172,16 @@ fn build_menus(app: &mut App) {
         let bar = CreateMenu();
 
         let file = CreatePopupMenu();
+        app.file_menu = file;
         menu_item(file, CMD_OPEN, "Open\tCtrl+O");
         menu_item(file, CMD_SAVE, "Save\tCtrl+S");
         menu_item(file, CMD_SAVE_AS, "Save As\u{2026}");
         menu_item(file, CMD_SAVE_SELECTION, "Save Selection to File\u{2026}");
+        menu_item(file, CMD_SPLIT_FILE, "Split File Copy\u{2026}");
         app.recent_menu = CreatePopupMenu();
         menu_popup(file, app.recent_menu, "Recent");
+        menu_sep(file);
+        menu_item(file, CMD_EXPLORER_MENU, "Explorer Menu Item");
         menu_sep(file);
         menu_item(file, CMD_EXIT, "Exit");
 
@@ -2694,6 +3197,9 @@ fn build_menus(app: &mut App) {
         menu_item(edit, CMD_REPLACE, "Replace\tCtrl+H");
         menu_sep(edit);
         menu_item(edit, CMD_SELECT_ALL, "Select All\tCtrl+A");
+        menu_sep(edit);
+        menu_item(edit, CMD_SORT_LINES, "Sort Lines in Selection");
+        menu_item(edit, CMD_DEDUP_LINES, "Remove Duplicate Lines in Selection");
 
         let search = CreatePopupMenu();
         menu_item(search, CMD_FIND, "Find\u{2026}\tCtrl+F");
@@ -2793,6 +3299,20 @@ fn refresh_menu_checks(app: &App) {
                     0
                 },
         );
+        // The Explorer menu item (roadmap item 38) is checked while
+        // the registry entry exists; choosing it toggles the entry.
+        if !app.file_menu.is_null() {
+            CheckMenuItem(
+                app.file_menu,
+                CMD_EXPLORER_MENU as u32,
+                MF_BYCOMMAND
+                    | if shell_menu_is_installed() {
+                        MF_CHECKED
+                    } else {
+                        0
+                    },
+            );
+        }
     }
     // The toolbar's Text / Hex toggle buttons show their state in
     // their owner-drawn faces; a mode change repaints them via
@@ -3017,6 +3537,22 @@ fn on_command(app: &mut App, id: usize) {
         CMD_SAVE_SELECTION => {
             do_save_selection(app);
         }
+        CMD_SPLIT_FILE => {
+            do_split_file(app);
+        }
+        CMD_EXPLORER_MENU => {
+            // Toggle the opt-in Explorer item (roadmap item 38): the
+            // registry state is the truth, the check mark follows it.
+            let result = if shell_menu_is_installed() {
+                shell_menu_uninstall().map(|_| ())
+            } else {
+                shell_menu_install()
+            };
+            if let Err(message) = result {
+                message_box(app.hwnd, &message, "VeloEdit", MB_OK | MB_ICONERROR);
+            }
+            refresh_menu_checks(app);
+        }
         CMD_EXIT => {
             // SAFETY: posting our own close message.
             unsafe { PostMessageW(app.hwnd, WM_CLOSE, 0, 0) };
@@ -3080,9 +3616,58 @@ fn on_command(app: &mut App, id: usize) {
         CMD_DO_REPLACE => do_replace(app, false),
         CMD_DO_REPLACE_ALL => do_replace(app, true),
         CMD_FIND_CLOSE => hide_find_bar(app),
+        CMD_FIND_SCOPE => {
+            // The "In selection" toggle: update the state, the
+            // button's state glyph, and re-run the find so the count
+            // immediately reflects the new scope (or the whole
+            // document, when toggled off).
+            app.find_in_selection = !app.find_in_selection;
+            if !app.find_in_selection {
+                app.find_scope_range = None;
+                app.last_scope_range = None;
+            }
+            let label = if app.find_in_selection {
+                "\u{2611} In selection"
+            } else {
+                "\u{2610} In selection"
+            };
+            let wide = wstr(label);
+            // SAFETY: our find-bar button; the string outlives the call.
+            unsafe {
+                SetWindowTextW(app.find_scope_check, wide.as_ptr());
+                InvalidateRect(app.find_scope_check, std::ptr::null(), 1);
+                SetFocus(app.find_edit);
+            }
+            find_from_bar(app, 0);
+        }
         CMD_SELECT_ALL => {
             app.editor.select_all();
             after_caret_move(app);
+        }
+        CMD_SORT_LINES | CMD_DEDUP_LINES => {
+            // Line operations on the selection (roadmap item 23):
+            // the editor ops expand the range to whole lines and are
+            // one undo entry each; a refusal (a range past the size
+            // limit) goes through the standard error box.
+            let Some((start, end)) = app.editor.selection_range() else {
+                return;
+            };
+            let result = if id == CMD_SORT_LINES {
+                app.editor.sort_lines_in_range(start, end).map(|_| ())
+            } else {
+                app.editor.dedup_lines_in_range(start, end).map(|_| ())
+            };
+            match result {
+                Ok(()) => after_edit(app),
+                Err(err) => {
+                    message_box(
+                        app.hwnd,
+                        &format!("{err}"),
+                        "VeloEdit",
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+            }
         }
         CMD_MODE_TEXT => set_mode(app, EditorMode::Text),
         CMD_MODE_HEX => set_mode(app, EditorMode::Hex),
@@ -3653,7 +4238,10 @@ unsafe extern "system" fn wnd_proc(
                     };
                     set(file_menu, CMD_SAVE, can_edit);
                     set(file_menu, CMD_SAVE_SELECTION, has_selection);
+                    set(file_menu, CMD_SPLIT_FILE, app.editor.path().is_some());
                     set(edit_menu, CMD_UNDO, app.editor.can_undo());
+                    set(edit_menu, CMD_SORT_LINES, can_edit && has_selection);
+                    set(edit_menu, CMD_DEDUP_LINES, can_edit && has_selection);
                     set(edit_menu, CMD_REDO, app.editor.can_redo());
                     set(edit_menu, CMD_CUT, can_edit && has_selection);
                     set(edit_menu, CMD_COPY, has_selection);
@@ -4050,11 +4638,17 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         find_count: std::ptr::null_mut(),
         find_label: std::ptr::null_mut(),
         replace_label: std::ptr::null_mut(),
+        find_scope_check: std::ptr::null_mut(),
+        find_in_selection: false,
+        find_scope_range: None,
+        last_scope_range: None,
+        last_find_kind: FindKind::Plain,
         status: std::ptr::null_mut(),
         status_right: std::ptr::null_mut(),
         eol: startup_eol,
         scroll_drag: None,
         help_hwnd: std::ptr::null_mut(),
+        file_menu: std::ptr::null_mut(),
         view_menu: std::ptr::null_mut(),
         recent_menu: std::ptr::null_mut(),
         theme_menu: std::ptr::null_mut(),
@@ -4202,7 +4796,146 @@ fn register_classes(hinstance: HINSTANCE) -> bool {
         lpszClassName: help.as_ptr(),
     };
     // SAFETY: as above.
-    (unsafe { RegisterClassW(&help_class) }) != 0
+    if unsafe { RegisterClassW(&help_class) } == 0 {
+        return false;
+    }
+    let split = wstr(SPLIT_CLASS);
+    let split_class = WNDCLASSW {
+        style: 0x2 | 0x1,
+        lpfnWndProc: Some(split_dialog_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: icon,
+        hCursor: cursor,
+        hbrBackground: std::ptr::null_mut(),
+        lpszMenuName: std::ptr::null(),
+        lpszClassName: split.as_ptr(),
+    };
+    // SAFETY: as above.
+    (unsafe { RegisterClassW(&split_class) }) != 0
+}
+
+/// The registry path of the Explorer context-menu item (roadmap
+/// item 38), relative to HKEY_CURRENT_USER: per-user, so installing
+/// it needs no administrator rights and touches no other account.
+pub fn shell_menu_key_path() -> &'static str {
+    r"Software\Classes\*\shell\VeloEdit"
+}
+
+/// The command Explorer runs for the menu item: the program's path
+/// in quotes, then the clicked file as `"%1"`.
+pub fn shell_menu_command(exe: &Path) -> String {
+    format!("\"{}\" \"%1\"", exe.display())
+}
+
+/// Write one REG_SZ value under an already-open key. `name` is None
+/// for the key's default value.
+fn reg_set_sz(key: HKEY, name: Option<&str>, value: &str) -> Result<(), String> {
+    let wide = wstr(value);
+    let name_wide = name.map(wstr);
+    // SAFETY: `key` is a live key handle opened by the caller with
+    // KEY_WRITE; the name (or null for the default value) and the
+    // NUL-terminated UTF-16 data outlive the call.
+    let status = unsafe {
+        RegSetValueExW(
+            key,
+            name_wide.as_ref().map_or(std::ptr::null(), |w| w.as_ptr()),
+            0,
+            REG_SZ,
+            wide.as_ptr() as *const u8,
+            (wide.len() * std::mem::size_of::<u16>()) as u32,
+        )
+    };
+    if status != 0 {
+        return Err(format!(
+            "could not write the Explorer menu value (registry error {status})"
+        ));
+    }
+    Ok(())
+}
+
+/// Create (or open) a key under HKCU with write access; the caller
+/// closes the returned handle.
+fn reg_create_key(path: &str) -> Result<HKEY, String> {
+    let wide = wstr(path);
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: the path is NUL-terminated and outlives the call; the
+    // out-slot is writable; a null class name and the non-volatile
+    // option are the standard create-or-open form.
+    let status = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            wide.as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(format!(
+            "could not create the Explorer menu key (registry error {status})"
+        ));
+    }
+    Ok(key)
+}
+
+/// Add the "Open in VeloEdit" Explorer menu item for this program
+/// (roadmap item 38): the MUIVerb and Icon on the item key, the
+/// launch command on its `command` subkey — all under the current
+/// user, nothing else in the registry is touched.
+pub fn shell_menu_install() -> Result<(), String> {
+    let exe =
+        std::env::current_exe().map_err(|e| format!("could not find the program file: {e}"))?;
+    let key = reg_create_key(shell_menu_key_path())?;
+    let verb = reg_set_sz(key, Some("MUIVerb"), "Open in VeloEdit");
+    let icon = verb.and_then(|()| reg_set_sz(key, Some("Icon"), &exe.to_string_lossy()));
+    // SAFETY: `key` came from reg_create_key above and is closed
+    // exactly once here, after the value writes.
+    unsafe { RegCloseKey(key) };
+    icon?;
+    let command_key = reg_create_key(&format!("{}\\command", shell_menu_key_path()))?;
+    let command = reg_set_sz(command_key, None, &shell_menu_command(&exe));
+    // SAFETY: as above — the command subkey, closed exactly once.
+    unsafe { RegCloseKey(command_key) };
+    command
+}
+
+/// Remove the Explorer menu item (roadmap item 38). Returns whether
+/// anything was installed; removing when nothing is installed is a
+/// success, not an error.
+pub fn shell_menu_uninstall() -> Result<bool, String> {
+    let wide = wstr(shell_menu_key_path());
+    // SAFETY: the path is NUL-terminated and outlives the call;
+    // RegDeleteTreeW removes the key and its subkeys (here just the
+    // command subkey) in one call.
+    let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, wide.as_ptr()) };
+    match status {
+        0 => Ok(true),
+        2 => Ok(false), // ERROR_FILE_NOT_FOUND: nothing was installed
+        other => Err(format!(
+            "could not remove the Explorer menu item (registry error {other})"
+        )),
+    }
+}
+
+/// Whether the Explorer menu item is currently installed.
+pub fn shell_menu_is_installed() -> bool {
+    let wide = wstr(shell_menu_key_path());
+    let mut key: HKEY = std::ptr::null_mut();
+    // SAFETY: the path is NUL-terminated and outlives the call; the
+    // out-slot is writable; a handle handed back is closed below.
+    let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, wide.as_ptr(), 0, KEY_READ, &mut key) };
+    if status != 0 {
+        return false;
+    }
+    // SAFETY: `key` was just opened by us and is closed exactly once.
+    unsafe { RegCloseKey(key) };
+    true
 }
 
 /// Attach to the parent process's console, if it has one.
@@ -4319,5 +5052,22 @@ mod tests {
         // The design mockup's file size.
         let gb104 = (104.2 * 1024.0 * 1024.0 * 1024.0) as u64;
         assert_eq!(human_size(gb104), "104.2 GB");
+    }
+
+    /// The Explorer menu item (roadmap item 38) lives at one fixed
+    /// per-user key, and its command quotes the program path and the
+    /// clicked file exactly as Explorer expects.
+    #[test]
+    fn shell_menu_paths_and_command_are_exact() {
+        assert_eq!(shell_menu_key_path(), r"Software\Classes\*\shell\VeloEdit");
+        assert_eq!(
+            shell_menu_command(Path::new(r"C:\Tools\VeloEdit.exe")),
+            "\"C:\\Tools\\VeloEdit.exe\" \"%1\""
+        );
+        assert_eq!(
+            shell_menu_command(Path::new(r"D:\My Apps\VeloEdit.exe")),
+            "\"D:\\My Apps\\VeloEdit.exe\" \"%1\"",
+            "a path with spaces stays one quoted argument"
+        );
     }
 }
