@@ -31,6 +31,15 @@
 //!   case-insensitive mode each match occupies exactly the needle's byte
 //!   length (the folded match has the same bytes counted, the replacement
 //!   is inserted verbatim).
+//! * **Scoped forms** ([`find_in_range`], [`count_in_range`],
+//!   [`replace_all_in_range`], roadmap item 11) report or replace only
+//!   matches lying fully inside `[start, end)`.
+//! * **Masked search** ([`MaskedPattern`], [`find_masked_all`], roadmap
+//!   item 12) matches byte patterns with per-nibble wildcards.
+//! * Scanning is **word-parallel** (roadmap item 8): candidate
+//!   positions are filtered eight bytes at a time with SWAR bit
+//!   tricks and verified individually, so results are identical to a
+//!   naive scan — an equivalence test against one is in this module.
 //!
 //! # UTF-16 alignment caveat (read before searching UTF-16 files)
 //!
@@ -75,7 +84,42 @@ pub struct ReplaceReport {
 /// list for an empty needle or no matches.
 pub fn find_all(table: &PieceTable, needle: &[u8], options: &SearchOptions) -> Vec<u64> {
     let limit = options.max_results.unwrap_or(usize::MAX);
-    collect_matches(table, needle, options, 0, false, limit)
+    collect_matches(table, needle, options, 0, table.len(), false, limit)
+}
+
+/// Find every occurrence of `needle` lying **fully inside**
+/// `[start, end)` (roadmap item 11): a match that starts inside the
+/// range but runs past `end` — or starts before `start` — is not
+/// reported. Overlapping matches are reported, as in [`find_all`].
+pub fn find_in_range(
+    table: &PieceTable,
+    needle: &[u8],
+    options: &SearchOptions,
+    start: u64,
+    end: u64,
+) -> Vec<u64> {
+    let limit = options.max_results.unwrap_or(usize::MAX);
+    let end = end.min(table.len());
+    if start >= end {
+        return Vec::new();
+    }
+    collect_matches(table, needle, options, start, end, false, limit)
+}
+
+/// How many occurrences of `needle` lie fully inside `[start, end)`.
+/// Ignores `options.max_results` (a count is a count).
+pub fn count_in_range(
+    table: &PieceTable,
+    needle: &[u8],
+    options: &SearchOptions,
+    start: u64,
+    end: u64,
+) -> usize {
+    let unlimited = SearchOptions {
+        max_results: None,
+        ..*options
+    };
+    find_in_range(table, needle, &unlimited, start, end).len()
 }
 
 /// Find the first occurrence of `needle` at or after `from_offset`, or
@@ -86,7 +130,7 @@ pub fn find_next(
     from_offset: u64,
     options: &SearchOptions,
 ) -> Option<u64> {
-    collect_matches(table, needle, options, from_offset, false, 1)
+    collect_matches(table, needle, options, from_offset, table.len(), false, 1)
         .into_iter()
         .next()
 }
@@ -101,6 +145,7 @@ fn collect_matches(
     needle: &[u8],
     options: &SearchOptions,
     from_offset: u64,
+    end: u64,
     non_overlapping: bool,
     limit: usize,
 ) -> Vec<u64> {
@@ -136,22 +181,20 @@ fn collect_matches(
         let window_start = tail_start;
 
         if window.len() >= n {
-            let last_start = window.len() - n;
-            let mut i = 0usize;
-            while i <= last_start {
-                if bytes_match(&window, i, &folded_needle, options.case_insensitive) {
-                    let absolute = window_start + i as u64;
-                    if absolute >= from_offset && absolute >= suppress_until {
-                        results.push(absolute);
-                        if non_overlapping {
-                            suppress_until = absolute + n as u64;
-                        }
-                        if results.len() >= limit {
-                            return results;
-                        }
+            for i in window_matches(&window, &folded_needle, options.case_insensitive) {
+                let absolute = window_start + i as u64;
+                if absolute >= from_offset
+                    && absolute >= suppress_until
+                    && absolute + n as u64 <= end
+                {
+                    results.push(absolute);
+                    if non_overlapping {
+                        suppress_until = absolute + n as u64;
+                    }
+                    if results.len() >= limit {
+                        return results;
                     }
                 }
-                i += 1;
             }
         }
 
@@ -161,6 +204,56 @@ fn collect_matches(
         tail_start = window_end - keep as u64;
     }
     results
+}
+
+/// All start positions in `window` where `folded_needle` matches, in
+/// ascending order (roadmap item 8). The scan is word-parallel: SWAR
+/// over 8-byte words finds the positions whose byte can be the
+/// needle's first byte, and only those candidates are verified with
+/// the full compare — the result list is identical to a naive
+/// position-by-position scan, overlaps included.
+fn window_matches(window: &[u8], folded_needle: &[u8], case_insensitive: bool) -> Vec<usize> {
+    let n = folded_needle.len();
+    if n == 0 || window.len() < n {
+        return Vec::new();
+    }
+    let last_start = window.len() - n;
+    let first = folded_needle[0];
+    // A candidate byte must fold to `first`: it is either `first`
+    // itself or, for a letter, its other case.
+    let alt = if case_insensitive {
+        first.to_ascii_uppercase()
+    } else {
+        first
+    };
+    let mut out: Vec<usize> = Vec::new();
+    let mut base = 0usize;
+    while base + 8 <= window.len() {
+        let word = u64::from_le_bytes(window[base..base + 8].try_into().expect("8 bytes"));
+        let mut hits = crate::line_index::swar_match_high_bits(word, first);
+        if alt != first {
+            hits |= crate::line_index::swar_match_high_bits(word, alt);
+        }
+        while hits != 0 {
+            let bit = hits.trailing_zeros() as usize;
+            hits &= hits - 1;
+            let i = base + bit / 8;
+            if i > last_start {
+                break;
+            }
+            if bytes_match(window, i, folded_needle, case_insensitive) {
+                out.push(i);
+            }
+        }
+        base += 8;
+    }
+    for i in base..=last_start {
+        let b = window[i];
+        if (b == first || b == alt) && bytes_match(window, i, folded_needle, case_insensitive) {
+            out.push(i);
+        }
+    }
+    out
 }
 
 /// Compare the (possibly pre-folded) needle against `window` at `pos`.
@@ -173,6 +266,154 @@ fn bytes_match(window: &[u8], pos: usize, folded_needle: &[u8], case_insensitive
     } else {
         hay == folded_needle
     }
+}
+
+/// A byte pattern with per-nibble wildcards (roadmap item 12), parsed
+/// from text like `"4A ?? FF 00 2B"`: each token is two characters,
+/// each character a hex digit or `?`. A `?` nibble matches anything,
+/// so `"4?"` matches `0x40..=0x4F` and `"?F"` matches `0x0F, 0x1F, …`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaskedPattern {
+    /// `(value, mask)` per byte: a document byte `b` matches when
+    /// `b & mask == value & mask`.
+    pairs: Vec<(u8, u8)>,
+}
+
+impl MaskedPattern {
+    /// Number of bytes in the pattern.
+    pub fn len(&self) -> usize {
+        self.pairs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// The `(value, mask)` pairs, in pattern order.
+    pub fn pairs(&self) -> &[(u8, u8)] {
+        &self.pairs
+    }
+
+    /// Does `bytes` (exactly the pattern's length) match?
+    pub fn matches_at(&self, bytes: &[u8]) -> bool {
+        bytes.len() == self.pairs.len()
+            && self
+                .pairs
+                .iter()
+                .zip(bytes.iter())
+                .all(|((value, mask), b)| b & mask == value & mask)
+    }
+}
+
+/// Parse a masked pattern from text (see [`MaskedPattern`]). Tokens
+/// are separated by whitespace; every token must be exactly two
+/// characters, each a hex digit or `?`. Returns a plain-words error.
+pub fn parse_masked_pattern(text: &str) -> Result<MaskedPattern, String> {
+    let mut pairs: Vec<(u8, u8)> = Vec::new();
+    for token in text.split_whitespace() {
+        let chars: Vec<char> = token.chars().collect();
+        if chars.len() != 2 {
+            return Err(format!(
+                "pattern token '{token}' must be exactly two characters (a byte or ??)"
+            ));
+        }
+        let mut value: u8 = 0;
+        let mut mask: u8 = 0;
+        for (pos, ch) in chars.iter().enumerate() {
+            let shift = if pos == 0 { 4 } else { 0 };
+            match ch {
+                '?' => {}
+                c => {
+                    let digit = c
+                        .to_digit(16)
+                        .ok_or_else(|| format!("'{c}' is not a hex digit or ?"))?;
+                    value |= (digit as u8) << shift;
+                    mask |= 0xFu8 << shift;
+                }
+            }
+        }
+        pairs.push((value, mask));
+    }
+    if pairs.is_empty() {
+        return Err("the pattern is empty".to_string());
+    }
+    Ok(MaskedPattern { pairs })
+}
+
+/// Find every occurrence of a masked pattern, streaming over the
+/// piece table exactly like [`find_all`] (matches spanning pieces are
+/// found; overlapping occurrences are reported). `max_results` caps
+/// the list when set.
+pub fn find_masked_all(
+    table: &PieceTable,
+    pattern: &MaskedPattern,
+    max_results: Option<usize>,
+) -> Vec<u64> {
+    let n = pattern.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let limit = max_results.unwrap_or(usize::MAX);
+    // Candidate anchor: the first fully-fixed byte, if the pattern has
+    // one — its positions (found with the SWAR filter) are the only
+    // possible match starts, offset back by the anchor's position.
+    let anchor = pattern.pairs().iter().position(|(_, mask)| *mask == 0xFF);
+    let mut results: Vec<u64> = Vec::new();
+    let mut tail: Vec<u8> = Vec::new();
+    let mut tail_start: u64 = 0;
+    for slice in table.iter_slices() {
+        let slice = slice.as_ref();
+        if slice.is_empty() {
+            continue;
+        }
+        let mut window: Vec<u8> = Vec::with_capacity(tail.len() + slice.len());
+        window.extend_from_slice(&tail);
+        window.extend_from_slice(slice);
+        let window_start = tail_start;
+        if window.len() >= n {
+            let last_start = window.len() - n;
+            let mut starts: Vec<usize> = Vec::new();
+            match anchor {
+                Some(a) => {
+                    let target = pattern.pairs()[a].0;
+                    let mut base = 0usize;
+                    while base + 8 <= window.len() {
+                        let word =
+                            u64::from_le_bytes(window[base..base + 8].try_into().expect("8 bytes"));
+                        let mut hits = crate::line_index::swar_match_high_bits(word, target);
+                        while hits != 0 {
+                            let bit = hits.trailing_zeros() as usize;
+                            hits &= hits - 1;
+                            let pos = base + bit / 8;
+                            if pos >= a && pos - a <= last_start {
+                                starts.push(pos - a);
+                            }
+                        }
+                        base += 8;
+                    }
+                    for (pos, &b) in window.iter().enumerate().skip(base) {
+                        if b == target && pos >= a && pos - a <= last_start {
+                            starts.push(pos - a);
+                        }
+                    }
+                }
+                None => starts.extend(0..=last_start),
+            }
+            for i in starts {
+                if pattern.matches_at(&window[i..i + n]) {
+                    results.push(window_start + i as u64);
+                    if results.len() >= limit {
+                        return results;
+                    }
+                }
+            }
+        }
+        let window_end = window_start + window.len() as u64;
+        let keep = (n - 1).min(window.len());
+        tail = window[window.len() - keep..].to_vec();
+        tail_start = window_end - keep as u64;
+    }
+    results
 }
 
 /// Replace the `needle_len` bytes at `offset` with `replacement`,
@@ -228,7 +469,44 @@ pub fn replace_all(
             action: None,
         };
     }
-    let matches = collect_matches(table, needle, options, 0, true, usize::MAX);
+    let matches = collect_matches(table, needle, options, 0, table.len(), true, usize::MAX);
+    apply_replace_matches(table, history, &matches, needle.len() as u64, replacement)
+}
+
+/// Replace every non-overlapping occurrence of `needle` lying fully
+/// inside `[start, end)` with `replacement`, as ONE undoable history
+/// entry (roadmap item 11). Matches outside the range — including one
+/// straddling either edge — are left exactly as they are.
+pub fn replace_all_in_range(
+    table: &mut PieceTable,
+    history: &mut UndoStack,
+    needle: &[u8],
+    replacement: &[u8],
+    options: &SearchOptions,
+    start: u64,
+    end: u64,
+) -> ReplaceReport {
+    if needle.is_empty() || start >= end {
+        return ReplaceReport {
+            count: 0,
+            action: None,
+        };
+    }
+    let end = end.min(table.len());
+    let matches = collect_matches(table, needle, options, start, end, true, usize::MAX);
+    apply_replace_matches(table, history, &matches, needle.len() as u64, replacement)
+}
+
+/// Apply a precomputed non-overlapping match list as one replace-all
+/// history entry (shared by [`replace_all`] and
+/// [`replace_all_in_range`]).
+fn apply_replace_matches(
+    table: &mut PieceTable,
+    history: &mut UndoStack,
+    matches: &[u64],
+    needle_len: u64,
+    replacement: &[u8],
+) -> ReplaceReport {
     if matches.is_empty() {
         return ReplaceReport {
             count: 0,
@@ -237,7 +515,6 @@ pub fn replace_all(
     }
     let count = matches.len();
     let first = matches[0];
-    let needle_len = needle.len() as u64;
     let last_end = matches[count - 1] + needle_len;
     let total_inserted = replacement.len() as u64 * count as u64;
 
@@ -584,6 +861,189 @@ mod tests {
         assert!(history.apply_undo(&mut table));
         assert_eq!(text(&table), "bar bar bar");
         assert!(table.check_invariants());
+    }
+
+    // ---- SWAR equivalence (roadmap item 8) ----
+
+    /// The naive reference matcher: every position, full compare.
+    fn naive_find(data: &[u8], needle: &[u8], ci: bool) -> Vec<u64> {
+        if needle.is_empty() || data.len() < needle.len() {
+            return Vec::new();
+        }
+        let fold = |b: u8| {
+            if ci {
+                b.to_ascii_lowercase()
+            } else {
+                b
+            }
+        };
+        (0..=data.len() - needle.len())
+            .filter(|&i| {
+                data[i..i + needle.len()]
+                    .iter()
+                    .zip(needle.iter())
+                    .all(|(h, n)| fold(*h) == fold(*n))
+            })
+            .map(|i| i as u64)
+            .collect()
+    }
+
+    #[test]
+    fn swar_scan_matches_naive_on_randomised_data() {
+        let mut state = 0x1357_9BDF_2468_ACE0u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Small alphabet so matches (and near-misses) are dense.
+        let alphabet = b"aAbB";
+        for trial in 0..60 {
+            let len = (next() % 300) as usize;
+            let mut data: Vec<u8> = (0..len).map(|_| alphabet[(next() % 4) as usize]).collect();
+            // Fragment the table: prepend single bytes so matches can
+            // straddle piece and word boundaries alike.
+            let mut table = PieceTable::from_original(std::mem::take(&mut data));
+            if trial % 3 == 0 {
+                table.insert(0, b"a");
+                table.delete(0, 1);
+                if table.len() > 4 {
+                    table.insert(3, b"B");
+                    table.delete(3, 1);
+                }
+            }
+            let content = table.read(0, table.len());
+            for needle in [&b"a"[..], b"ab", b"aAb", b"baab", b"bbbbbbbbbb"] {
+                for ci in [false, true] {
+                    let options = SearchOptions {
+                        case_insensitive: ci,
+                        max_results: None,
+                    };
+                    assert_eq!(
+                        find_all(&table, needle, &options),
+                        naive_find(&content, needle, ci),
+                        "trial {trial} needle {needle:?} ci {ci}"
+                    );
+                }
+            }
+        }
+        // A needle longer than any window chunk, planted at a word
+        // boundary and at a piece boundary.
+        let mut table = PieceTable::from_original(b"0123456789".to_vec());
+        table.insert(5, b"ABCDEFGHIJ");
+        assert_eq!(find_all(&table, b"4ABCDEFGHIJ5", &sensitive()), vec![4]);
+        assert_eq!(find_all(&table, b"ABCDEFGHIJ", &sensitive()), vec![5]);
+    }
+
+    // ---- scoped search (roadmap item 11) ----
+
+    #[test]
+    fn find_in_range_requires_matches_fully_inside() {
+        let table = PieceTable::from_original(b"foo bar foo baz foo".to_vec());
+        // Whole-range behaves like find_all.
+        assert_eq!(
+            find_in_range(&table, b"foo", &sensitive(), 0, 19),
+            vec![0, 8, 16]
+        );
+        // A range that cuts the last match off excludes it.
+        assert_eq!(
+            find_in_range(&table, b"foo", &sensitive(), 0, 18),
+            vec![0, 8]
+        );
+        // A match starting before `start` is excluded even when most
+        // of it lies inside.
+        assert_eq!(
+            find_in_range(&table, b"foo", &sensitive(), 1, 19),
+            vec![8, 16]
+        );
+        assert_eq!(count_in_range(&table, b"foo", &sensitive(), 4, 15), 1);
+        assert_eq!(count_in_range(&table, b"foo", &sensitive(), 9, 9), 0);
+    }
+
+    #[test]
+    fn replace_all_in_range_is_one_undo_and_leaves_the_rest() {
+        let mut table = PieceTable::from_original(b"foo bar foo baz foo".to_vec());
+        let mut history = UndoStack::new();
+        let layout_before = table.pieces.clone();
+        // Replace only the middle occurrence (offsets 8..11).
+        let report = replace_all_in_range(
+            &mut table,
+            &mut history,
+            b"foo",
+            b"quux",
+            &sensitive(),
+            4,
+            15,
+        );
+        assert_eq!(report.count, 1);
+        assert_eq!(text(&table), "foo bar quux baz foo");
+        assert_eq!(history.undo_len(), 1);
+        assert!(history.apply_undo(&mut table));
+        assert_eq!(text(&table), "foo bar foo baz foo");
+        assert_eq!(table.pieces, layout_before);
+        // A range straddling a match replaces nothing.
+        let report = replace_all_in_range(
+            &mut table,
+            &mut history,
+            b"foo",
+            b"quux",
+            &sensitive(),
+            1,
+            3,
+        );
+        assert_eq!(report.count, 0);
+        assert_eq!(text(&table), "foo bar foo baz foo");
+        assert!(table.check_invariants());
+    }
+
+    // ---- masked search (roadmap item 12) ----
+
+    #[test]
+    fn masked_pattern_parsing() {
+        let p = parse_masked_pattern("4A ?? FF 00 2B").unwrap();
+        assert_eq!(p.len(), 5);
+        assert_eq!(p.pairs()[0], (0x4A, 0xFF));
+        assert_eq!(p.pairs()[1], (0x00, 0x00));
+        // Nibble masks.
+        let p = parse_masked_pattern("4? ?F").unwrap();
+        assert_eq!(p.pairs(), &[(0x40, 0xF0), (0x0F, 0x0F)]);
+        // Invalid forms are errors, not silent guesses.
+        assert!(parse_masked_pattern("").is_err());
+        assert!(parse_masked_pattern("4").is_err());
+        assert!(parse_masked_pattern("4A2").is_err());
+        assert!(parse_masked_pattern("ZZ").is_err());
+        assert!(parse_masked_pattern("4G").is_err());
+    }
+
+    #[test]
+    fn masked_search_finds_wildcard_and_nibble_matches() {
+        let table = PieceTable::from_original(vec![
+            0x4A, 0x11, 0xFF, 0x00, 0x2B, 0x99, 0x4A, 0x77, 0xFF, 0x00, 0x2B,
+        ]);
+        let p = parse_masked_pattern("4A ?? FF 00 2B").unwrap();
+        assert_eq!(find_masked_all(&table, &p, None), vec![0, 6]);
+        // Nibble masks: 4? matches 0x40..=0x4F, ?F matches any byte
+        // ending in F.
+        let table = PieceTable::from_original(vec![0x41, 0x2F, 0x4F, 0x3F, 0x51, 0x2F]);
+        let p = parse_masked_pattern("4? ?F").unwrap();
+        assert_eq!(find_masked_all(&table, &p, None), vec![0, 2]);
+        // An all-wildcard pattern matches at every start.
+        let p = parse_masked_pattern("?? ??").unwrap();
+        assert_eq!(find_masked_all(&table, &p, None), vec![0, 1, 2, 3, 4]);
+        // max_results caps the list.
+        assert_eq!(find_masked_all(&table, &p, Some(2)), vec![0, 1]);
+    }
+
+    #[test]
+    fn masked_search_spans_piece_boundaries() {
+        let mut table = PieceTable::from_original(vec![0x01, 0x02, 0x05, 0x06]);
+        table.insert(2, &[0x03, 0x04]);
+        // Document: 01 02 | 03 04 | 05 06 over three pieces.
+        let p = parse_masked_pattern("02 ?? 04 ?? 06").unwrap();
+        assert_eq!(find_masked_all(&table, &p, None), vec![1]);
+        let p = parse_masked_pattern("01 02 03 04 05 06").unwrap();
+        assert_eq!(find_masked_all(&table, &p, None), vec![0]);
     }
 
     #[test]
