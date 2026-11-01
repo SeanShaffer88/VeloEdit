@@ -8,11 +8,17 @@
 //! is the ordered list of [`PieceNode`]s pointing into those two stores, so
 //! inserts and deletes only move small node records, never file data.
 //!
-//! Production target (SPEC.md section 2.1): the `Vec<PieceNode>` below is
-//! replaced by a weight-balanced 2-3 B-tree that maintains subtree lengths
-//! for O(log N) lookups (section 2.2). All public operations in this module
-//! are written against piece *semantics*, not Vec internals, so the B-tree
-//! can slot in behind the same API in a later slice.
+//! Lookup acceleration (SPEC.md section 2.2, roadmap item 2): the piece
+//! list itself stays a `Vec<PieceNode>`, but a Fenwick (binary indexed)
+//! tree over the piece lengths is maintained alongside it, so locating
+//! the piece that contains a byte offset — and the offset a piece starts
+//! at — costs O(log N) instead of a linear scan. Structural mutations
+//! rebuild the tree in O(N), the same order as the `Vec` splice they
+//! accompany; the hot typing path (coalescing extend) updates it in
+//! O(log N). Neighbouring pieces that reference one backing store
+//! contiguously are merged by [`PieceTable::coalesce`], which also runs
+//! automatically once the table grows past
+//! [`AUTO_COALESCE_THRESHOLD`] pieces.
 
 use std::borrow::Cow;
 
@@ -109,6 +115,30 @@ impl OriginalBuffer {
     }
 }
 
+/// Piece count above which an edit triggers an automatic
+/// [`PieceTable::coalesce`] pass (roadmap item 2). Typing coalescence
+/// keeps ordinary editing far below this; the pass exists for
+/// pathological fragmentation (bulk replaces, many small pastes).
+pub const AUTO_COALESCE_THRESHOLD: usize = 8192;
+
+/// Build a Fenwick (binary indexed) tree over `lengths`: `tree[i]`
+/// (1-based) holds the sum of the `lowbit(i)` lengths ending at piece
+/// `i - 1`. Prefix sums and point updates are O(log N).
+fn build_fenwick(lengths: &[u64]) -> Vec<u64> {
+    let n = lengths.len();
+    let mut tree = vec![0u64; n + 1];
+    for (i, &len) in lengths.iter().enumerate() {
+        tree[i + 1] = len;
+    }
+    for i in 1..=n {
+        let j = i + (i & i.wrapping_neg());
+        if j <= n {
+            tree[j] += tree[i];
+        }
+    }
+    tree
+}
+
 /// The piece table: an ordered list of pieces over the original file and the
 /// append buffer (SPEC.md section 2.1).
 #[derive(Debug)]
@@ -123,6 +153,20 @@ pub struct PieceTable {
     pub pieces: Vec<PieceNode>,
     /// Total visible length in bytes: always the sum of all piece lengths.
     pub total_length: u64,
+    /// Fenwick tree over the piece lengths (see [`build_fenwick`]);
+    /// `weights.len() == pieces.len() + 1` whenever it is in sync.
+    /// Every mutation path in this module keeps it in sync, and code
+    /// outside the module that rewrites `pieces` directly (the undo
+    /// engine's segment splice) calls [`PieceTable::rebuild_weights`].
+    weights: Vec<u64>,
+    /// How many times [`PieceTable::coalesce`] actually merged pieces.
+    /// The undo engine watches this to detect a coalesce that happened
+    /// inside one of its recorded edits (its segment bookkeeping then
+    /// falls back to whole-layout entries — see `crate::undo`).
+    coalesce_gen: u64,
+    /// Piece count at which the next automatic coalesce pass may run
+    /// (the throttle in `maybe_auto_coalesce`).
+    next_auto_coalesce: usize,
     /// Backing store for `BufferSource::Original` pieces.
     original: OriginalBuffer,
 }
@@ -137,11 +181,15 @@ impl PieceTable {
         } else {
             vec![PieceNode::new(BufferSource::Original, 0, original_len)]
         };
+        let weights = build_fenwick(&pieces.iter().map(|p| p.length).collect::<Vec<_>>());
         Self {
             original_file_size: original_len,
             append_buffer: Vec::new(),
             pieces,
             total_length: original_len,
+            weights,
+            coalesce_gen: 0,
+            next_auto_coalesce: AUTO_COALESCE_THRESHOLD + 1,
             original: OriginalBuffer::LengthOnly { len: original_len },
         }
     }
@@ -165,11 +213,15 @@ impl PieceTable {
         } else {
             vec![PieceNode::new(BufferSource::Original, 0, len)]
         };
+        let weights = build_fenwick(&pieces.iter().map(|p| p.length).collect::<Vec<_>>());
         Self {
             original_file_size: len,
             append_buffer: Vec::new(),
             pieces,
             total_length: len,
+            weights,
+            coalesce_gen: 0,
+            next_auto_coalesce: AUTO_COALESCE_THRESHOLD + 1,
             original,
         }
     }
@@ -223,6 +275,8 @@ impl PieceTable {
             vec![PieceNode::new(BufferSource::Original, 0, len)]
         };
         self.total_length = len;
+        self.next_auto_coalesce = AUTO_COALESCE_THRESHOLD + 1;
+        self.rebuild_weights();
         debug_assert!(self.check_invariants());
     }
 
@@ -238,6 +292,121 @@ impl PieceTable {
     /// Number of pieces currently describing the document.
     pub fn piece_count(&self) -> usize {
         self.pieces.len()
+    }
+
+    /// Rebuild the Fenwick weight tree from the current piece list.
+    /// Called by every structural mutation in this module, and by the
+    /// undo engine after it splices `pieces` directly.
+    pub(crate) fn rebuild_weights(&mut self) {
+        let lengths: Vec<u64> = self.pieces.iter().map(|p| p.length).collect();
+        self.weights = build_fenwick(&lengths);
+    }
+
+    /// How many times [`PieceTable::coalesce`] merged pieces (the undo
+    /// engine compares this around an edit it records).
+    pub(crate) fn coalesce_gen(&self) -> u64 {
+        self.coalesce_gen
+    }
+
+    /// Sum of the lengths of pieces `[0, idx)` — the document offset at
+    /// which piece `idx` starts. O(log N) via the Fenwick tree.
+    pub fn offset_of_piece(&self, idx: usize) -> u64 {
+        debug_assert!(idx <= self.pieces.len());
+        let mut sum: u64 = 0;
+        let mut i = idx;
+        while i > 0 {
+            sum += self.weights[i];
+            i -= i & i.wrapping_neg();
+        }
+        sum
+    }
+
+    /// Add `delta` to the length of piece `idx` in the Fenwick tree.
+    fn weights_add(&mut self, idx: usize, delta: u64) {
+        let mut i = idx + 1;
+        while i < self.weights.len() {
+            self.weights[i] += delta;
+            i += i & i.wrapping_neg();
+        }
+    }
+
+    /// The piece containing byte `offset`: its index and the document
+    /// offset at which it starts. `None` when `offset` is at or past
+    /// the end of the document. O(log N) via the Fenwick tree (binary
+    /// lifting over the prefix sums).
+    pub fn piece_at_offset(&self, offset: u64) -> Option<(usize, u64)> {
+        if offset >= self.total_length || self.pieces.is_empty() {
+            return None;
+        }
+        // Find the largest idx with prefix_sum(idx) <= offset; that idx
+        // is the index of the piece containing `offset`. Standard
+        // Fenwick binary lifting: walk bits from high to low, consuming
+        // whole ranges whose sums fit in the remaining offset.
+        let n = self.pieces.len();
+        let mut idx: usize = 0;
+        let mut remaining = offset;
+        let mut bit: usize = 1;
+        while bit << 1 <= n {
+            bit <<= 1;
+        }
+        while bit > 0 {
+            let next = idx + bit;
+            if next <= n && self.weights[next] <= remaining {
+                remaining -= self.weights[next];
+                idx = next;
+            }
+            bit >>= 1;
+        }
+        debug_assert!(idx < n);
+        let start = self.offset_of_piece(idx);
+        debug_assert!(start <= offset && offset < start + self.pieces[idx].length);
+        Some((idx, start))
+    }
+
+    /// Merge every pair of neighbouring pieces that reference the same
+    /// backing store with contiguous ranges (piece B starts exactly
+    /// where piece A ends, in the same store). Content is unchanged;
+    /// only the node count drops. Returns how many merges happened.
+    pub fn coalesce(&mut self) -> usize {
+        if self.pieces.len() < 2 {
+            return 0;
+        }
+        let mut merged: Vec<PieceNode> = Vec::with_capacity(self.pieces.len());
+        let mut merges = 0usize;
+        for piece in self.pieces.drain(..) {
+            match merged.last_mut() {
+                Some(last)
+                    if last.source == piece.source && last.source_end() == piece.source_offset =>
+                {
+                    last.length += piece.length;
+                    merges += 1;
+                }
+                _ => merged.push(piece),
+            }
+        }
+        if merges > 0 {
+            self.pieces = merged;
+            self.coalesce_gen += 1;
+            self.rebuild_weights();
+            debug_assert!(self.check_invariants());
+        } else {
+            self.pieces = merged; // nothing merged; the list is unchanged
+        }
+        merges
+    }
+
+    /// The automatic coalescing trigger: after an edit, once the table
+    /// exceeds [`AUTO_COALESCE_THRESHOLD`] pieces, run a full pass —
+    /// throttled so a pass runs at most once per 1024 further pieces,
+    /// keeping a long run of small inserts from paying an O(N) pass
+    /// for every keystroke.
+    fn maybe_auto_coalesce(&mut self) {
+        if self.pieces.len() > AUTO_COALESCE_THRESHOLD
+            && self.pieces.len() >= self.next_auto_coalesce
+        {
+            self.coalesce();
+            self.next_auto_coalesce = self.pieces.len().max(AUTO_COALESCE_THRESHOLD) + 1024;
+        }
     }
 
     /// Check the table invariants: piece lengths sum to `total_length`, no
@@ -258,12 +427,14 @@ impl PieceTable {
             }
             sum += piece.length;
         }
-        sum == self.total_length && self.original.len() == self.original_file_size
+        // The Fenwick tree must agree with the piece list it indexes.
+        let fenwick_ok = self.weights.len() == self.pieces.len() + 1
+            && self.offset_of_piece(self.pieces.len()) == self.total_length;
+        sum == self.total_length && self.original.len() == self.original_file_size && fenwick_ok
     }
 
-    /// The byte at visible `offset`, or `None` past the end. O(N) in the
-    /// number of pieces in this Vec-based slice; O(log N) once the B-tree
-    /// index from SPEC.md section 2.2 lands.
+    /// The byte at visible `offset`, or `None` past the end. The piece
+    /// is located in O(log N) through the Fenwick weight index.
     pub fn byte_at(&self, offset: u64) -> Option<u8> {
         if offset >= self.total_length {
             return None;
@@ -294,22 +465,21 @@ impl PieceTable {
             return 0;
         }
         let want = (out.len() as u64).min(self.total_length - offset);
+        let (mut idx, mut piece_start) = match self.piece_at_offset(offset) {
+            Some(found) => found,
+            None => return 0,
+        };
         let mut written: u64 = 0;
-        let mut piece_start: u64 = 0;
-        for piece in &self.pieces {
-            if written >= want {
-                break;
-            }
-            let piece_end = piece_start + piece.length;
-            if piece_end > offset {
-                let skip = offset.saturating_sub(piece_start);
-                let avail = piece.length - skip;
-                let take = avail.min(want - written);
-                let dst = &mut out[written as usize..(written + take) as usize];
-                self.copy_piece_bytes(piece, skip, dst);
-                written += take;
-            }
-            piece_start = piece_end;
+        while written < want {
+            let piece = self.pieces[idx];
+            let skip = offset + written - piece_start;
+            let avail = piece.length - skip;
+            let take = avail.min(want - written);
+            let dst = &mut out[written as usize..(written + take) as usize];
+            self.copy_piece_bytes(&piece, skip, dst);
+            written += take;
+            piece_start += piece.length;
+            idx += 1;
         }
         written as usize
     }
@@ -377,21 +547,25 @@ impl PieceTable {
         }
         let n = bytes.len() as u64;
 
-        // Coalescence: find the piece ending exactly at `offset`.
-        let mut piece_start: u64 = 0;
-        for (idx, piece) in self.pieces.iter().enumerate() {
-            let piece_end = piece_start + piece.length;
-            if piece_end == offset
-                && piece.source == BufferSource::Add
-                && piece.source_end() == self.append_buffer.len() as u64
-            {
-                self.append_buffer.extend_from_slice(bytes);
-                self.pieces[idx].length += n;
-                self.total_length += n;
-                debug_assert!(self.check_invariants());
-                return;
+        // Coalescence: the piece ending exactly at `offset` is the one
+        // containing `offset - 1` (located in O(log N)). When it is an
+        // `Add` piece whose data ends at the current end of the append
+        // buffer — the live-typing case — extend it in place.
+        if offset > 0 {
+            if let Some((idx, start)) = self.piece_at_offset(offset - 1) {
+                let piece = self.pieces[idx];
+                if start + piece.length == offset
+                    && piece.source == BufferSource::Add
+                    && piece.source_end() == self.append_buffer.len() as u64
+                {
+                    self.append_buffer.extend_from_slice(bytes);
+                    self.pieces[idx].length += n;
+                    self.weights_add(idx, n);
+                    self.total_length += n;
+                    debug_assert!(self.check_invariants());
+                    return;
+                }
             }
-            piece_start = piece_end;
         }
 
         let append_offset = self.append_buffer.len() as u64;
@@ -403,33 +577,29 @@ impl PieceTable {
         } else if offset == 0 {
             self.pieces.insert(0, new_piece);
         } else {
-            // Find the piece containing offset and bisect it.
-            let mut start: u64 = 0;
-            let mut idx = 0;
-            loop {
+            // Locate the piece containing offset (O(log N)) and bisect
+            // it, or insert at its start boundary.
+            let (idx, start) = self
+                .piece_at_offset(offset)
+                .expect("offset < total_length has a piece");
+            if offset == start {
+                self.pieces.insert(idx, new_piece);
+            } else {
                 let piece = self.pieces[idx];
-                let end = start + piece.length;
-                if offset == start {
-                    self.pieces.insert(idx, new_piece);
-                    break;
-                }
-                if offset > start && offset < end {
-                    let left_len = offset - start;
-                    let right = PieceNode::new(
-                        piece.source,
-                        piece.source_offset + left_len,
-                        piece.length - left_len,
-                    );
-                    self.pieces[idx].length = left_len;
-                    self.pieces.insert(idx + 1, new_piece);
-                    self.pieces.insert(idx + 2, right);
-                    break;
-                }
-                start = end;
-                idx += 1;
+                let left_len = offset - start;
+                let right = PieceNode::new(
+                    piece.source,
+                    piece.source_offset + left_len,
+                    piece.length - left_len,
+                );
+                self.pieces[idx].length = left_len;
+                self.pieces.insert(idx + 1, new_piece);
+                self.pieces.insert(idx + 2, right);
             }
         }
         self.total_length += n;
+        self.rebuild_weights();
+        self.maybe_auto_coalesce();
         debug_assert!(self.check_invariants());
     }
 
@@ -454,8 +624,15 @@ impl PieceTable {
         let del_end = offset + len.min(self.total_length - offset);
         let mut removed: Vec<PieceNode> = Vec::new();
         let mut new_pieces: Vec<PieceNode> = Vec::with_capacity(self.pieces.len());
-        let mut piece_start: u64 = 0;
-        for piece in &self.pieces {
+        // Pieces entirely before the deleted range are kept untouched;
+        // jump straight to the first overlapping piece in O(log N) and
+        // prefill the kept prefix.
+        let (first_idx, mut piece_start) = match self.piece_at_offset(offset) {
+            Some(found) => found,
+            None => (self.pieces.len(), self.total_length),
+        };
+        new_pieces.extend_from_slice(&self.pieces[..first_idx]);
+        for piece in &self.pieces[first_idx..] {
             let piece_end = piece_start + piece.length;
             if piece_end <= offset || piece_start >= del_end {
                 // No overlap: keep whole piece.
@@ -490,6 +667,8 @@ impl PieceTable {
         let removed_len: u64 = removed.iter().map(|p| p.length).sum();
         self.pieces = new_pieces;
         self.total_length -= removed_len;
+        self.rebuild_weights();
+        self.maybe_auto_coalesce();
         debug_assert!(self.check_invariants());
         removed
     }
@@ -665,6 +844,132 @@ mod tests {
         let removed = table.delete(0, 10);
         assert_eq!(removed.iter().map(|p| p.length).sum::<u64>(), 10);
         assert_eq!(table.len(), 93);
+        assert!(table.check_invariants());
+    }
+
+    /// Tiny deterministic PRNG (xorshift64) for the randomised tests —
+    /// no dependency, same script every run.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            if n == 0 {
+                0
+            } else {
+                self.next() % n
+            }
+        }
+    }
+
+    #[test]
+    fn random_edit_scripts_match_a_naive_model() {
+        // Roadmap item 2 equivalence: the Fenwick-accelerated table
+        // must produce byte-identical content and identical piece
+        // lookups to the plain semantics, across random edit scripts.
+        let mut rng = XorShift(0x1234_5678_9ABC_DEF1);
+        let mut table = doc(b"seed document\nwith two lines\n");
+        let mut model: Vec<u8> = table.read(0, table.len());
+        for step in 0..600 {
+            if model.is_empty() || rng.below(2) == 0 {
+                let at = rng.below(model.len() as u64 + 1);
+                let bytes: Vec<u8> = (0..rng.below(9))
+                    .map(|_| b"abcXYZ 09\n"[rng.below(10) as usize])
+                    .collect();
+                table.insert(at, &bytes);
+                model.splice(at as usize..at as usize, bytes.iter().copied());
+            } else {
+                let at = rng.below(model.len() as u64);
+                let len = rng.below(12);
+                table.delete(at, len);
+                let end = (at + len).min(model.len() as u64) as usize;
+                model.drain(at as usize..end);
+            }
+            assert_eq!(table.read(0, table.len()), model, "content at step {step}");
+            assert!(table.check_invariants(), "invariants at step {step}");
+            // Lookups agree with the content: every offset's piece
+            // contains it, and piece starts are the prefix sums.
+            for _probe in 0..8 {
+                let off = rng.below(model.len() as u64 + 1);
+                if off < model.len() as u64 {
+                    let (idx, start) = table.piece_at_offset(off).unwrap();
+                    assert!(start <= off && off < start + table.pieces[idx].length);
+                    assert_eq!(table.offset_of_piece(idx), start);
+                    assert_eq!(table.byte_at(off), Some(model[off as usize]));
+                } else {
+                    assert_eq!(table.piece_at_offset(off), None);
+                }
+            }
+            assert_eq!(
+                table.offset_of_piece(table.piece_count()),
+                table.len(),
+                "piece starts sum to the document length at step {step}"
+            );
+        }
+    }
+
+    #[test]
+    fn hundred_thousand_pieces_answer_lookups_at_boundaries() {
+        // Build the fragmented table directly (100k one-byte inserts
+        // would pay the per-insert debug invariant check 100k times):
+        // piece k holds append-buffer byte n-1-k, so the document is
+        // the reverse of the buffer — and no two neighbours are
+        // contiguous in the store, so nothing can coalesce.
+        let n = 100_000u64;
+        let mut table = PieceTable::new(0);
+        table.append_buffer = (0..n).map(|i| (i % 251) as u8).collect();
+        table.pieces = (0..n)
+            .map(|k| PieceNode::new(BufferSource::Add, n - 1 - k, 1))
+            .collect();
+        table.total_length = n;
+        table.rebuild_weights();
+        assert_eq!(table.piece_count(), n as usize);
+        assert!(table.check_invariants());
+        // Byte at document offset k is append-buffer byte n-1-k.
+        for k in [0u64, 1, 2, 999, 50_000, 99_998, 99_999] {
+            let expect = ((n - 1 - k) % 251) as u8;
+            assert_eq!(table.byte_at(k), Some(expect), "byte at {k}");
+            let (idx, start) = table.piece_at_offset(k).unwrap();
+            assert_eq!((idx, start), (k as usize, k), "one-byte pieces at {k}");
+        }
+        assert_eq!(table.read(n - 3, 3), vec![2, 1, 0]);
+        assert_eq!(table.piece_at_offset(n), None);
+        // A real edit at this scale still lands correctly (and the
+        // automatic coalesce pass merges nothing here: neighbours are
+        // not contiguous in the append buffer).
+        table.insert(50_000, b"!");
+        assert_eq!(table.byte_at(50_000), Some(b'!'));
+        assert_eq!(table.read(49_999, 3)[0], ((n - 1 - 49_999) % 251) as u8);
+        assert!(table.check_invariants());
+    }
+
+    #[test]
+    fn coalesce_merges_contiguous_neighbours_without_changing_content() {
+        // "abcdef" with "ZZ" inserted in the middle: three pieces.
+        let mut table = doc(b"abcdef");
+        table.insert(2, b"ZZ");
+        assert_eq!(table.piece_count(), 3);
+        // Deleting the inserted piece leaves two Original pieces that
+        // are contiguous in the original store (0..2 and 2..6).
+        table.delete(2, 2);
+        assert_eq!(table.piece_count(), 2);
+        assert_eq!(table.read(0, 99), b"abcdef");
+        assert_eq!(table.coalesce(), 1);
+        assert_eq!(table.piece_count(), 1);
+        assert_eq!(
+            table.pieces[0],
+            PieceNode::new(BufferSource::Original, 0, 6)
+        );
+        assert_eq!(table.read(0, 99), b"abcdef");
+        // A second pass is a no-op.
+        assert_eq!(table.coalesce(), 0);
         assert!(table.check_invariants());
     }
 
