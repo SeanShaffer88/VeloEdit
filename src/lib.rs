@@ -18,7 +18,12 @@
 //! read-only memory-mapped file backing lives in [`mmap_win`]. The
 //! roadmap R3 cores add hand-written streaming hashes ([`hash`]), the
 //! data inspector's byte readings ([`inspector`]), per-file bookmarks
-//! ([`bookmarks`]) and delta-log crash recovery ([`recovery`]).
+//! ([`bookmarks`]) and delta-log crash recovery ([`recovery`]). The
+//! roadmap R4 cores add the structural filter view ([`filter`]),
+//! multi-range slicing ([`slicing`]), delta patch export ([`patch`]),
+//! the strings scan ([`strings`]), the entropy map ([`entropy`]),
+//! pointer targets and the jump history ([`pointers`]), log time
+//! deltas ([`timedeltas`]) and the delimiter grid ([`delimited`]).
 //!
 //! Unsafe policy (PROJECT_RULES.md): the crate root is
 //! `#![deny(unsafe_code)]`, and the only modules allowed to opt back in
@@ -32,9 +37,12 @@
 
 pub mod bookmarks;
 pub mod cli;
+pub mod delimited;
 pub mod diff;
 pub mod editor;
 pub mod encoding;
+pub mod entropy;
+pub mod filter;
 #[cfg(windows)]
 pub mod gui_win;
 pub mod hash;
@@ -43,12 +51,17 @@ pub mod inspector;
 pub mod line_index;
 #[cfg(windows)]
 pub mod mmap_win;
+pub mod patch;
 pub mod piece_table;
+pub mod pointers;
 pub mod recovery;
 pub mod save;
 pub mod search;
 pub mod settings;
+pub mod slicing;
+pub mod strings;
 pub mod theme;
+pub mod timedeltas;
 pub mod undo;
 
 use piece_table::{PieceNode, PieceTable};
@@ -216,9 +229,10 @@ pub fn op_inspect(bytes: &[u8]) -> inspector::InspectorReport {
     inspector::inspect(bytes)
 }
 
-/// Operation: hash a byte source with MD5, SHA-1, and SHA-256,
-/// streamed through fixed-size windows (roadmap item 37). `read_at`
-/// follows the contract of [`hash::hash_byte_source`].
+/// Operation: hash a byte source with MD5, SHA-1, SHA-256, CRC32,
+/// and xxHash64, streamed through fixed-size windows (roadmap
+/// item 37). `read_at` follows the contract of
+/// [`hash::hash_byte_source`].
 pub fn op_hash_byte_source(
     total: u64,
     read_at: impl FnMut(u64, &mut [u8]) -> usize,
@@ -257,4 +271,47 @@ pub fn op_save_copy(
     target: &std::path::Path,
 ) -> Result<save::SaveReport, save::SaveError> {
     save::save_atomic(table, target, &save::SaveOptions::default())
+}
+
+/// Operation: insert a zero run into the document, recorded for
+/// undo (R4 core). The zeros are a piece-table region, never
+/// materialised bytes; every read path (editor, find, save,
+/// extract) yields `0x00` for them. See
+/// [`piece_table::PieceTable::insert_zeroes`].
+pub fn op_insert_zeroes(table: &mut PieceTable, history: &mut UndoStack, offset: u64, count: u64) {
+    history.do_insert_zeroes(table, offset, count);
+}
+
+/// Operation: build the structural filter view (roadmap item 18,
+/// R4 core): the lines containing a match, with two-way mapping
+/// between filtered rows and full-file positions. See
+/// [`filter::build_filter`] for the partial-index contract.
+pub fn op_build_filter(
+    table: &PieceTable,
+    index: &line_index::LineIndex,
+    query: filter::FilterQuery,
+) -> filter::FilterView {
+    filter::build_filter(table, index, query)
+}
+
+/// Operation: stream the byte/line ranges named by a slicing spec
+/// out of the document, in order (R4 core, extending item 44). See
+/// [`slicing`] for the spec grammar and its rules.
+pub fn op_extract_ranges(
+    table: &PieceTable,
+    index: Option<&line_index::LineIndex>,
+    spec: &str,
+    out: &mut impl std::io::Write,
+) -> Result<slicing::ExtractReport, slicing::SliceError> {
+    slicing::extract_ranges(table, index, spec, out)
+}
+
+/// Operation: build a `VELOPAT1` delta patch from the original
+/// byte source to the edited document (R4 core). See [`patch`].
+pub fn op_build_patch(
+    original_len: u64,
+    read_original: impl FnMut(u64, &mut [u8]) -> usize,
+    table: &PieceTable,
+) -> Result<patch::Patch, patch::PatchError> {
+    patch::build_patch(original_len, read_original, table)
 }
