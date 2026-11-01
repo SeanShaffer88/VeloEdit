@@ -112,6 +112,17 @@ impl UndoStack {
         self.redo.len()
     }
 
+    /// Forget all recorded history in both directions.
+    ///
+    /// The atomic save calls this: saving is a history boundary (the
+    /// append-buffer reset in SPEC.md section 5.1 step 6 invalidates the
+    /// piece segments history entries point at), so nothing recorded
+    /// before a save may be undone after it. See `crate::save`.
+    pub fn clear(&mut self) {
+        self.undo.clear();
+        self.redo.clear();
+    }
+
     /// The most recent undoable action, if any (newest first inspection).
     pub fn peek_undo(&self) -> Option<&EditAction> {
         self.undo.back().map(|entry| &entry.action)

@@ -24,8 +24,8 @@ USAGE:
     VeloEdit.exe [OPTIONS] [FILE]
     VeloEdit.exe --diff <A> <B> [--output <REPORT>] [--headless]
 
-OPEN A FILE (GUI arrives in a later build; this foundation build is headless):
-    FILE                  File to open
+OPEN A FILE IN THE GRAPHICAL EDITOR (Windows):
+    FILE                  File to open (memory-mapped; huge files open fast)
     --line <N>            Open at line N
     --mode <hex|text>     Open in hex or text mode (default: text)
     --read-only           Open without allowing edits
@@ -44,6 +44,14 @@ HEADLESS OPERATIONS:
                           utf8 | utf16le | utf16be | ansi
                           (default: detect from the file's first 64 KB,
                           including any byte-order mark)
+    --save-copy <DEST>    Save a copy of FILE to DEST using the atomic
+                          save pipeline (write to a staging file next to
+                          DEST, flush, then swap it into place), and
+                          print a report; with --json the report is
+                          {\"bytes_written\":N,\"staging_removed\":true}.
+                          DEST must differ from FILE; FILE itself is
+                          never modified. With --output <PATH> the JSON
+                          report is also written to PATH.
 
 CLEANUP:
     --clean               Remove the portable data folder next to the program
@@ -62,7 +70,7 @@ GLOBAL FLAGS:
 EXIT CODES:
     0   Success (for --diff: the files are identical)
     1   An error occurred (bad arguments, unreadable file, failed write)
-    2   The GUI was requested but is not part of this foundation build
+    2   The GUI was requested but this platform build has no window code
     3   For --diff: the files differ
 
 VeloEdit works fully offline and writes only to the data folder next to the
@@ -90,6 +98,7 @@ pub struct CliOptions {
     pub output: Option<PathBuf>,
     pub find: Option<String>,
     pub encoding: Option<TextEncoding>,
+    pub save_copy: Option<PathBuf>,
     pub headless: bool,
     pub json: bool,
     pub silent: bool,
@@ -173,6 +182,10 @@ pub fn parse_args(args: &[String]) -> Result<CliOptions, CliError> {
             "--find" => {
                 let value = take_value(args, &mut i, inline_value, "--find")?;
                 opts.find = Some(value);
+            }
+            "--save-copy" => {
+                let value = take_value(args, &mut i, inline_value, "--save-copy")?;
+                opts.save_copy = Some(PathBuf::from(value));
             }
             "--encoding" => {
                 let value = take_value(args, &mut i, inline_value, "--encoding")?;
@@ -324,20 +337,31 @@ pub fn run(args: &[String]) -> i32 {
         return run_find(&opts);
     }
 
-    // Anything else — a file to open, or no arguments at all — is a request
-    // to launch the GUI. This foundation build contains no window code yet:
-    // the GUI arrives in a later slice, after the interface design is
-    // confirmed. Say so plainly instead of failing silently.
-    if !opts.silent {
-        println!(
-            "VeloEdit: the graphical editor is not part of this foundation build ({}).",
-            env!("CARGO_PKG_VERSION")
-        );
-        println!(
-            "The editing core and headless tools are ready — run VeloEdit --help to see them."
-        );
+    if opts.save_copy.is_some() {
+        return run_save_copy(&opts);
     }
-    2
+
+    // Anything else — a file to open, or no arguments at all — is a request
+    // to launch the GUI. On Windows the Win32 + Direct2D shell
+    // (crate::gui_win) takes it from here and runs the message loop. Other
+    // platforms have no window code in this build and say so plainly
+    // instead of failing silently.
+    #[cfg(windows)]
+    return crate::gui_win::run_gui(&opts);
+
+    #[cfg(not(windows))]
+    {
+        if !opts.silent {
+            println!(
+                "VeloEdit: the graphical editor is only built for Windows ({}).",
+                env!("CARGO_PKG_VERSION")
+            );
+            println!(
+                "The editing core and headless tools are ready — run VeloEdit --help to see them."
+            );
+        }
+        2
+    }
 }
 
 /// Headless `--find`: report every offset of the needle in the file as
@@ -413,6 +437,89 @@ fn run_find(opts: &CliOptions) -> i32 {
     }
     if !opts.silent {
         println!("{json}");
+    }
+    0
+}
+
+/// Load a file as a piece table for the headless `--save-copy` tool:
+/// memory-mapped on Windows (the production open path, SPEC.md section
+/// 2.1 — no bytes are loaded), read into memory on the host.
+#[cfg(windows)]
+fn load_table_for_copy(path: &Path) -> Result<PieceTable, String> {
+    let mmap = crate::mmap_win::MmapFile::open(path)
+        .map_err(|e| format!("could not map {}: {e}", path.display()))?;
+    Ok(PieceTable::from_mapped(std::sync::Arc::new(mmap)))
+}
+
+/// Load a file as a piece table for the headless `--save-copy` tool
+/// (host form; Windows memory-maps instead — see above).
+#[cfg(not(windows))]
+fn load_table_for_copy(path: &Path) -> Result<PieceTable, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    Ok(PieceTable::from_original(bytes))
+}
+
+/// Headless `--save-copy`: save a copy of FILE to the destination with
+/// the atomic save pipeline (`crate::save::save_atomic`) and report the
+/// result; exit 0 on success, 1 on any error.
+///
+/// The destination must differ from the source: saving a file *over
+/// itself* is the editor's save operation (which closes our mapping of
+/// the target first — `PieceTable::save_to`), not a copy, so it is
+/// refused here with a plain message instead of risking a sharing
+/// failure on Windows.
+fn run_save_copy(opts: &CliOptions) -> i32 {
+    let dest = opts.save_copy.as_deref().unwrap_or_else(|| Path::new(""));
+    let Some(path) = &opts.file else {
+        eprintln!(
+            "VeloEdit: --save-copy needs a file to copy: VeloEdit.exe <FILE> --save-copy <DEST>"
+        );
+        return 1;
+    };
+    if dest == path.as_path() {
+        eprintln!(
+            "VeloEdit: --save-copy destination must differ from the source file ({})",
+            path.display()
+        );
+        return 1;
+    }
+    let table = match load_table_for_copy(path) {
+        Ok(table) => table,
+        Err(message) => {
+            eprintln!("VeloEdit: {message}");
+            return 1;
+        }
+    };
+    let report = match crate::save::save_atomic(&table, dest, &crate::save::SaveOptions::default())
+    {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln!("VeloEdit: could not save copy to {}: {e}", dest.display());
+            return 1;
+        }
+    };
+    let json = format!(
+        "{{\"bytes_written\":{},\"staging_removed\":{}}}",
+        report.bytes_written, report.staging_removed
+    );
+    if let Some(output) = &opts.output {
+        if let Err(e) = std::fs::write(output, json.clone() + "\n") {
+            eprintln!("VeloEdit: could not write {}: {e}", output.display());
+            return 1;
+        }
+    }
+    if !opts.silent {
+        if opts.json {
+            println!("{json}");
+        } else {
+            println!(
+                "Saved a copy of {} to {} ({} bytes).",
+                path.display(),
+                dest.display(),
+                report.bytes_written
+            );
+        }
     }
     0
 }
@@ -585,8 +692,11 @@ mod tests {
         assert_eq!(run(&["--version".to_string()]), 0);
     }
 
+    // On Windows a bare file request opens the GUI (covered by the
+    // Windows build, not by host tests); everywhere else it exits 2.
+    #[cfg(not(windows))]
     #[test]
-    fn gui_request_exits_two_in_foundation_build() {
+    fn gui_request_exits_two_without_a_gui_build() {
         assert_eq!(run(&["somefile.bin".to_string()]), 2);
         assert_eq!(run(&[]), 2);
     }
@@ -676,6 +786,61 @@ mod tests {
             dir.join("nope.txt").to_string_lossy().into_owned(),
             "--find".into(),
             "TODO".into(),
+        ];
+        assert_eq!(run(&args), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn parse_save_copy() {
+        let opts = parse(&["in.bin", "--save-copy", "out.bin", "--headless"]).unwrap();
+        assert_eq!(opts.save_copy, Some(PathBuf::from("out.bin")));
+        let opts = parse(&["--save-copy=out.bin", "in.bin"]).unwrap();
+        assert_eq!(opts.save_copy, Some(PathBuf::from("out.bin")));
+        assert!(parse(&["--save-copy"]).is_err());
+    }
+
+    #[test]
+    fn save_copy_run_writes_copy_and_report() {
+        let dir = std::env::temp_dir().join(format!("veloedit-copy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let dest = dir.join("dest.bin");
+        let out = dir.join("report.json");
+        std::fs::write(&src, b"copy me exactly").unwrap();
+        let args: Vec<String> = vec![
+            src.to_string_lossy().into_owned(),
+            "--save-copy".into(),
+            dest.to_string_lossy().into_owned(),
+            "--json".into(),
+            "--output".into(),
+            out.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run(&args), 0);
+        // The copy holds the bytes; the source is untouched.
+        assert_eq!(std::fs::read(&dest).unwrap(), b"copy me exactly");
+        assert_eq!(std::fs::read(&src).unwrap(), b"copy me exactly");
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert!(written.contains("\"bytes_written\":15"));
+        assert!(written.contains("\"staging_removed\":true"));
+        // No staging file is left behind.
+        assert!(!crate::save::staging_path_for(&dest).exists());
+
+        // Destination equal to the source is refused, exit 1.
+        let args: Vec<String> = vec![
+            src.to_string_lossy().into_owned(),
+            "--save-copy".into(),
+            src.to_string_lossy().into_owned(),
+        ];
+        assert_eq!(run(&args), 1);
+        // --save-copy without a file is an error, exit 1.
+        let args: Vec<String> = vec!["--save-copy".into(), dest.to_string_lossy().into_owned()];
+        assert_eq!(run(&args), 1);
+        // A missing source file is an error, exit 1.
+        let args: Vec<String> = vec![
+            dir.join("nope.bin").to_string_lossy().into_owned(),
+            "--save-copy".into(),
+            dest.to_string_lossy().into_owned(),
         ];
         assert_eq!(run(&args), 1);
         std::fs::remove_dir_all(&dir).unwrap();

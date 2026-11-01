@@ -5,29 +5,43 @@
 //! capability exists only inside a window or only inside the CLI
 //! (see `docs/PARITY.md` for the operation registry).
 //!
-//! The core contains the platform-independent operations only: the piece
+//! The core contains the platform-independent operations: the piece
 //! table (SPEC.md section 2), the sparse line index and hex arithmetic
-//! (section 3), undo/redo (section 5.2), the headless binary diff
-//! (section 7), command-line parsing, and — owner-confirmed v1 features
-//! the blueprint omits — text encodings ([`encoding`]) and streaming
-//! search/replace over the piece table ([`search`]). The Win32 /
-//! Direct2D shell and the Windows memory-mapping and atomic-save
-//! operations arrive in later slices; the seams for them are documented
-//! in each module.
+//! (section 3), undo/redo (section 5.2), the atomic save pipeline
+//! (section 5.1, [`save`]), the headless binary diff (section 7),
+//! command-line parsing, and — owner-confirmed v1 features the
+//! blueprint omits — text encodings ([`encoding`]) and streaming
+//! search/replace over the piece table ([`search`]). Slice 4 adds the
+//! GUI-independent editor state machine ([`editor`]), the built-in
+//! theme library ([`theme`]), portable settings ([`settings`]) and the
+//! Win32 / Direct2D shell ([`gui_win`], Windows only). On Windows, the
+//! read-only memory-mapped file backing lives in [`mmap_win`].
 //!
-//! No `unsafe` code exists in this slice: the only `unsafe` the design
-//! needs is the Windows FFI in later slices, which will be scoped to the
-//! smallest possible modules there.
+//! Unsafe policy (PROJECT_RULES.md): the crate root is
+//! `#![deny(unsafe_code)]`, and the only modules allowed to opt back in
+//! with `#[allow(unsafe_code)]` are the Windows FFI modules that cannot
+//! avoid it — [`mmap_win`], [`gui_win`] and the Windows half of [`save`]
+//! (the `ReplaceFileW` / `FlushFileBuffers` calls). Every `unsafe` block
+//! there carries a `// SAFETY:` comment. No other module may contain
+//! `unsafe`.
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod cli;
 pub mod diff;
+pub mod editor;
 pub mod encoding;
+#[cfg(windows)]
+pub mod gui_win;
 pub mod hexview;
 pub mod line_index;
+#[cfg(windows)]
+pub mod mmap_win;
 pub mod piece_table;
+pub mod save;
 pub mod search;
+pub mod settings;
+pub mod theme;
 pub mod undo;
 
 use piece_table::{PieceNode, PieceTable};
@@ -135,4 +149,26 @@ pub fn op_replace_all(
     options: &search::SearchOptions,
 ) -> search::ReplaceReport {
     search::replace_all(table, history, needle, replacement, options)
+}
+
+/// Operation: save the document over its file atomically (SPEC.md
+/// section 5.1) and adopt the saved file as the new original backing.
+/// Saving is a history boundary: `history` is cleared on success.
+pub fn op_save(
+    table: &mut PieceTable,
+    history: &mut UndoStack,
+    target: &std::path::Path,
+) -> Result<save::SaveReport, save::SaveError> {
+    table.save_to(target, history)
+}
+
+/// Operation: save a copy of the document to a different path atomically
+/// (SPEC.md section 5.1 steps 1–5; the table itself is not reset). See
+/// [`save::save_atomic`] for the mapping caveat that applies when the
+/// copy target is the mapped file itself — use [`op_save`] for that.
+pub fn op_save_copy(
+    table: &PieceTable,
+    target: &std::path::Path,
+) -> Result<save::SaveReport, save::SaveError> {
+    save::save_atomic(table, target, &save::SaveOptions::default())
 }

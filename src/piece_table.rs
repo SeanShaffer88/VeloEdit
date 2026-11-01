@@ -1,8 +1,9 @@
 //! Memory-mapped piece table engine (SPEC.md section 2).
 //!
 //! The document is never held as one contiguous edited buffer. The original
-//! file bytes stay in a read-only backing store (on Windows that will be an
-//! mmap view created with `CreateFileMappingW` / `MapViewOfFile`), and every
+//! file bytes stay in a read-only backing store (on Windows, an mmap view
+//! created with `CreateFileMappingW` / `MapViewOfFile` — see
+//! `crate::mmap_win`), and every
 //! edit appends new bytes to an append-only heap buffer. The visible document
 //! is the ordered list of [`PieceNode`]s pointing into those two stores, so
 //! inserts and deletes only move small node records, never file data.
@@ -52,24 +53,33 @@ impl PieceNode {
 
 /// Backing store for the original file bytes.
 ///
-/// This enum is the seam where the Windows memory-mapped view slots in: the
-/// next Windows slice adds a variant holding the mapped view, and every read
-/// in [`PieceTable`] already goes through it, so no piece-table API changes.
+/// This enum is the seam where the Windows memory-mapped view slots in:
+/// every read in [`PieceTable`] goes through it, so no piece-table API
+/// changes were needed when the mmap variant landed (Slice 3).
 ///
-/// Two variants exist in this foundation slice:
+/// Three variants exist:
 ///
 /// * `Memory` — the original bytes are held in a `Vec<u8>`. Used by
 ///   [`PieceTable::from_original`], by tests, and by the headless tools.
-/// * `LengthOnly` — only the original length is known and no byte storage is
-///   attached yet (the state a table is in right after a file is mapped but
-///   before any view exists). Structural operations (insert, delete, undo)
-///   behave normally; reading an `Original` piece yields zero bytes of the
-///   correct length. Byte-accurate reading is only promised for `Memory`
-///   (and, later, for the mmap variant).
+/// * `LengthOnly` — only the original length is known and no byte storage
+///   is attached (also the transient state inside a save while our own
+///   mapping of the target is closed, SPEC.md section 5.1 step 4).
+///   Structural operations (insert, delete, undo) behave normally;
+///   reading an `Original` piece yields zero bytes of the correct
+///   length. Byte-accurate reading is only promised for `Memory` and
+///   `Mapped`.
+/// * `Mapped` (Windows only) — the original bytes are a read-only
+///   memory-mapped view of the file ([`crate::mmap_win::MmapFile`]),
+///   the production backing of SPEC.md section 2.1: the OS pages bytes
+///   in lazily and nothing is loaded into RAM up front.
 #[derive(Debug)]
 pub enum OriginalBuffer {
     Memory(Vec<u8>),
-    LengthOnly { len: u64 },
+    LengthOnly {
+        len: u64,
+    },
+    #[cfg(windows)]
+    Mapped(std::sync::Arc<crate::mmap_win::MmapFile>),
 }
 
 impl OriginalBuffer {
@@ -78,11 +88,24 @@ impl OriginalBuffer {
         match self {
             OriginalBuffer::Memory(bytes) => bytes.len() as u64,
             OriginalBuffer::LengthOnly { len } => *len,
+            #[cfg(windows)]
+            OriginalBuffer::Mapped(mmap) => mmap.len(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Path of the mapped file when this backing is a Windows mmap;
+    /// `None` for the memory and length-only backings. The save pipeline
+    /// uses it to re-open a mapping it had to close for the atomic swap.
+    pub fn mapped_path(&self) -> Option<&std::path::Path> {
+        match self {
+            #[cfg(windows)]
+            OriginalBuffer::Mapped(mmap) => mmap.path(),
+            _ => None,
+        }
     }
 }
 
@@ -124,10 +147,19 @@ impl PieceTable {
     }
 
     /// Create a table whose original bytes are held in memory. Used by tests
-    /// and headless tools; the production Windows path will pass an mmap
-    /// backing store through the same seam instead.
+    /// and headless tools; the production Windows path passes an mmap
+    /// backing store through the same seam instead (see
+    /// [`PieceTable::from_original_buffer`]).
     pub fn from_original(bytes: Vec<u8>) -> Self {
-        let len = bytes.len() as u64;
+        Self::from_original_buffer(OriginalBuffer::Memory(bytes))
+    }
+
+    /// Create a table over any original-bytes backing store — the single
+    /// constructor every backing (memory, length-only, Windows mmap)
+    /// flows through. A non-empty source starts as a single `Original`
+    /// piece covering the whole store.
+    pub fn from_original_buffer(original: OriginalBuffer) -> Self {
+        let len = original.len();
         let pieces = if len == 0 {
             Vec::new()
         } else {
@@ -138,8 +170,60 @@ impl PieceTable {
             append_buffer: Vec::new(),
             pieces,
             total_length: len,
-            original: OriginalBuffer::Memory(bytes),
+            original,
         }
+    }
+
+    /// Create a table whose original bytes are the given Windows
+    /// memory-mapped file (SPEC.md section 2.1). No bytes are read at
+    /// open time; the OS pages them in on first touch.
+    #[cfg(windows)]
+    pub fn from_mapped(mmap: std::sync::Arc<crate::mmap_win::MmapFile>) -> Self {
+        Self::from_original_buffer(OriginalBuffer::Mapped(mmap))
+    }
+
+    /// Replace the original backing with a `LengthOnly` placeholder of
+    /// the same length and return the old backing (dropping it when the
+    /// caller drops the return value). The save pipeline uses this to
+    /// close *our own* mapping of the target file before the atomic swap
+    /// (SPEC.md section 5.1 step 4). Piece layout and totals are
+    /// unchanged; until a new backing is installed, `Original` reads
+    /// yield zero bytes (the `LengthOnly` contract above).
+    pub(crate) fn detach_original(&mut self) -> OriginalBuffer {
+        let len = self.original_file_size;
+        std::mem::replace(&mut self.original, OriginalBuffer::LengthOnly { len })
+    }
+
+    /// Swap only the original backing store, leaving the piece layout,
+    /// append buffer and totals exactly as they are. The save pipeline
+    /// uses this to restore the pre-save backing after a *failed* swap
+    /// (the document did not change, so the backing must not either).
+    /// The new backing's length must equal `original_file_size`.
+    pub(crate) fn replace_original(&mut self, backing: OriginalBuffer) {
+        debug_assert_eq!(backing.len(), self.original_file_size);
+        self.original = backing;
+        debug_assert!(self.check_invariants());
+    }
+
+    /// Reset the whole table to a freshly-opened state over `new_original`:
+    /// the append buffer is cleared and the document becomes a single
+    /// `Original` piece (or no pieces, for an empty source). The atomic
+    /// save pipeline calls this after a successful swap with the saved
+    /// file's backing (SPEC.md section 5.1 step 6) — the "save is a
+    /// history boundary" reset; the matching history clear lives in
+    /// `crate::save::PieceTable::save_to`.
+    pub(crate) fn reset_to_original(&mut self, new_original: OriginalBuffer) {
+        let len = new_original.len();
+        self.original = new_original;
+        self.original_file_size = len;
+        self.append_buffer.clear();
+        self.pieces = if len == 0 {
+            Vec::new()
+        } else {
+            vec![PieceNode::new(BufferSource::Original, 0, len)]
+        };
+        self.total_length = len;
+        debug_assert!(self.check_invariants());
     }
 
     /// Total visible length in bytes.
@@ -247,6 +331,8 @@ impl PieceTable {
                 OriginalBuffer::Memory(bytes) => Cow::Borrowed(&bytes[start..start + len]),
                 // No storage attached: yield correctly-sized zero bytes.
                 OriginalBuffer::LengthOnly { .. } => Cow::Owned(vec![0u8; len]),
+                #[cfg(windows)]
+                OriginalBuffer::Mapped(mmap) => Cow::Borrowed(&mmap.as_slice()[start..start + len]),
             },
         }
     }
@@ -262,6 +348,10 @@ impl PieceTable {
             BufferSource::Original => match &self.original {
                 OriginalBuffer::Memory(bytes) => dst.copy_from_slice(&bytes[start..start + len]),
                 OriginalBuffer::LengthOnly { .. } => dst.fill(0),
+                #[cfg(windows)]
+                OriginalBuffer::Mapped(mmap) => {
+                    dst.copy_from_slice(&mmap.as_slice()[start..start + len])
+                }
             },
         }
     }
