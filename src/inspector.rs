@@ -245,10 +245,13 @@ pub fn format_unix_millis(millis: u64) -> String {
         return whole;
     }
     // Replace the trailing " UTC" with the fraction plus " UTC".
-    format!(
-        "{}.{fraction:03} UTC",
-        whole.strip_suffix(" UTC").expect("suffix")
-    )
+    // `whole` came from `format_unix_seconds` and is not NO_READING
+    // (checked above), so its format string guarantees the suffix;
+    // the fallback is unreachable and returns the string unmodified
+    // rather than panicking (architectural audit: dead error path
+    // removed).
+    let base = whole.strip_suffix(" UTC").unwrap_or(&whole);
+    format!("{base}.{fraction:03} UTC")
 }
 
 /// Days since 1970-01-01 → (year, month, day), by Howard
