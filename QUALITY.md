@@ -26,9 +26,9 @@ is the owner's call — and every Windows-runtime verification.
 
 | Dimension | Score | Evidence |
 | --- | --- | --- |
-| Architecture & foundation | 4 | Frozen module layout in `PROJECT_RULES.md`; original-bytes seam (`OriginalBuffer`) now carries the Windows mmap backing with no API change; B-tree target documented where the Vec stands in |
+| Architecture & foundation | 4 | Frozen module layout in `PROJECT_RULES.md`; original-bytes seam (`OriginalBuffer`) now carries the Windows mmap backing with no API change; the piece Vec carries a Fenwick weight index for O(log N) lookups (R2a) in place of the sketched B-tree, with the trade-off recorded in Known gaps |
 | Correctness (core operations) | 4 | Insert/delete/coalescence, multi-piece reads, undo/redo layout restoration, line checkpoints, hex/scroll math, diff counting, encoding detection/decode/encode, boundary-spanning search, single-undo replace-all, and the atomic save round trips (including both staged failure paths) are all covered by unit tests that exercise the real code paths |
-| Tests | 4 | 165 unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1: editor state machine, the 20 themes incl. WCAG contrast, settings incl. corruption handling, undo byte-budget trimming, the extract command and the standard exit codes), host gate fully green (see below). Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
+| Tests | 4 | 190 unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1 + 16 roadmap R2a + 9 roadmap R2b: Fenwick piece-index equivalence against a naive model over random edit scripts, 100k-piece lookups, coalescing, SWAR-vs-scalar and parallel-vs-serial line-index equivalence, SWAR search equivalence, scoped find/replace, masked search, line sort/dedup, scoped find navigation, masked find flow, the file splitter, CLI size parsing and split runs), host gate fully green (see below). Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
 | Reliability & data safety | 4 | Undo never touches the append buffer; deletes return their removed pieces; `--clean` is guarded to the adjacent `data/` folder and tested. The atomic save safety path (SPEC §5.1) is implemented and covered by host tests for the success, replace, empty, staging-failure and swap-failure cases, with the table provably unchanged after a failed save; its Windows runtime behaviour (real `ReplaceFileW` under a live mapping) is still Unverified — see Known gaps |
 | Performance (SPEC §8 budgets) | Unverified | Host proxies are now measured and recorded in `docs/BENCHMARKS.md` (200 MB diff median 330 ms, find 1073 ms, save-copy 466 ms, `--version` start proxy median 1.07 ms, all Linux host build) — evidence about the core only. Every §8 metric itself (cold start <50 ms, 100 GB open <100 ms, <15 MB idle / <35 MB active, <16 ms frame) is a Windows measurement and remains a target, not a result |
 | Security & privacy | 4 | 100% offline, zero telemetry by construction (no network code at all); crate root is `#![deny(unsafe_code)]` with `unsafe` confined to `src/mmap_win.rs`, `src/gui_win.rs` and the Windows half of `src/save.rs`, every block carrying a `// SAFETY:` comment (PROJECT_RULES.md confinement rule); the only dependency crate is `windows-sys`, gated to `cfg(windows)` |
@@ -366,6 +366,209 @@ scored from real Windows evidence before any release.
     is Unverified until the owner's Windows machine runs it, as with
     every GUI slice before its field run.
 
+- 2026-11-01, roadmap slice R2a (engine core: items 2, 3, 8, 11,
+  12, 23 — core halves only; GUI/CLI wiring lands in a later
+  slice), built locally on the development host; NOT published:
+  - (#2) Fenwick piece index: `PieceTable` keeps a Fenwick (binary
+    indexed) tree over piece lengths in sync on every mutation —
+    offset→piece and piece→offset are O(log N)
+    (`piece_at_offset` / `offset_of_piece`), and `read_into`,
+    `insert` and `delete` locate through it. This is the O(log N)
+    structure SPEC §2.2 asks for in place of the sketched
+    weight-balanced B-tree: same lookup bound, far less machinery,
+    and the piece list itself (which the undo engine splices by
+    index) is untouched. Coalescing: `coalesce()` merges neighbours
+    over contiguous bytes of one store; it runs automatically past
+    8,192 pieces, throttled to one pass per 1,024 further pieces so
+    insert runs stay amortised. One hazard was designed for, not
+    discovered by failure: an automatic coalesce inside an
+    undo-recorded edit would invalidate the entry's segment indices,
+    so `UndoStack` snapshots the layout whenever an edit *could*
+    cross the threshold and falls back to a whole-layout entry when
+    the pass actually fires (generation-counter check). Equivalence
+    evidence: a randomised edit-script test compares content and
+    lookups against a naive model for 600 mixed edits, a 100k-piece
+    table answers boundary lookups exactly, and coalescing reduces
+    a fragmented table to the expected count with identical bytes.
+    No existing test needed editing: the only count-sensitive
+    assertions cover tables far below the auto-coalesce threshold.
+  - (#3) Word-parallel + parallel line indexing: newline counting
+    is SWAR (eight bytes per step; an exact per-byte zero test that
+    cannot over-count through borrow chains — the adversarial
+    patterns are in the tests), and `LineIndex::build` reads blocks
+    in bounded rounds (≤ 8 × 64 KB live) and counts them on up to
+    `available_parallelism` threads (cap 8, `std::thread::scope`),
+    assembled in order. A serial reference implementation in the
+    tests proves the checkpoint lists identical on randomised
+    buffers including block-straddling newlines, `\r\n` data, empty
+    input and exact-interval inputs.
+  - (#8) Search candidate filtering is SWAR over the needle's first
+    byte (both cases when case-insensitive), with full verification
+    of candidates only; a naive-matcher equivalence test over
+    randomised dense-match data (both case modes, five needles,
+    fragmented tables) proves identical results.
+  - (#11) Scoped search core: `find_in_range` / `count_in_range`
+    (matches fully inside `[start, end)` only — straddlers
+    excluded, tested at both edges) and `replace_all_in_range` in
+    `search` plus `Editor::replace_all_in_range`, one undo entry,
+    outside text untouched (layout-exact undo tested).
+  - (#12) Masked search core: `MaskedPattern` parsed from
+    `"4A ?? FF 00 2B"`-style text with per-nibble masks (`4?`,
+    `?F`); invalid tokens are plain-words errors.
+    `find_masked_all` streams like plain search (SWAR anchor on the
+    first fully-fixed byte when one exists) and finds matches
+    spanning pieces; parse/match/nibble/boundary cases tested.
+  - (#23) Sort / dedup core: `Editor::sort_lines_in_range` /
+    `dedup_lines_in_range` expand the range to whole lines (line 0
+    starts after any BOM, so the mark is never sorted away), sort
+    byte-wise and stable with each line's terminator attached (CRLF
+    stays CRLF — tested), dedup by content keeping first
+    occurrences, apply as one undo entry via the existing replace
+    machinery, and refuse an expanded range over 64 MB
+    (`EditorError::RangeTooLarge`) before changing anything —
+    the refusal is tested on a real >64 MB document.
+  - Scope honesty: SWAR is word-parallel portable bit tricks, not
+    AVX2/AVX-512 intrinsics — deliberately: intrinsics would need
+    `unsafe` and runtime CPU dispatch in a crate that confines
+    `unsafe` to three Windows-facing files, for a gain the
+    equivalence-tested SWAR path already mostly captures. The
+    LengthOnly backing behaviour is unchanged (it has no bytes to
+    scan either way). No GUI or CLI surface changed in this slice.
+  - Gate, run locally on the development host (true exit codes):
+    - `cargo fmt --all` + `cargo fmt --all --check` — clean (exit 0)
+    - `cargo test` — **181 passed, 0 failed** (exit 0; 165 → 181,
+      +16 new tests across piece_table, line_index, search, editor)
+    - `cargo clippy --all-targets -- -D warnings` (host) — clean
+      (exit 0; two lints from the new code were found and fixed)
+    - `cargo clippy --target x86_64-pc-windows-gnu --all-targets --
+      -D warnings` — clean (exit 0)
+    - `cargo check --target x86_64-pc-windows-msvc` — passed
+      (exit 0)
+    - `cargo build --release --target x86_64-pc-windows-gnu` —
+      passed (exit 0); `VeloEdit.exe` 708,608 bytes, SHA-256
+      `27543b1b2c168cf03bea424bdcff90e275e1f2c5c723e2abdd5ce69b2d96e9e9`
+
+- 2026-11-01, roadmap slice R2b (integration: items 11, 12, 23
+  GUI surfaces; 36 splitter; 38 Explorer menu; 50 benchmark
+  harness), built locally on the development host; NOT published:
+  - (#11 GUI) The find bar gains an "In selection" toggle — an
+    owner-drawn button in the find bar's themed style, its state
+    shown by a ☐/☑ glyph in its label. Two editor operations back
+    it: `Editor::set_find_in_range` (scoped match list with the
+    same first-at-or-after-caret selection and UTF-16 alignment
+    filter as a plain find) and the R2a
+    `Editor::replace_all_in_range`. The shell captures the
+    selection as the scope (a selection that is merely the current
+    match does not shrink it), Find Next / Previous and the count
+    stay inside the scope, and Replace All replaces only there,
+    still one undo entry. Ticked with no selection and no captured
+    scope, the count label shows "Select text first" — the same
+    notice surface as "No matches". Editor-level tests cover
+    scoped navigation wrapping inside the range.
+  - (#12 GUI) Hex-mode masked find: when the find text parses as a
+    masked pattern AND contains a space or `?`, Find Next / Count
+    run `Editor::set_find_masked` (new); its match list drives the
+    ordinary caret/selection/highlight flow (the editor stores a
+    stand-in needle of the pattern's length, which is all that
+    maths uses). Anything else keeps the previous hex find
+    behaviour byte for byte. Replace and Replace All refuse a
+    masked pattern with a plain information box — a wildcard has
+    no single replacement. One flow note: after an edit clears the
+    match list, Find Next does not silently re-run a masked find
+    as text (the editor deliberately stores no needle text for
+    it); pressing Find again re-runs the pattern.
+  - (#23 GUI) Edit ▸ Sort Lines in Selection and Edit ▸ Remove
+    Duplicate Lines in Selection call the R2a editor ops on the
+    selection range, greyed unless a selection exists (and the
+    document is writable) in the existing WM_INITMENUPOPUP
+    pattern. A `RangeTooLarge` refusal surfaces through the same
+    message-box error path as a failed replace.
+  - (#36) Splitter: `save::split_file` streams the source in
+    4 MB chunks into `<name>.part001`, `.part002`, … (3-digit
+    minimum, width growing with the part count so names sort in
+    order), refusing a part size of 0 and a part count over
+    10,000 before writing anything; an empty source yields one
+    empty part. Tests prove the parts join back byte-identical,
+    the exact-multiple and refusal cases included. CLI:
+    `--split <FILE> --part-size <SIZE> [--out-dir <DIR>]`, SIZE
+    via the new tested `cli::parse_size` (plain/hex numbers plus
+    K/M/G suffixes, overflow refused), exit 0/2 per the R1
+    scheme; a host smoke run split 250 random bytes into 3 parts
+    that rejoin identical, with the error cases at exit 2. GUI:
+    File ▸ Split File Copy… opens a small modal dialog (built
+    like the Help window — this codebase has no separate Go To
+    dialog; the brief's "Go To Line dialog pattern" was read as
+    that hand-built small-window pattern) asking for the part
+    size in MB (default 4096); it then writes the document to a
+    copy in a `<name>-parts` folder via the atomic pipeline,
+    splits the copy, deletes it, and reports the part count in a
+    message box. (Design choice, recorded: the dialog's buttons
+    are owner-drawn and painted by the dialog's own proc with the
+    active theme, since owner-draw messages go to the parent
+    window, not the main window.)
+  - (#38) Explorer menu: `gui_win::shell_menu_install` /
+    `shell_menu_uninstall` / `shell_menu_is_installed` write only
+    `HKCU\Software\Classes\*\shell\VeloEdit` (MUIVerb "Open in
+    VeloEdit", Icon = the exe path, `command` subkey default
+    `"<exe>" "%1"`), via the registry APIs — the
+    `Win32_System_Registry` windows-sys feature was added for
+    this. CLI `--install-shell` / `--uninstall-shell` exit 0/2
+    (2 on non-Windows builds, with a plain message — smoke-tested
+    on the host). `--clean` now also removes the item on a real
+    run (never on `--dry-run`). File ▸ Explorer Menu Item is a
+    checkable item reflecting the live registry state. The pure
+    helpers (key path, command string incl. a spaced path) are
+    unit-tested in the Windows test module. The old "never writes
+    to the registry" wording in `--help`, the README, and the
+    portable data note was corrected to name this one opt-in
+    exception.
+  - (#50) Benchmark harness: `scripts/Run-Benchmarks.ps1`
+    creates a sparse fixture with `fsutil` at `-SizeGB` (default
+    1), plants TODO markers, and times cold launch to `--help`,
+    `--find`, `--save-copy`, and `extract` with stopwatches,
+    reporting each process's peak working set as a plain table;
+    its header warns that save-copy writes a real full-size copy.
+    `.github/workflows/benchmarks.yml` is `workflow_dispatch`
+    only: same gate + MSVC release build steps as the release
+    workflow, runs the script at 1 GB (input, default "1"),
+    uploads the table as an artifact. `docs/BENCHMARKS.md`
+    describes it and keeps 10/100 GB as local runs.
+  - Gate, run locally on the development host (true exit codes):
+    - `cargo fmt --all` + `cargo fmt --all --check` — clean (exit 0)
+    - `cargo test` — **190 passed, 0 failed** (exit 0; 181 → 190,
+      +9 new: editor scoped navigation + masked flow, save split
+      names/round-trip/edges/refusals, CLI size parsing, split and
+      shell flag parsing, split run; the two Windows-only
+      `gui_win` tests — shell-menu path/command — compile under
+      the Windows targets and run in the Windows CI test job)
+    - `cargo clippy --all-targets -- -D warnings` (host) — clean
+      (exit 0)
+    - `cargo clippy --target x86_64-pc-windows-gnu --all-targets --
+      -D warnings` — clean (exit 0; one fix during the slice:
+      `EnableWindow` lives under KeyboardAndMouse in
+      windows-sys 0.61, not WindowsAndMessaging)
+    - `cargo check --target x86_64-pc-windows-msvc` — passed
+      (exit 0)
+    - `cargo build --release --target x86_64-pc-windows-gnu` —
+      passed (exit 0); `VeloEdit.exe` 758,784 bytes, SHA-256
+      `d9ee8c0ee8c3a86e9e573bee02b3eaa0e28cc6fcac01729133b60f3281b8a5f1`
+    - The workflow YAML parses (python `yaml`); the PowerShell
+      script could NOT be parse-checked here — `pwsh` is not
+      installed on this VM — so its first real parse is the
+      manual workflow run or a local Windows run.
+  - Honest status: every GUI item in this slice (the scope
+    toggle's look and behaviour, masked navigation/highlighting
+    in the window, the sort/dedup menu items and their greying,
+    the split dialog and its modal loop, the Explorer menu item's
+    check state) and every registry operation is compile-verified
+    only — the registry code has never run, so install/uninstall
+    behaviour on a real machine is Unverified, as is
+    `RegDeleteTreeW`'s not-found code path (2) that the
+    uninstall treats as "nothing installed". The benchmark
+    script and workflow are likewise unrun anywhere. The core and
+    CLI halves (splitter, size parsing, scoped/masked editor
+    operations) are unit-tested on the host.
+
 ## Known gaps (honest list)
 
 - The installers have been *built* by the release workflow and their
@@ -374,10 +577,16 @@ scored from real Windows evidence before any release.
   still Unverified until the owner's machine proves them.
 
 
-- Piece storage is a `Vec`; SPEC §2.2's weight-balanced B-tree is a later
-  slice, so point lookups are O(N) in the number of pieces for now.
-- The line-index scan is a plain chunked scan; the SIMD inner loop
-  (SPEC §3.1) replaces `count_newlines_in` later without API change.
+- Piece storage is a `Vec` with a Fenwick weight index over it
+  (roadmap R2a): lookups are O(log N); structural edits rebuild the
+  index in O(N), the same order as the `Vec` splice they accompany.
+  SPEC §2.2's weight-balanced B-tree was not built — the Fenwick
+  tree provides the same lookup bound with the piece list (and the
+  undo engine's index-based segments) unchanged.
+- The line-index scan is word-parallel SWAR and the build counts
+  blocks on multiple threads (roadmap R2a); SPEC §3.1's AVX2/AVX-512
+  intrinsics were deliberately not used (they would need `unsafe`
+  and CPU dispatch outside the three sanctioned files).
 - Undo history bounds are owner settings since roadmap slice R1
   (`undo_limit` steps, default 1024; `undo_byte_budget_mb`, default
   256 MB of stored deltas). The defaults are the shipped choice —
