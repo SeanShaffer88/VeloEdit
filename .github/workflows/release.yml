@@ -1,0 +1,155 @@
+# VeloEdit — release workflow (SPEC §6.1 asset matrix)
+#
+# This workflow runs ONLY when the owner pushes a v* tag or dispatches it
+# manually. Ordinary pushes and pull requests never trigger it: code can
+# merge to main without releasing. Never push a release tag without the
+# project owner's explicit confirmation (PROJECT_RULES.md).
+#
+# It builds the three §6.1 assets from the tagged commit on a Windows
+# runner — VeloEdit-v<version>-x64-Setup.exe (NSIS),
+# VeloEdit-v<version>-x64-Setup.msi (WiX v4), and
+# VeloEdit-v<version>-x64-Portable.zip — plus SHA256SUMS.txt, and attaches
+# all four to the GitHub Release for the tag. The full test gate runs
+# BEFORE any packaging; a failing test fails the release.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build the release from"
+        required: true
+        default: "v1.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish release assets
+    runs-on: windows-latest
+    steps:
+      - name: Resolve the release tag
+        id: tag
+        shell: pwsh
+        run: |
+          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME } else { '${{ inputs.tag }}' }
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Tag must look like v1.0.0, got: $tag" }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$($tag.Substring(1))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+
+      # ---- Gate first: nothing is packaged unless the whole gate passes.
+      - name: Format check
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test gate (host target)
+        run: cargo test
+
+      # ---- Build the release binary (static CRT via .cargo/config.toml).
+      - name: Build release (x86_64-pc-windows-msvc, crt-static)
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Stage the assets folder
+        shell: pwsh
+        run: |
+          $version = '${{ steps.tag.outputs.version }}'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $exe = "target\x86_64-pc-windows-msvc\release\VeloEdit.exe"
+
+          # Portable layout: exe + LICENSE + an empty data/ entry whose
+          # README explains what the folder is for (portable mode).
+          New-Item -ItemType Directory -Force stage-portable\data | Out-Null
+          Copy-Item $exe stage-portable\VeloEdit.exe
+          Copy-Item LICENSE stage-portable\LICENSE
+          @(
+            "VeloEdit portable data folder"
+            ""
+            "Everything VeloEdit remembers lives in this folder, next to the"
+            "program: settings.json (theme, accent, font size, window"
+            "position, recent files) and, while you edit a document up to"
+            "16 MB, the crash-recovery snapshot (recovery.bin /"
+            "recovery.json). Nothing is written to %APPDATA% or the"
+            "registry, so the whole program folder stays portable."
+            ""
+            "Deleting this folder resets VeloEdit to its first-run state."
+          ) | Set-Content stage-portable\data\README-data.txt
+          Compress-Archive -Path stage-portable\* -DestinationPath "dist\VeloEdit-v$version-x64-Portable.zip"
+
+      - name: Build the NSIS Setup exe
+        shell: pwsh
+        run: |
+          $version = '${{ steps.tag.outputs.version }}'
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y --no-progress
+          }
+          $makensis = (Get-Command makensis).Source
+          & $makensis "-DEXE_PATH=$PWD\target\x86_64-pc-windows-msvc\release\VeloEdit.exe" "-DOUT_DIR=$PWD\dist" installer\VeloEdit.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed with exit code $LASTEXITCODE" }
+          if (-not (Test-Path "dist\VeloEdit-v$version-x64-Setup.exe")) { throw "Setup exe was not produced" }
+
+      - name: Build the WiX MSI
+        shell: pwsh
+        run: |
+          $version = '${{ steps.tag.outputs.version }}'
+          dotnet tool install --global wix --version "4.*"
+          $env:PATH = "$env:PATH;$env:USERPROFILE\.dotnet\tools"
+          wix extension add WixToolset.UI.wixext
+          if ($LASTEXITCODE -ne 0) { throw "wix extension add failed with exit code $LASTEXITCODE" }
+          wix build installer\Package.wxs -ext WixToolset.UI.wixext -d "ExePath=$PWD\target\x86_64-pc-windows-msvc\release\VeloEdit.exe" -o "dist\VeloEdit-v$version-x64-Setup.msi"
+          if ($LASTEXITCODE -ne 0) { throw "wix build failed with exit code $LASTEXITCODE" }
+
+      - name: Generate SHA256SUMS.txt
+        shell: pwsh
+        working-directory: dist
+        run: |
+          $version = '${{ steps.tag.outputs.version }}'
+          $assets = @(
+            "VeloEdit-v$version-x64-Setup.exe",
+            "VeloEdit-v$version-x64-Setup.msi",
+            "VeloEdit-v$version-x64-Portable.zip"
+          )
+          $lines = foreach ($asset in $assets) {
+            if (-not (Test-Path $asset)) { throw "Missing asset: $asset" }
+            $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
+            "$hash  $asset"
+          }
+          $lines | Set-Content SHA256SUMS.txt
+          Get-ChildItem | Format-Table Name, Length
+
+      # ---- Release notes: the CHANGELOG's section for this version, when
+      # it can be extracted; otherwise a short fixed factual body.
+      - name: Extract release notes
+        id: notes
+        shell: pwsh
+        run: |
+          $version = '${{ steps.tag.outputs.version }}'
+          $changelog = Get-Content CHANGELOG.md -Raw
+          $pattern = "(?ms)^## \[$([regex]::Escape($version))\] — Unreleased\s*\r?\n(.*?)(?=^## \[|\z)"
+          $body = if ($changelog -match $pattern) {
+            $Matches[1].Trim()
+          } else {
+            "VeloEdit $version. See CHANGELOG.md for details."
+          }
+          $body | Set-Content release-notes.md
+
+      - name: Create the GitHub Release with the four assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = '${{ steps.tag.outputs.version }}'
+          gh release create '${{ steps.tag.outputs.tag }}' `
+            "dist\VeloEdit-v$version-x64-Setup.exe" `
+            "dist\VeloEdit-v$version-x64-Setup.msi" `
+            "dist\VeloEdit-v$version-x64-Portable.zip" `
+            "dist\SHA256SUMS.txt" `
+            --title "VeloEdit v$version" `
+            --notes-file release-notes.md
