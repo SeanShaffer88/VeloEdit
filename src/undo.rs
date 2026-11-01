@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 
-use crate::piece_table::{PieceNode, PieceTable};
+use crate::piece_table::{PieceNode, PieceTable, AUTO_COALESCE_THRESHOLD};
 
 /// Default maximum number of edits kept in history.
 ///
@@ -185,8 +185,22 @@ impl UndoStack {
             return;
         }
         let count_before = table.pieces.len();
+        let gen_before = table.coalesce_gen();
+        let full_before = layout_snapshot(table, 2);
         let (anchor, before) = insert_anchor(table, offset);
         table.insert(offset, bytes);
+        if table.coalesce_gen() != gen_before {
+            let full_before = full_before.expect("coalesce implies the snapshot was taken");
+            return self.record(HistoryEntry {
+                action: EditAction::Insert {
+                    offset,
+                    length: bytes.len() as u64,
+                },
+                anchor: 0,
+                before: full_before,
+                after: table.pieces.clone(),
+            });
+        }
         let after = segment_after(table, anchor, before.len(), count_before);
         self.record(HistoryEntry {
             action: EditAction::Insert {
@@ -206,9 +220,24 @@ impl UndoStack {
             return Vec::new();
         }
         let count_before = table.pieces.len();
+        let gen_before = table.coalesce_gen();
+        let full_before = layout_snapshot(table, 0);
         let (anchor, before) = delete_anchor(table, offset, len);
         let removed = table.delete(offset, len);
         if removed.is_empty() {
+            return removed;
+        }
+        if table.coalesce_gen() != gen_before {
+            let full_before = full_before.expect("coalesce implies the snapshot was taken");
+            self.record(HistoryEntry {
+                action: EditAction::Delete {
+                    offset,
+                    previous_pieces: removed.clone(),
+                },
+                anchor: 0,
+                before: full_before,
+                after: table.pieces.clone(),
+            });
             return removed;
         }
         let after = segment_after(table, anchor, before.len(), count_before);
@@ -247,8 +276,24 @@ impl UndoStack {
     ) -> EditAction {
         debug_assert!(start < end && end <= table.len());
         let count_before = table.pieces.len();
+        let gen_before = table.coalesce_gen();
+        // A segment replace performs one delete+insert pair per
+        // replaced range inside `[start, end)`, so it can add at most
+        // two pieces per byte of the segment (a 1-byte needle replaced
+        // at every byte) plus slack for the boundary splits.
+        let full_before = layout_snapshot(table, 2 * (end - start) + 4);
         let (anchor, before) = segment_anchor(table, start, end);
         let action = edit(table);
+        if table.coalesce_gen() != gen_before {
+            let full_before = full_before.expect("coalesce implies the snapshot was taken");
+            self.record(HistoryEntry {
+                action: action.clone(),
+                anchor: 0,
+                before: full_before,
+                after: table.pieces.clone(),
+            });
+            return action;
+        }
         let after = segment_after(table, anchor, before.len(), count_before);
         self.record(HistoryEntry {
             action: action.clone(),
@@ -319,7 +364,29 @@ fn splice_segment(
         .collect();
     drop(removed);
     table.total_length = table.pieces.iter().map(|p| p.length).sum();
+    // This splice rewrote `pieces` directly, outside the piece table's
+    // own mutation paths: resync its Fenwick weight index.
+    table.rebuild_weights();
     debug_assert!(table.check_invariants());
+}
+
+/// Snapshot the full piece layout when an edit could trigger the
+/// piece table's automatic coalesce pass (roadmap item 2): the pass
+/// fires when the post-edit count exceeds
+/// [`AUTO_COALESCE_THRESHOLD`], and `headroom` bounds how many pieces
+/// the edit can add (2 for a single insert, 0 for a delete, two per
+/// replaced range for a segment replace). A coalesce merges pieces
+/// *anywhere* in the table, which the segment bookkeeping in this
+/// module cannot attribute to the touched segment; when one fires
+/// inside a recorded edit, the entry falls back to a whole-layout
+/// before/after pair (correct, and rare — ordinary typing coalescence
+/// never triggers the pass).
+fn layout_snapshot(table: &PieceTable, headroom: u64) -> Option<Vec<PieceNode>> {
+    if table.pieces.len() as u64 + headroom >= AUTO_COALESCE_THRESHOLD as u64 {
+        Some(table.pieces.clone())
+    } else {
+        None
+    }
 }
 
 /// The segment an edit produced, derived from the touched segment length
