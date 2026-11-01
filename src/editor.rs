@@ -227,6 +227,10 @@ pub struct Editor {
     anchor: Option<u64>,
     first_line: u64,
     first_row: u64,
+    /// Hex display layout (roadmap items 13/14): row width,
+    /// grouping, and group byte order. Purely presentational —
+    /// caret offsets and edits stay byte-based under every layout.
+    hex_layout: hexview::HexLayout,
     index: Option<LineIndex>,
     /// First byte offset touched by an edit since the index was built
     /// (`None` = the index fully describes the current document). The
@@ -284,6 +288,7 @@ impl Editor {
             anchor: None,
             first_line: 0,
             first_row: 0,
+            hex_layout: hexview::HexLayout::default(),
             index: None,
             index_dirty_from: None,
             nl_delta: 0,
@@ -338,7 +343,7 @@ impl Editor {
             self.mode = mode;
             // Keep the caret in view under the new mode's scroll unit.
             if mode == EditorMode::Hex {
-                self.first_row = hexview::row_for_offset(self.caret);
+                self.first_row = hexview::row_for_offset_w(self.caret, self.hex_width());
             } else {
                 let (line, _) = self.line_col_of(self.caret);
                 self.first_line = line;
@@ -398,8 +403,42 @@ impl Editor {
     }
 
     pub fn set_first_row(&mut self, row: u64) {
-        let rows = hexview::row_count(self.total_len());
+        let rows = hexview::row_count_w(self.total_len(), self.hex_width());
         self.first_row = if rows == 0 { 0 } else { row.min(rows - 1) };
+    }
+
+    /// The current hex display layout.
+    pub fn hex_layout(&self) -> hexview::HexLayout {
+        self.hex_layout
+    }
+
+    /// Row width of the current hex layout (the layout's
+    /// `bytes_per_row`, never zero).
+    fn hex_width(&self) -> u64 {
+        self.hex_layout.bytes_per_row.max(1)
+    }
+
+    /// Set the hex display layout. Changing the row width re-derives
+    /// the scroll row from the caret when the caret's new row would
+    /// fall above the viewport; the caret itself never moves.
+    pub fn set_hex_layout(&mut self, layout: hexview::HexLayout) {
+        if layout == self.hex_layout {
+            return;
+        }
+        let width_changed = layout.bytes_per_row != self.hex_layout.bytes_per_row;
+        self.hex_layout = layout;
+        if width_changed {
+            let rows = hexview::row_count_w(self.total_len(), self.hex_width());
+            self.first_row = if rows == 0 {
+                0
+            } else {
+                self.first_row.min(rows - 1)
+            };
+            let caret_row = hexview::row_for_offset_w(self.caret, self.hex_width());
+            if caret_row < self.first_row {
+                self.first_row = caret_row;
+            }
+        }
     }
 
     pub fn can_undo(&self) -> bool {
@@ -774,24 +813,20 @@ impl Editor {
     }
 
     /// The visible hex rows starting at `first_row`, at most `count`.
+    /// Row width, grouping, and group byte order follow the current
+    /// hex layout; the ASCII column always reads in file order.
     pub fn visible_hex_rows(&self, first_row: u64, count: usize) -> Vec<HexRow> {
-        let total_rows = hexview::row_count(self.total_len());
+        let width = self.hex_width();
+        let total_rows = hexview::row_count_w(self.total_len(), width);
         let mut rows = Vec::new();
         let mut row = first_row;
         while rows.len() < count && row < total_rows {
-            let address = hexview::row_offset(row);
-            let len = hexview::BYTES_PER_ROW.min(self.total_len() - address);
+            let address = hexview::row_offset_w(row, width);
+            let len = width.min(self.total_len() - address);
             let bytes = self.table.read(address, len);
-            let mut hex = String::new();
+            let hex = hexview::format_hex(&bytes, &self.hex_layout);
             let mut ascii = String::new();
-            for (i, &b) in bytes.iter().enumerate() {
-                if i > 0 {
-                    hex.push(' ');
-                    if i == 8 {
-                        hex.push(' ');
-                    }
-                }
-                hex.push_str(&format!("{b:02X}"));
+            for &b in bytes.iter() {
                 ascii.push(if (0x20..=0x7E).contains(&b) {
                     b as char
                 } else {
@@ -902,7 +937,7 @@ impl Editor {
     fn move_vertical(&mut self, delta: i64, extend: bool) {
         match self.mode {
             EditorMode::Hex => {
-                let step = hexview::BYTES_PER_ROW as i64 * delta;
+                let step = self.hex_width() as i64 * delta;
                 let target = (self.caret as i64 + step).clamp(0, self.total_len() as i64);
                 self.set_caret(target as u64, extend);
             }
@@ -931,8 +966,8 @@ impl Editor {
     pub fn move_home(&mut self, extend: bool) {
         match self.mode {
             EditorMode::Hex => {
-                let row = hexview::row_for_offset(self.caret);
-                self.set_caret(hexview::row_offset(row), extend);
+                let row = hexview::row_for_offset_w(self.caret, self.hex_width());
+                self.set_caret(hexview::row_offset_w(row, self.hex_width()), extend);
             }
             EditorMode::Text => {
                 let (line, _) = self.line_col_of(self.caret);
@@ -946,9 +981,10 @@ impl Editor {
     pub fn move_end(&mut self, extend: bool) {
         match self.mode {
             EditorMode::Hex => {
-                let row = hexview::row_for_offset(self.caret);
-                let end = hexview::row_offset(row)
-                    .saturating_add(hexview::BYTES_PER_ROW)
+                let width = self.hex_width();
+                let row = hexview::row_for_offset_w(self.caret, width);
+                let end = hexview::row_offset_w(row, width)
+                    .saturating_add(width)
                     .min(self.total_len());
                 self.set_caret(end, extend);
             }
@@ -991,7 +1027,7 @@ impl Editor {
         let rows = visible_rows.max(1);
         match self.mode {
             EditorMode::Hex => {
-                let row = hexview::row_for_offset(self.caret);
+                let row = hexview::row_for_offset_w(self.caret, self.hex_width());
                 if row < self.first_row {
                     self.first_row = row;
                 } else if row >= self.first_row + rows {
@@ -1643,6 +1679,37 @@ impl Editor {
         Ok(self.finish_save(report))
     }
 
+    /// Save over the document's own file with explicit save options
+    /// (roadmap items 31/32: the line-ending and BOM transforms the
+    /// window's File ▸ Save Options menu chooses). Same pipeline as
+    /// [`Editor::save`], but routed through
+    /// `PieceTable::save_to_with_options`.
+    pub fn save_with_options(
+        &mut self,
+        options: &crate::save::SaveOptions,
+    ) -> Result<SaveReport, EditorError> {
+        self.require_writable_save()?;
+        let path = self.path.clone().ok_or(EditorError::NoPath)?;
+        let report = self
+            .table
+            .save_to_with_options(&path, &mut self.history, options)?;
+        Ok(self.finish_save(report))
+    }
+
+    /// Save As with explicit save options; the path is adopted only
+    /// when the save succeeds, like [`Editor::save_as`].
+    pub fn save_as_with_options(
+        &mut self,
+        path: &Path,
+        options: &crate::save::SaveOptions,
+    ) -> Result<SaveReport, EditorError> {
+        let report = self
+            .table
+            .save_to_with_options(path, &mut self.history, options)?;
+        self.path = Some(path.to_path_buf());
+        Ok(self.finish_save(report))
+    }
+
     /// Save to a new path (Save As): the path is adopted only when the
     /// save succeeds. Unlike [`Editor::save`], Save As is allowed for
     /// a read-only document — writing the (unedited) content to a
@@ -1929,6 +1996,117 @@ mod tests {
         assert_eq!(e.caret(), 4, "down clamps to the end of a short file");
         e.move_home(false);
         assert_eq!(e.caret(), 0);
+    }
+
+    #[test]
+    fn hex_layout_changes_row_math_and_formatting() {
+        let data: Vec<u8> = (0..40).collect();
+        let mut e = ed(&data);
+        e.set_mode(EditorMode::Hex);
+        // Narrower rows: more of them, addresses in steps of 8.
+        e.set_hex_layout(hexview::HexLayout {
+            bytes_per_row: 8,
+            group: 1,
+            big_endian: false,
+        });
+        let rows = e.visible_hex_rows(0, 10);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[1].address, 8);
+        assert_eq!(rows[0].hex, "00 01 02 03  04 05 06 07");
+        assert_eq!(rows[0].ascii, "........");
+        // Vertical movement steps one narrow row at a time.
+        e.move_down(false);
+        assert_eq!(e.caret(), 8);
+        e.move_end(false);
+        assert_eq!(e.caret(), 16, "end of the second 8-byte row");
+        // Home goes to the start of the caret's own row.
+        e.move_caret_to(11, false);
+        e.move_home(false);
+        assert_eq!(e.caret(), 8);
+        // Wider rows: two rows cover the file.
+        e.set_hex_layout(hexview::HexLayout {
+            bytes_per_row: 32,
+            group: 1,
+            big_endian: false,
+        });
+        let rows = e.visible_hex_rows(0, 10);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].address, 32);
+        assert_eq!(rows[1].len, 8);
+        e.move_doc_start(false);
+        e.move_down(false);
+        assert_eq!(e.caret(), 32);
+        // Grouping changes the display only: the caret and the bytes
+        // stay byte-based.
+        e.set_hex_layout(hexview::HexLayout {
+            bytes_per_row: 16,
+            group: 4,
+            big_endian: true,
+        });
+        let rows = e.visible_hex_rows(0, 1);
+        assert!(rows[0].hex.starts_with("03 02 01 00"), "{}", rows[0].hex);
+        assert_eq!(rows[0].ascii, "................");
+        e.move_doc_start(false);
+        e.overwrite_byte(0xEE).unwrap();
+        assert_eq!(content(&e)[0], 0xEE);
+    }
+
+    #[test]
+    fn hex_layout_keeps_the_caret_row_in_view() {
+        let data: Vec<u8> = (0..200).collect();
+        let mut e = ed(&data);
+        e.set_mode(EditorMode::Hex);
+        e.move_caret_to(150, false);
+        e.set_first_row(9); // row of the caret at width 16
+        assert_eq!(e.first_row(), 9);
+        // At width 8 the caret sits on row 18; the scroll row must
+        // not leave it above the viewport.
+        e.set_hex_layout(hexview::HexLayout {
+            bytes_per_row: 8,
+            group: 1,
+            big_endian: false,
+        });
+        assert_eq!(e.first_row(), 9);
+        e.set_first_row(24); // last row at width 8 (25 rows)
+        e.set_hex_layout(hexview::HexLayout {
+            bytes_per_row: 64,
+            group: 1,
+            big_endian: false,
+        });
+        // Only 4 rows exist now; the scroll row clamps, then the
+        // caret's row (2) pulls it up.
+        assert_eq!(e.first_row(), 2);
+    }
+
+    #[test]
+    fn save_with_options_applies_the_chosen_transform() {
+        let path = temp_path("saveopts-doc.txt");
+        std::fs::write(&path, b"a\nb\n").unwrap();
+        let mut e = Editor::open_from_path(&path, false).unwrap();
+        let options = crate::save::SaveOptions {
+            eol: crate::save::EolChoice::Crlf,
+            bom: crate::save::BomChoice::Add,
+            ..crate::save::SaveOptions::default()
+        };
+        e.save_with_options(&options).unwrap();
+        assert!(!e.is_dirty());
+        let on_disk = std::fs::read(&path).unwrap();
+        assert_eq!(on_disk, b"\xEF\xBB\xBFa\r\nb\r\n");
+        // Save As with options adopts the new path and transforms too.
+        let other = temp_path("saveopts-copy.txt");
+        e.save_as_with_options(
+            &other,
+            &crate::save::SaveOptions {
+                eol: crate::save::EolChoice::Lf,
+                bom: crate::save::BomChoice::Remove,
+                ..crate::save::SaveOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(e.path(), Some(other.as_path()));
+        assert_eq!(std::fs::read(&other).unwrap(), b"a\nb\n");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&other).ok();
     }
 
     #[test]
