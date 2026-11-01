@@ -28,6 +28,21 @@ pub const MIN_FONT_SIZE: u16 = 8;
 pub const MAX_FONT_SIZE: u16 = 48;
 pub const DEFAULT_FONT_SIZE: u16 = 14;
 
+/// Undo bounds (roadmap item 6): the history keeps at most this many
+/// steps and at most this many megabytes of stored deltas, whichever
+/// runs out first. Both are owner-settable in `settings.json`.
+pub const MIN_UNDO_LIMIT: usize = 16;
+pub const MAX_UNDO_LIMIT: usize = 65_536;
+pub const DEFAULT_UNDO_LIMIT: usize = 1024;
+pub const MIN_UNDO_BYTE_BUDGET_MB: u64 = 1;
+pub const MAX_UNDO_BYTE_BUDGET_MB: u64 = 4096;
+pub const DEFAULT_UNDO_BYTE_BUDGET_MB: u64 = 256;
+
+/// Column ruler bounds: 0 = off; any other value is the character
+/// column the guideline is drawn at (roadmap item 21).
+pub const MAX_RULER_COLUMN: u32 = 4096;
+pub const DEFAULT_RULER_COLUMN: u32 = 0;
+
 /// The folder that holds all portable program state: `<exe-dir>/data`.
 /// Falls back to a `data/` folder relative to the working directory
 /// when the executable path cannot be determined (tests, odd launchers)
@@ -78,6 +93,16 @@ pub struct Settings {
     /// Editor font size in points (clamped to
     /// [`MIN_FONT_SIZE`]..=[`MAX_FONT_SIZE`] on load).
     pub font_size: u16,
+    /// Maximum number of undo steps kept (clamped to
+    /// [`MIN_UNDO_LIMIT`]..=[`MAX_UNDO_LIMIT`] on load).
+    pub undo_limit: usize,
+    /// Maximum total size of the stored undo deltas, in megabytes
+    /// (clamped to [`MIN_UNDO_BYTE_BUDGET_MB`]..=
+    /// [`MAX_UNDO_BYTE_BUDGET_MB`] on load).
+    pub undo_byte_budget_mb: u64,
+    /// Character column of the optional vertical guideline in text
+    /// mode; 0 = off (clamped to at most [`MAX_RULER_COLUMN`] on load).
+    pub ruler_column: u32,
     /// Last window placement `(x, y, width, height)` in physical pixels;
     /// the shell validates it against the connected monitors before
     /// applying it.
@@ -93,6 +118,9 @@ impl Default for Settings {
             theme: theme::DEFAULT_THEME_NAME.to_string(),
             accent_override: None,
             font_size: DEFAULT_FONT_SIZE,
+            undo_limit: DEFAULT_UNDO_LIMIT,
+            undo_byte_budget_mb: DEFAULT_UNDO_BYTE_BUDGET_MB,
+            ruler_column: DEFAULT_RULER_COLUMN,
             window: None,
             recent: Vec::new(),
         }
@@ -123,6 +151,12 @@ impl Settings {
             None => out.push_str("  \"accent_override\": null,\n"),
         }
         out.push_str(&format!("  \"font_size\": {},\n", self.font_size));
+        out.push_str(&format!("  \"undo_limit\": {},\n", self.undo_limit));
+        out.push_str(&format!(
+            "  \"undo_byte_budget_mb\": {},\n",
+            self.undo_byte_budget_mb
+        ));
+        out.push_str(&format!("  \"ruler_column\": {},\n", self.ruler_column));
         match self.window {
             Some((x, y, w, h)) => out.push_str(&format!("  \"window\": [{x}, {y}, {w}, {h}],\n")),
             None => out.push_str("  \"window\": null,\n"),
@@ -175,6 +209,22 @@ impl Settings {
                     let n = parser.integer()?;
                     settings.font_size =
                         (n.clamp(MIN_FONT_SIZE as i64, MAX_FONT_SIZE as i64)) as u16;
+                }
+                "undo_limit" => {
+                    let n = parser.integer()?;
+                    settings.undo_limit =
+                        (n.clamp(MIN_UNDO_LIMIT as i64, MAX_UNDO_LIMIT as i64)) as usize;
+                }
+                "undo_byte_budget_mb" => {
+                    let n = parser.integer()?;
+                    settings.undo_byte_budget_mb = (n.clamp(
+                        MIN_UNDO_BYTE_BUDGET_MB as i64,
+                        MAX_UNDO_BYTE_BUDGET_MB as i64,
+                    )) as u64;
+                }
+                "ruler_column" => {
+                    let n = parser.integer()?;
+                    settings.ruler_column = (n.clamp(0, MAX_RULER_COLUMN as i64)) as u32;
                 }
                 "window" => {
                     if parser.eat_null() {
@@ -469,6 +519,9 @@ mod tests {
             theme: "Monokai".to_string(),
             accent_override: Some("#2F7CF6".to_string()),
             font_size: 18,
+            undo_limit: 2048,
+            undo_byte_budget_mb: 128,
+            ruler_column: 80,
             window: Some((-120, 40, 1100, 750)),
             recent: vec![
                 "C:\\Logs\\server.log".to_string(),
@@ -483,6 +536,9 @@ mod tests {
         assert_eq!(s.theme, "Obsidian");
         assert_eq!(s.accent_override, None);
         assert_eq!(s.font_size, 14);
+        assert_eq!(s.undo_limit, DEFAULT_UNDO_LIMIT);
+        assert_eq!(s.undo_byte_budget_mb, DEFAULT_UNDO_BYTE_BUDGET_MB);
+        assert_eq!(s.ruler_column, DEFAULT_RULER_COLUMN);
         assert_eq!(s.window, None);
         assert!(s.recent.is_empty());
     }
@@ -553,6 +609,21 @@ mod tests {
         assert_eq!(s.font_size, MAX_FONT_SIZE, "font size clamps to the max");
         // Case-insensitive dedupe, first occurrence wins, order preserved.
         assert_eq!(s.recent, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn undo_and_ruler_values_are_clamped() {
+        // Below the floor, above the ceiling, and a good value.
+        let text = r#"{"undo_limit":2,"undo_byte_budget_mb":99999,"ruler_column":120}"#;
+        let s = Settings::from_json(text).unwrap();
+        assert_eq!(s.undo_limit, MIN_UNDO_LIMIT);
+        assert_eq!(s.undo_byte_budget_mb, MAX_UNDO_BYTE_BUDGET_MB);
+        assert_eq!(s.ruler_column, 120);
+        let text = r#"{"undo_limit":700000,"undo_byte_budget_mb":0,"ruler_column":-5}"#;
+        let s = Settings::from_json(text).unwrap();
+        assert_eq!(s.undo_limit, MAX_UNDO_LIMIT);
+        assert_eq!(s.undo_byte_budget_mb, MIN_UNDO_BYTE_BUDGET_MB);
+        assert_eq!(s.ruler_column, 0);
     }
 
     #[test]
