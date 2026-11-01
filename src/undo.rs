@@ -20,8 +20,9 @@ use crate::piece_table::{PieceNode, PieceTable};
 /// Default maximum number of edits kept in history.
 ///
 /// SPEC.md section 5.2 requires a memory-constrained history but does not
-/// name a number, so this is a placeholder default until the cap is
-/// confirmed; it can be overridden with [`UndoStack::with_capacity`].
+/// name a number. The default is 1,024 steps; the owner can override it
+/// (and the byte budget below) in `data/settings.json` — see
+/// [`UndoStack::with_limits`] and `crate::settings`.
 pub const DEFAULT_HISTORY_LIMIT: usize = 1024;
 
 /// One reversible mutation (SPEC.md section 5.2).
@@ -63,12 +64,43 @@ struct HistoryEntry {
     after: Vec<PieceNode>,
 }
 
+/// The stored weight of one history entry: the document bytes its
+/// piece segments span (before + after) plus the action's own stored
+/// bytes. This is the quantity the byte budget bounds — a proxy for
+/// the memory a delta pins, so one huge edit (a replace-all over a
+/// mass of pieces) counts far more than a keystroke.
+fn entry_payload(entry: &HistoryEntry) -> u64 {
+    let pieces_bytes = |pieces: &[PieceNode]| pieces.iter().map(|p| p.length).sum::<u64>();
+    let action_bytes = match &entry.action {
+        EditAction::Insert { length, .. } => *length,
+        EditAction::Delete {
+            previous_pieces, ..
+        } => pieces_bytes(previous_pieces),
+        EditAction::Replace {
+            previous_pieces,
+            inserted_length,
+            ..
+        } => pieces_bytes(previous_pieces) + inserted_length,
+    };
+    pieces_bytes(&entry.before) + pieces_bytes(&entry.after) + action_bytes
+}
+
 /// Bounded undo/redo history for one document.
+///
+/// Two bounds apply together (roadmap item 6): at most `capacity`
+/// steps, and at most `byte_budget` summed payload bytes across the
+/// undo stack. Whichever bound is hit first trims the oldest entries;
+/// the newest entry is never trimmed, so the most recent edit can
+/// always be undone even when it alone exceeds the budget.
 #[derive(Debug)]
 pub struct UndoStack {
     undo: VecDeque<HistoryEntry>,
     redo: VecDeque<HistoryEntry>,
     capacity: usize,
+    byte_budget: u64,
+    /// Summed [`entry_payload`] of the entries currently in `undo`,
+    /// kept incrementally so trimming never rescans the stack.
+    undo_bytes: u64,
 }
 
 impl Default for UndoStack {
@@ -82,18 +114,36 @@ impl UndoStack {
         Self::with_capacity(DEFAULT_HISTORY_LIMIT)
     }
 
-    /// A history keeping at most `capacity` edits. `0` disables history:
-    /// edits still apply, but nothing is recorded.
+    /// A history keeping at most `capacity` edits, with no byte
+    /// budget. `0` disables history: edits still apply, but nothing is
+    /// recorded.
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_limits(capacity, u64::MAX)
+    }
+
+    /// A history bounded by both a step limit and a byte budget (the
+    /// sum of the stored deltas' payload bytes, see [`entry_payload`]).
+    pub fn with_limits(capacity: usize, byte_budget: u64) -> Self {
         Self {
             undo: VecDeque::new(),
             redo: VecDeque::new(),
             capacity,
+            byte_budget,
+            undo_bytes: 0,
         }
     }
 
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    pub fn byte_budget(&self) -> u64 {
+        self.byte_budget
+    }
+
+    /// The summed payload bytes of the entries currently undoable.
+    pub fn undo_bytes(&self) -> u64 {
+        self.undo_bytes
     }
 
     pub fn can_undo(&self) -> bool {
@@ -121,6 +171,7 @@ impl UndoStack {
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
+        self.undo_bytes = 0;
     }
 
     /// The most recent undoable action, if any (newest first inspection).
@@ -215,6 +266,7 @@ impl UndoStack {
         let Some(entry) = self.undo.pop_back() else {
             return false;
         };
+        self.undo_bytes -= entry_payload(&entry);
         splice_segment(table, entry.anchor, entry.after.len(), &entry.before);
         self.redo.push_back(entry);
         true
@@ -227,6 +279,7 @@ impl UndoStack {
             return false;
         };
         splice_segment(table, entry.anchor, entry.before.len(), &entry.after);
+        self.undo_bytes += entry_payload(&entry);
         self.undo.push_back(entry);
         true
     }
@@ -237,9 +290,17 @@ impl UndoStack {
         if self.capacity == 0 {
             return;
         }
+        self.undo_bytes += entry_payload(&entry);
         self.undo.push_back(entry);
-        while self.undo.len() > self.capacity {
-            self.undo.pop_front();
+        // Trim the oldest entries until both bounds hold. The newest
+        // entry is never trimmed: the loop stops at one entry, so the
+        // edit just made can always be undone, even when it alone is
+        // bigger than the whole byte budget.
+        while self.undo.len() > 1
+            && (self.undo.len() > self.capacity || self.undo_bytes > self.byte_budget)
+        {
+            let dropped = self.undo.pop_front().expect("len > 1");
+            self.undo_bytes -= entry_payload(&dropped);
         }
     }
 }
@@ -460,6 +521,55 @@ mod tests {
         assert!(history.apply_undo(&mut table));
         assert!(!history.apply_undo(&mut table));
         assert_eq!(text(&table), "ab"); // first two inserts fell off history
+    }
+
+    #[test]
+    fn byte_budget_trims_oldest_first() {
+        let mut table = PieceTable::from_original(Vec::new());
+        // Budget 20: the first insert weighs 8 (4 segment bytes after
+        // the edit + 4 action bytes), the second 16 (it coalesces
+        // into the same piece: 4 before + 8 after + 4 action bytes).
+        let mut history = UndoStack::with_limits(100, 20);
+        history.do_insert(&mut table, 0, b"aaaa");
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(history.undo_bytes(), 8);
+        history.do_insert(&mut table, 4, b"bbbb");
+        // 8 + 16 = 24 > 20: the oldest entry is dropped, the newest
+        // stays — only the second insert can still be undone.
+        assert_eq!(history.undo_len(), 1);
+        assert_eq!(history.undo_bytes(), 16);
+        assert_eq!(
+            history.peek_undo(),
+            Some(&EditAction::Insert {
+                offset: 4,
+                length: 4
+            })
+        );
+        assert!(history.apply_undo(&mut table));
+        assert_eq!(text(&table), "aaaa");
+        assert_eq!(history.undo_bytes(), 0);
+        assert!(!history.apply_undo(&mut table));
+    }
+
+    #[test]
+    fn byte_budget_never_drops_the_just_added_entry() {
+        let mut table = PieceTable::from_original(Vec::new());
+        // A budget smaller than a single edit: the edit is still
+        // recorded and undoable (history never trims itself empty).
+        let mut history = UndoStack::with_limits(100, 4);
+        history.do_insert(&mut table, 0, b"aaaaaaaa");
+        assert_eq!(history.undo_len(), 1);
+        assert!(history.can_undo());
+        assert!(history.apply_undo(&mut table));
+        assert_eq!(text(&table), "");
+    }
+
+    #[test]
+    fn default_stacks_have_no_byte_budget() {
+        assert_eq!(UndoStack::new().byte_budget(), u64::MAX);
+        assert_eq!(UndoStack::with_capacity(3).byte_budget(), u64::MAX);
+        assert_eq!(UndoStack::with_limits(3, 99).byte_budget(), 99);
+        assert_eq!(UndoStack::new().undo_bytes(), 0);
     }
 
     #[test]
