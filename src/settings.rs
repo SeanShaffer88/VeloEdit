@@ -15,6 +15,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::hexview::HexLayout;
+use crate::save::{BomChoice, EolChoice};
 use crate::theme;
 
 /// The settings file's name inside the `data/` folder.
@@ -42,6 +44,26 @@ pub const DEFAULT_UNDO_BYTE_BUDGET_MB: u64 = 256;
 /// column the guideline is drawn at (roadmap item 21).
 pub const MAX_RULER_COLUMN: u32 = 4096;
 pub const DEFAULT_RULER_COLUMN: u32 = 0;
+
+/// Hex row widths the settings accept (roadmap item 13): one of
+/// these, or 0 for fit-to-window (the shell computes the width
+/// from the window size). Anything else loads as the default.
+pub const HEX_COLS_FIT: u32 = 0;
+pub const HEX_COLS_CHOICES: [u32; 5] = [8, 16, 24, 32, 64];
+pub const DEFAULT_HEX_COLS: u32 = 16;
+
+/// Hex group sizes the settings accept (roadmap item 14).
+pub const HEX_GROUP_CHOICES: [u32; 4] = [1, 2, 4, 8];
+pub const DEFAULT_HEX_GROUP: u32 = 1;
+
+/// The stored words for the save line-ending choice (roadmap
+/// item 31) and the save byte-order-mark choice (item 32).
+pub const SAVE_EOL_KEEP: &str = "keep";
+pub const SAVE_EOL_LF: &str = "lf";
+pub const SAVE_EOL_CRLF: &str = "crlf";
+pub const SAVE_BOM_KEEP: &str = "keep";
+pub const SAVE_BOM_ADD: &str = "add";
+pub const SAVE_BOM_REMOVE: &str = "remove";
 
 /// The folder that holds all portable program state: `<exe-dir>/data`.
 /// Falls back to a `data/` folder relative to the working directory
@@ -103,6 +125,27 @@ pub struct Settings {
     /// Character column of the optional vertical guideline in text
     /// mode; 0 = off (clamped to at most [`MAX_RULER_COLUMN`] on load).
     pub ruler_column: u32,
+    /// Whether the data inspector panel is docked open (roadmap
+    /// item 15).
+    pub inspector_open: bool,
+    /// Hex bytes per row (roadmap item 13): one of
+    /// [`HEX_COLS_CHOICES`], or [`HEX_COLS_FIT`] (0) for
+    /// fit-to-window. Any other value loads as the default.
+    pub hex_cols: u32,
+    /// Hex grouping in bytes (roadmap item 14): one of
+    /// [`HEX_GROUP_CHOICES`]; any other value loads as 1.
+    pub hex_group: u32,
+    /// Hex groups are displayed big-endian (roadmap item 14):
+    /// each group's bytes are shown reversed, so the group reads
+    /// as one big-endian number. Display only — file bytes never
+    /// change order.
+    pub hex_endian: bool,
+    /// Line-ending handling for saves (roadmap item 31): one of
+    /// the `SAVE_EOL_*` words; anything else loads as "keep".
+    pub save_eol: String,
+    /// Byte-order-mark handling for saves (roadmap item 32): one
+    /// of the `SAVE_BOM_*` words; anything else loads as "keep".
+    pub save_bom: String,
     /// Last window placement `(x, y, width, height)` in physical pixels;
     /// the shell validates it against the connected monitors before
     /// applying it.
@@ -121,6 +164,12 @@ impl Default for Settings {
             undo_limit: DEFAULT_UNDO_LIMIT,
             undo_byte_budget_mb: DEFAULT_UNDO_BYTE_BUDGET_MB,
             ruler_column: DEFAULT_RULER_COLUMN,
+            inspector_open: false,
+            hex_cols: DEFAULT_HEX_COLS,
+            hex_group: DEFAULT_HEX_GROUP,
+            hex_endian: false,
+            save_eol: SAVE_EOL_KEEP.to_string(),
+            save_bom: SAVE_BOM_KEEP.to_string(),
             window: None,
             recent: Vec::new(),
         }
@@ -128,6 +177,39 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The save line-ending choice as the save pipeline's enum.
+    pub fn save_eol_choice(&self) -> EolChoice {
+        match self.save_eol.as_str() {
+            SAVE_EOL_LF => EolChoice::Lf,
+            SAVE_EOL_CRLF => EolChoice::Crlf,
+            _ => EolChoice::Keep,
+        }
+    }
+
+    /// The save byte-order-mark choice as the save pipeline's enum.
+    pub fn save_bom_choice(&self) -> BomChoice {
+        match self.save_bom.as_str() {
+            SAVE_BOM_ADD => BomChoice::Add,
+            SAVE_BOM_REMOVE => BomChoice::Remove,
+            _ => BomChoice::Keep,
+        }
+    }
+
+    /// The hex display layout these settings describe. `fit_width`
+    /// is the shell-computed row width used when `hex_cols` is
+    /// [`HEX_COLS_FIT`]; it is ignored for a fixed width.
+    pub fn hex_layout(&self, fit_width: u64) -> HexLayout {
+        HexLayout {
+            bytes_per_row: if self.hex_cols == HEX_COLS_FIT {
+                fit_width.max(1)
+            } else {
+                self.hex_cols as u64
+            },
+            group: self.hex_group as usize,
+            big_endian: self.hex_endian,
+        }
+    }
+
     /// Record `path` as the most recently opened file: moved to the
     /// front, duplicates removed (compared case-insensitively, as
     /// Windows paths are), the list truncated to [`MAX_RECENT`].
@@ -157,6 +239,18 @@ impl Settings {
             self.undo_byte_budget_mb
         ));
         out.push_str(&format!("  \"ruler_column\": {},\n", self.ruler_column));
+        out.push_str(&format!("  \"inspector_open\": {},\n", self.inspector_open));
+        out.push_str(&format!("  \"hex_cols\": {},\n", self.hex_cols));
+        out.push_str(&format!("  \"hex_group\": {},\n", self.hex_group));
+        out.push_str(&format!("  \"hex_endian\": {},\n", self.hex_endian));
+        out.push_str(&format!(
+            "  \"save_eol\": \"{}\",\n",
+            json_escape(&self.save_eol)
+        ));
+        out.push_str(&format!(
+            "  \"save_bom\": \"{}\",\n",
+            json_escape(&self.save_bom)
+        ));
         match self.window {
             Some((x, y, w, h)) => out.push_str(&format!("  \"window\": [{x}, {y}, {w}, {h}],\n")),
             None => out.push_str("  \"window\": null,\n"),
@@ -225,6 +319,37 @@ impl Settings {
                 "ruler_column" => {
                     let n = parser.integer()?;
                     settings.ruler_column = (n.clamp(0, MAX_RULER_COLUMN as i64)) as u32;
+                }
+                "inspector_open" => settings.inspector_open = parser.boolean()?,
+                "hex_cols" => {
+                    let n = parser.integer()?;
+                    settings.hex_cols = match n {
+                        0 => HEX_COLS_FIT,
+                        8 | 16 | 24 | 32 | 64 => n as u32,
+                        _ => DEFAULT_HEX_COLS,
+                    };
+                }
+                "hex_group" => {
+                    let n = parser.integer()?;
+                    settings.hex_group = match n {
+                        1 | 2 | 4 | 8 => n as u32,
+                        _ => DEFAULT_HEX_GROUP,
+                    };
+                }
+                "hex_endian" => settings.hex_endian = parser.boolean()?,
+                "save_eol" => {
+                    let word = parser.string()?;
+                    settings.save_eol = match word.as_str() {
+                        SAVE_EOL_LF | SAVE_EOL_CRLF => word,
+                        _ => SAVE_EOL_KEEP.to_string(),
+                    };
+                }
+                "save_bom" => {
+                    let word = parser.string()?;
+                    settings.save_bom = match word.as_str() {
+                        SAVE_BOM_ADD | SAVE_BOM_REMOVE => word,
+                        _ => SAVE_BOM_KEEP.to_string(),
+                    };
                 }
                 "window" => {
                     if parser.eat_null() {
@@ -335,7 +460,7 @@ impl Settings {
 }
 
 /// A minimal JSON reader for the settings shape: objects with string
-/// keys, string / integer / null / array values. It is deliberately not
+/// keys, string / integer / boolean / null / array values. It is deliberately not
 /// a general JSON parser — it reads what [`Settings::to_json`] writes,
 /// tolerates whitespace and key order, and rejects everything else.
 struct Parser {
@@ -425,6 +550,19 @@ impl Parser {
                 },
                 Some(ch) => out.push(ch),
             }
+        }
+    }
+
+    fn boolean(&mut self) -> Result<bool, String> {
+        self.skip_ws();
+        if self.chars[self.pos..].starts_with(&['t', 'r', 'u', 'e']) {
+            self.pos += 4;
+            Ok(true)
+        } else if self.chars[self.pos..].starts_with(&['f', 'a', 'l', 's', 'e']) {
+            self.pos += 5;
+            Ok(false)
+        } else {
+            Err(format!("expected a boolean at character {}", self.pos))
         }
     }
 
@@ -522,6 +660,12 @@ mod tests {
             undo_limit: 2048,
             undo_byte_budget_mb: 128,
             ruler_column: 80,
+            inspector_open: true,
+            hex_cols: 32,
+            hex_group: 4,
+            hex_endian: true,
+            save_eol: SAVE_EOL_CRLF.to_string(),
+            save_bom: SAVE_BOM_ADD.to_string(),
             window: Some((-120, 40, 1100, 750)),
             recent: vec![
                 "C:\\Logs\\server.log".to_string(),
@@ -539,8 +683,58 @@ mod tests {
         assert_eq!(s.undo_limit, DEFAULT_UNDO_LIMIT);
         assert_eq!(s.undo_byte_budget_mb, DEFAULT_UNDO_BYTE_BUDGET_MB);
         assert_eq!(s.ruler_column, DEFAULT_RULER_COLUMN);
+        assert!(!s.inspector_open);
+        assert_eq!(s.hex_cols, DEFAULT_HEX_COLS);
+        assert_eq!(s.hex_group, DEFAULT_HEX_GROUP);
+        assert!(!s.hex_endian);
+        assert_eq!(s.save_eol, SAVE_EOL_KEEP);
+        assert_eq!(s.save_bom, SAVE_BOM_KEEP);
         assert_eq!(s.window, None);
         assert!(s.recent.is_empty());
+    }
+
+    #[test]
+    fn view_and_save_keys_round_trip_and_validate() {
+        // The sample sets every new key to a non-default value; the
+        // generic round-trip test already proves they survive, so
+        // here the enum/word conversions are pinned down.
+        let s = sample();
+        assert_eq!(s.save_eol_choice(), EolChoice::Crlf);
+        assert_eq!(s.save_bom_choice(), BomChoice::Add);
+        let layout = s.hex_layout(48);
+        assert_eq!(layout.bytes_per_row, 32);
+        assert_eq!(layout.group, 4);
+        assert!(layout.big_endian);
+        // Fit-to-window takes the shell-computed width instead.
+        let fit = Settings {
+            hex_cols: HEX_COLS_FIT,
+            ..Settings::default()
+        };
+        assert_eq!(fit.hex_layout(48).bytes_per_row, 48);
+        assert_eq!(fit.save_eol_choice(), EolChoice::Keep);
+        assert_eq!(fit.save_bom_choice(), BomChoice::Keep);
+
+        // Out-of-set values load as the documented defaults.
+        let text = r#"{"hex_cols":12,"hex_group":3,"save_eol":"tabs","save_bom":"yes","hex_endian":true,"inspector_open":true}"#;
+        let s = Settings::from_json(text).unwrap();
+        assert_eq!(s.hex_cols, DEFAULT_HEX_COLS);
+        assert_eq!(s.hex_group, DEFAULT_HEX_GROUP);
+        assert_eq!(s.save_eol, SAVE_EOL_KEEP);
+        assert_eq!(s.save_bom, SAVE_BOM_KEEP);
+        assert!(s.hex_endian);
+        assert!(s.inspector_open);
+        // Every accepted value loads as itself, fit included.
+        for cols in [0, 8, 16, 24, 32, 64] {
+            let s = Settings::from_json(&format!("{{\"hex_cols\":{cols}}}")).unwrap();
+            assert_eq!(s.hex_cols, cols);
+        }
+        for group in [1, 2, 4, 8] {
+            let s = Settings::from_json(&format!("{{\"hex_group\":{group}}}")).unwrap();
+            assert_eq!(s.hex_group, group);
+        }
+        let s = Settings::from_json(r#"{"save_eol":"lf","save_bom":"remove"}"#).unwrap();
+        assert_eq!(s.save_eol_choice(), EolChoice::Lf);
+        assert_eq!(s.save_bom_choice(), BomChoice::Remove);
     }
 
     #[test]
