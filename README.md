@@ -161,8 +161,10 @@ Once the window is open:
   megabytes, then writes a copy of the document as numbered parts in
   a `<name>-parts` folder and reports how many parts it made.
 - **Themes**: View ▸ Theme picks from 20 built-in themes; View ▸
-  Accent changes just the highlight colour. Font size is in the same
-  menu (or Ctrl+ '+' / Ctrl+ '-').
+  Accent changes just the highlight colour. Moving through those
+  menus previews each choice in the window — click to keep it, or
+  close the menu to go back. Font size is in the same menu (or
+  Ctrl+ '+' / Ctrl+ '-', or Ctrl+mouse wheel).
 - **Column ruler**: View ▸ Column Ruler cycles a vertical guideline
   at column 80 or 120 (or off), for keeping lines to a set length.
 - **Save selection**: File ▸ Save Selection to File… writes just the
