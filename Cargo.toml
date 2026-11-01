@@ -1,0 +1,38 @@
+[package]
+name = "veloedit"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["Sean Shaffer"]
+description = "Zero-dependency, portable binary and large-file editor written in Rust."
+license = "MIT"
+keywords = ["windows", "editor", "hex-editor", "large-files"]
+categories = ["text-editors"]
+
+[lib]
+name = "veloedit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "VeloEdit"
+path = "src/main.rs"
+
+# The ONLY dependency crate allowed (SPEC.md section 1.1: direct windows-sys
+# FFI bindings). It is gated behind cfg(windows) so the platform-independent
+# core in this slice builds and tests on any host. Features are the minimum
+# the later Windows slices need: file/memory-mapping APIs for the mmap piece
+# table (section 2) and the atomic save pipeline (section 5).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# panic stays "unwind" (the default): abort is intentionally NOT enabled so a
+# failure during editing can unwind without discarding in-memory state.
