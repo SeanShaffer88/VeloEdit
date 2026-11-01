@@ -3,6 +3,65 @@
 All notable changes to VeloEdit are recorded here. Versions follow the
 release asset naming in the specification.
 
+## [1.1.0] — Unreleased
+
+### Added
+
+- Scoped search core: find, count, and replace-all can be limited
+  to a byte range (for example the current selection); only matches
+  lying fully inside the range are reported or replaced, and a
+  scoped replace-all is still a single undo step.
+- Masked byte search core: patterns like `4A ?? FF 00 2B` with
+  per-nibble wildcards (`4?`, `?F`) find binary sequences in hex
+  data, streaming over the document like plain search.
+- Line operations core: sort the lines in a range (byte-wise,
+  stable, each line keeping its own line ending) or remove
+  duplicate lines keeping the first occurrence — each as a single
+  undo step, refusing ranges over 64 MB.
+- Search in selection (window): the find bar gains an "In
+  selection" toggle — with a selection made, Find Next, the match
+  count, and Replace All work only inside it (Replace All stays
+  one undo step); with no selection, the bar says so.
+- Masked search (window): in hex mode, a find text that parses as
+  a byte pattern (it contains a space or a `?`, like `4A ?? FF`)
+  searches by pattern, with the same match navigation and
+  highlighting as a plain hex find. Patterns are find-only;
+  replace reports that instead of guessing.
+- Sort / dedup (window): Edit ▸ Sort Lines in Selection and Edit
+  ▸ Remove Duplicate Lines in Selection, enabled when a selection
+  exists; an over-limit range is refused with an explanation.
+- File splitter: `--split <FILE> --part-size <SIZE>` (sizes like
+  `500M` or `4G`) writes `<name>.part001`, `.part002`, … parts,
+  streamed, and File ▸ Split File Copy… does the same from the
+  window through a small dialog (part size in MB, default 4096),
+  splitting a copy in a `<name>-parts` folder and reporting the
+  part count. At most 10,000 parts are made.
+- Explorer menu item (opt-in): `--install-shell` adds an "Open in
+  VeloEdit" entry to the Explorer right-click menu for all files
+  (current user only, no administrator rights);
+  `--uninstall-shell` removes it, `--clean` removes it too, and
+  File ▸ Explorer Menu Item toggles it from the window. This is
+  the only registry entry the program ever writes.
+- Benchmark harness: `scripts/Run-Benchmarks.ps1` builds sparse
+  test files (1 GB by default) and times cold launch, find,
+  save-copy, and extract with peak memory, and a manual-only
+  GitHub workflow runs it at 1 GB on a Windows runner and uploads
+  the table.
+
+### Changed
+
+- Piece lookups are now logarithmic: a Fenwick weight index over
+  the piece lengths replaces the linear piece scan for offset
+  lookups, and neighbouring pieces pointing at contiguous bytes in
+  the same store are merged automatically once the table grows
+  past 8,192 pieces.
+- Line indexing is faster and parallel: newline counting processes
+  eight bytes per step with word-parallel (SWAR) bit tricks, and
+  the initial index build counts blocks on up to eight worker
+  threads, producing checkpoints identical to the serial build.
+- Search scanning uses the same word-parallel technique to filter
+  candidate positions before verifying them; results are unchanged.
+
 ## [1.0.1] — Unreleased
 
 ### Fixed
