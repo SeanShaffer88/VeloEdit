@@ -54,7 +54,8 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Controls::{
-    DRAWITEMSTRUCT, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTTOOLINFOW,
+    DRAWITEMSTRUCT, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_TRACKACTIVATE, TTM_TRACKPOSITION,
+    TTTOOLINFOW,
 };
 use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -68,13 +69,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::cli::{CliOptions, Mode as CliMode};
 use crate::editor::{Editor, EditorMode};
 use crate::encoding;
+use crate::filter::FilterView;
 use crate::hexview;
 use crate::line_index::{LineIndex, LineIndexBuilder};
 use crate::mmap_win::MmapFile;
-use crate::piece_table::PieceTable;
+use crate::piece_table::{OriginalBuffer, PieceTable};
+use crate::pointers::JumpHistory;
 use crate::save::SaveOptions;
 use crate::search::{self, SearchOptions};
 use crate::settings::{Settings, DEFAULT_FONT_SIZE};
+use crate::strings::FoundString;
 use crate::theme::{Rgba, Theme, ACCENT_PRESETS};
 
 // ---------------------------------------------------------------------------
@@ -122,6 +126,24 @@ const CMD_DO_REPLACE: usize = 1043;
 const CMD_DO_REPLACE_ALL: usize = 1044;
 const CMD_FIND_CLOSE: usize = 1045;
 const CMD_FIND_SCOPE: usize = 1046;
+// Roadmap slice R4b (view wiring): Follow Tail / Ghost Tail
+// (item 22), structural filter (item 18), word wrap (item 19),
+// strings pane, delimiter grid, entropy strip, time-delta gutter,
+// freeze pane, focus dimming, ANSI colours + control-character
+// tags (item 30 expansion), jump history (item 11 wiring).
+const CMD_FOLLOW_TAIL: usize = 1030;
+const CMD_FILTER: usize = 1033;
+const CMD_WORD_WRAP: usize = 1034;
+const CMD_STRINGS: usize = 1035;
+const CMD_GRID: usize = 1036;
+const CMD_ENTROPY: usize = 1037;
+const CMD_TIME_DELTAS: usize = 1038;
+const CMD_FREEZE: usize = 1039;
+const CMD_DIM: usize = 1040;
+const CMD_ANSI: usize = 1047;
+const CMD_CTL_CHARS: usize = 1048;
+const CMD_JUMP_BACK: usize = 1049;
+const CMD_JUMP_FORWARD: usize = 1050;
 const CMD_THEME_BASE: usize = 3000; // + theme index (20 themes)
 const CMD_ACCENT_BASE: usize = 3100; // 0 = theme default, 1..=11 presets, then Custom…
 const CMD_ACCENT_CUSTOM: usize = CMD_ACCENT_BASE + 1 + ACCENT_PRESETS.len();
@@ -629,6 +651,49 @@ menu to go back to what you had. Your choices are stored in\r\n\
 the data folder next to the program — VeloEdit is fully portable and\r\n\
 works completely offline.\r\n\
 \r\n\
+MORE WAYS TO LOOK\r\n\
+View \u{25B8} Follow Tail keeps an eye on a file that is still being\r\n\
+written (a log, for instance): when the file grows and you have\r\n\
+not edited it, the new lines simply arrive — nothing reloads and\r\n\
+your place is kept. The status bar reads Following while it is on.\r\n\
+Search \u{25B8} Filter\u{2026} shows only the lines that contain a word\r\n\
+or phrase, each with its real line number. Walk the rows with the\r\n\
+arrow keys; Enter jumps back to the full file at that line, and\r\n\
+Esc goes back without moving. You cannot type while the filter\r\n\
+is up — the status bar says what is happening.\r\n\
+View \u{25B8} Word Wrap folds long lines at the edge of the window\r\n\
+instead of letting them run off it. Wrapping is only how lines\r\n\
+are shown; the file never changes.\r\n\
+View \u{25B8} Strings Pane lists the readable text found inside a\r\n\
+binary file along the bottom of the window; double-click one to\r\n\
+jump to where it sits. View \u{25B8} Entropy Strip draws a thin\r\n\
+rainbow-like bar under the toolbar — packed or encrypted parts\r\n\
+of a file glow in the accent colour, plain text stays dark — and\r\n\
+clicking the bar jumps the view to that part of the file.\r\n\
+View \u{25B8} Time Deltas is for log files: when lines begin with a\r\n\
+time, the gutter shows how long passed between one line and the\r\n\
+next. View \u{25B8} Delimiter Grid lines up comma, tab, semicolon\r\n\
+or pipe separated values into columns — display only: positions\r\n\
+and copying still use the file's real text. View \u{25B8} Freeze\r\n\
+Top Lines\u{2026} pins the first lines (a header row, say) at the top\r\n\
+while the rest scrolls; frozen lines can be looked at but not\r\n\
+edited. View \u{25B8} Dim Inactive Paragraphs fades everything\r\n\
+except the block of lines you are working in.\r\n\
+View \u{25B8} ANSI Colours paints the colour codes found in\r\n\
+terminal logs as real colours, and View \u{25B8} Show Control\r\n\
+Characters shows invisible control bytes as small tags like ^A.\r\n\
+With either on, the window may paint text wider or narrower than\r\n\
+the byte columns the status bar reports — the status bar always\r\n\
+tells the truth about the file.\r\n\
+Resting the mouse pointer on a scrollbar tick (a match or a\r\n\
+bookmark) shows which line it belongs to. In hex mode,\r\n\
+Ctrl+click a byte — or put the caret on it and press Ctrl+Enter —\r\n\
+to follow a stored pointer to where it points, and Alt+Left /\r\n\
+Alt+Right walk back and forward through your jumps. The Data\r\n\
+Inspector also grows a Bits row in hex mode: eight boxes for the\r\n\
+byte at the caret, and clicking a box flips that bit (undo works\r\n\
+as usual).\r\n\
+\r\n\
 READING THE WINDOW\r\n\
 The toolbar buttons carry small icons beside their words, and\r\n\
 the Text / Hex switch is one joined control with the side in\r\n\
@@ -886,9 +951,58 @@ struct Brushes {
     selection: *mut c_void,
     match_bg: *mut c_void,
     accent: *mut c_void,
+    /// The 16 ANSI SGR foreground colours (item 30 expansion),
+    /// indices 0..8 = codes 30..37, 8..16 = codes 90..97.
+    ansi: [*mut c_void; 16],
+    /// The entropy strip's colour ramp (16 steps from the panel
+    /// colour to the accent).
+    ramp: [*mut c_void; 16],
 }
 
+/// The ANSI SGR foreground palette: the standard terminal colours,
+/// chosen bright enough to read on the dark themes. Codes 30–37
+/// index 0..8, bright codes 90–97 index 8..16.
+const ANSI_PALETTE: [Rgba; 16] = [
+    Rgba::rgb(0x66, 0x66, 0x70),
+    Rgba::rgb(0xE0, 0x52, 0x52),
+    Rgba::rgb(0x4C, 0xC3, 0x8A),
+    Rgba::rgb(0xE5, 0xC0, 0x7B),
+    Rgba::rgb(0x5B, 0x8D, 0xEF),
+    Rgba::rgb(0xC6, 0x78, 0xDD),
+    Rgba::rgb(0x56, 0xB6, 0xC2),
+    Rgba::rgb(0xD4, 0xD4, 0xD8),
+    Rgba::rgb(0x8A, 0x8A, 0x93),
+    Rgba::rgb(0xFF, 0x6B, 0x6B),
+    Rgba::rgb(0x69, 0xDB, 0x7C),
+    Rgba::rgb(0xFF, 0xD4, 0x3B),
+    Rgba::rgb(0x74, 0xC0, 0xFC),
+    Rgba::rgb(0xE5, 0x99, 0xF7),
+    Rgba::rgb(0x66, 0xD9, 0xE8),
+    Rgba::rgb(0xF8, 0xF9, 0xFA),
+];
+
 impl Brushes {
+    /// Build the full brush set for a theme against a live target.
+    fn build(target: *mut c_void, t: &Theme) -> Brushes {
+        Brushes {
+            bg: make_brush(target, t.bg),
+            panel: make_brush(target, t.panel),
+            text: make_brush(target, t.text),
+            muted: make_brush(target, t.muted),
+            line: make_brush(target, t.line),
+            gutter: make_brush(target, t.gutter_bg),
+            band: make_brush(target, blend_rgba(t.bg, t.panel, 0.5)),
+            gutter_num: make_brush(target, blend_rgba(t.muted, t.text, 0.5)),
+            selection: make_brush(target, t.selection),
+            match_bg: make_brush(target, t.match_bg),
+            accent: make_brush(target, t.accent),
+            ansi: std::array::from_fn(|i| make_brush(target, ANSI_PALETTE[i])),
+            ramp: std::array::from_fn(|i| {
+                make_brush(target, blend_rgba(t.panel, t.accent, i as f32 / 15.0))
+            }),
+        }
+    }
+
     fn release_all(&mut self) {
         for ptr in [
             &mut self.bg,
@@ -902,7 +1016,11 @@ impl Brushes {
             &mut self.selection,
             &mut self.match_bg,
             &mut self.accent,
-        ] {
+        ]
+        .into_iter()
+        .chain(self.ansi.iter_mut())
+        .chain(self.ramp.iter_mut())
+        {
             if !ptr.is_null() {
                 // SAFETY: each brush is a live ID2D1SolidColorBrush owned
                 // by this struct, released exactly once here.
@@ -953,6 +1071,89 @@ struct FindProgress {
     doc_gen: u64,
     matches: Vec<u64>,
     done: bool,
+}
+
+/// The canvas tooltip tool's id (the scrollbar tick hover preview).
+const TICK_TOOL_ID: usize = 0x7E57;
+
+thread_local! {
+    /// The tick hover preview's text buffer. The tooltip control
+    /// keeps the pointer, so the buffer is a fixed-size scratch that
+    /// is never reallocated: contents are rewritten in place before
+    /// each activation (the same deliberate-lifetime trick
+    /// `add_tooltip` uses, without leaking per control).
+    static HOVER_TEXT_SCRATCH: std::cell::RefCell<Vec<u16>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Rewrite the tick hover preview's text in place.
+fn set_hover_text(text: &str) {
+    HOVER_TEXT_SCRATCH.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        if buf.is_empty() {
+            buf.resize(512, 0);
+        }
+        let mut n = 0;
+        for unit in text.encode_utf16() {
+            if n >= 500 {
+                break;
+            }
+            buf[n] = unit;
+            n += 1;
+        }
+        buf[n] = 0;
+    });
+}
+
+/// The structural filter view's shell state (roadmap item 18): the
+/// core model plus the view's own scroll position and row cursor.
+/// The document caret never moves while the filter is up — the
+/// cursor is a row highlight, and Enter turns it into a real jump.
+struct FilterState {
+    view: FilterView,
+    /// The pattern as typed, for the banner.
+    pattern: String,
+    /// Index of the first visible filtered row.
+    first_row: usize,
+    /// The row cursor (an index into the filtered rows).
+    cursor_row: usize,
+}
+
+/// The strings worker's delivery slot: (generation, min length,
+/// results).
+type StringsSlot = Arc<Mutex<Option<(u64, u32, Vec<FoundString>)>>>;
+
+/// The entropy worker's delivery slot: (generation, values).
+type EntropySlot = Arc<Mutex<Option<(u64, Vec<f64>)>>>;
+
+/// The strings pane's shell state: the worker's slot and the UI
+/// mirror, epoch-guarded like the background find (the generation
+/// bumps on every document change — open, edit, save).
+struct StringsState {
+    slot: StringsSlot,
+    gen: u64,
+    results: Vec<FoundString>,
+    /// Index of the first visible result row in the pane.
+    first: usize,
+    /// The selected result row, drawn highlighted.
+    selected: Option<usize>,
+    searching: bool,
+    /// The generation the held `results` belong to; a mismatch with
+    /// `gen` means a rescan is owed.
+    scanned_gen: u64,
+    /// The minimum length the held results were scanned with.
+    scanned_min_len: u32,
+}
+
+/// The entropy strip's shell state: the worker's slot and the UI
+/// mirror, with its own generation (bumped wherever the strings
+/// generation bumps).
+struct EntropyState {
+    slot: EntropySlot,
+    gen: u64,
+    values: Vec<f64>,
+    computing: bool,
+    scanned_gen: u64,
 }
 
 struct App {
@@ -1112,6 +1313,54 @@ struct App {
     /// with the epoch they were spawned for, and the tick drops
     /// publications from older epochs.
     index_epoch: u64,
+    // --- Roadmap slice R4b (view wiring) -----------------------------
+    /// One-shot status-bar note (a pointer jump's origin, a Ghost
+    /// Tail growth summary): appended to the next status refresh,
+    /// then cleared by the next caret move or edit.
+    status_note: Option<String>,
+    /// Ghost Tail: the view was at the end of the document when a
+    /// growth was adopted; when the resumed index completes, pin
+    /// the view to the new end once.
+    tail_pin_view: bool,
+    /// The structural filter view (item 18), while active.
+    filter: Option<FilterState>,
+    /// The strings pane's state.
+    strings: StringsState,
+    /// The entropy strip's state (worker + mirror).
+    entropy: EntropyState,
+    /// Entropy strip on/off (session-only, like relative offsets).
+    entropy_on: bool,
+    /// Delimiter grid on/off (session-only).
+    grid_on: bool,
+    /// Time-delta gutter on/off (session-only).
+    deltas_on: bool,
+    /// Focus dimming on/off (session-only).
+    dim_on: bool,
+    /// ANSI colour rendering on/off (session-only).
+    ansi_on: bool,
+    /// Control-character glyph tags on/off (session-only).
+    ctl_on: bool,
+    /// Pointer-follow jump history (item 11 wiring): pushed at the
+    /// shell's jump points, cleared on open.
+    jump_history: JumpHistory,
+    /// The main tooltip control, kept so the scrollbar tick hover
+    /// preview can drive its tracking tool.
+    tooltip: HWND,
+    /// The canvas tooltip tool was registered.
+    hover_tool_ready: bool,
+    /// The tick the hover preview currently shows, as
+    /// `(offset, is_bookmark)`.
+    hover_shown: Option<(u64, bool)>,
+    /// The hover candidate under the pointer and when it settled:
+    /// `(offset, is_bookmark, since)`.
+    hover_cand: Option<(u64, bool, Instant)>,
+    /// The Data Inspector's bit boxes from the last render (DIPs),
+    /// bit 7 first, plus the caret offset and byte they mirror.
+    bit_boxes: Vec<(f32, f32, f32, f32)>,
+    bit_mirror: Option<(u64, u8)>,
+    /// The strings pane's min-length chips from the last render:
+    /// `(min_len, rect in DIPs)`.
+    strings_chips: Vec<(u32, (f32, f32, f32, f32))>,
 }
 
 impl App {
@@ -1135,6 +1384,17 @@ impl App {
         self.doc_generation += 1;
         self.last_edit = Some(Instant::now());
         self.hex_nibble = None;
+        self.status_note = None;
+        self.tail_pin_view = false;
+        // The strings pane and the entropy strip describe the
+        // document's bytes; an edit makes their held results stale
+        // (their workers are epoch-guarded on these generations).
+        self.strings.gen += 1;
+        self.entropy.gen += 1;
+        // A filter view describes the pre-edit document; editing is
+        // refused while it is up, and this drop is the belt to that
+        // braces for programmatic edit paths.
+        self.filter = None;
         // An edit invalidates a background find exactly like the
         // editor's own match list (which the editor clears itself):
         // drop the mirrored matches — and their scrollbar ticks —
@@ -1231,20 +1491,7 @@ fn ensure_target(app: &mut App) {
         return;
     }
     app.target = target;
-    let t = &app.theme;
-    app.brushes = Some(Brushes {
-        bg: make_brush(target, t.bg),
-        panel: make_brush(target, t.panel),
-        text: make_brush(target, t.text),
-        muted: make_brush(target, t.muted),
-        line: make_brush(target, t.line),
-        gutter: make_brush(target, t.gutter_bg),
-        band: make_brush(target, blend_rgba(t.bg, t.panel, 0.5)),
-        gutter_num: make_brush(target, blend_rgba(t.muted, t.text, 0.5)),
-        selection: make_brush(target, t.selection),
-        match_bg: make_brush(target, t.match_bg),
-        accent: make_brush(target, t.accent),
-    });
+    app.brushes = Some(Brushes::build(target, &app.theme));
 }
 
 /// Pick the first available family from the SPEC.md section 4.2 chain
@@ -1410,6 +1657,17 @@ struct Layout {
     /// this; the chrome (accent strip, row washes, status bar) uses
     /// the full `width`.
     editor_right: f32,
+    /// Top of the first text/hex row: below the entropy strip and
+    /// the filter banner when either is showing (R4b).
+    rows_top: f32,
+    /// Bottom of the rows region: above the strings pane when it is
+    /// docked open (R4b).
+    rows_bottom: f32,
+    /// Width of the time-delta gutter column inside the gutter
+    /// (0 while the time-delta gutter is off or in hex mode).
+    delta_w: f32,
+    /// Height of the strings pane (0 while closed).
+    strings_h: f32,
 }
 
 fn compute_layout(app: &mut App) -> Layout {
@@ -1422,10 +1680,17 @@ fn compute_layout(app: &mut App) -> Layout {
         + TOOLBAR_H
         + if app.change_visible { CHANGEBAR_H } else { 0.0 }
         + if app.find_visible { FINDBAR_H } else { 0.0 };
+    // Time-delta gutter (R4b): an extra column inside the text
+    // gutter, wide enough for "+999.9s"-shaped deltas.
+    let delta_w = if app.deltas_on && app.editor.mode() == EditorMode::Text {
+        DELTA_GUTTER_CHARS * app.char_w
+    } else {
+        0.0
+    };
     let gutter_w = match app.editor.mode() {
         EditorMode::Text => {
             let digits = app.editor.line_count().max(1).to_string().len() as f32;
-            (digits + 2.0) * app.char_w + TEXT_PAD
+            (digits + 2.0) * app.char_w + TEXT_PAD + delta_w
         }
         EditorMode::Hex => 18.0 * app.char_w + TEXT_PAD,
     };
@@ -1434,12 +1699,31 @@ fn compute_layout(app: &mut App) -> Layout {
     } else {
         width
     };
+    let bottom = (height - STATUS_H).max(top);
+    let strings_h = if app.settings.strings_open {
+        STRINGS_HEADER_H + STRINGS_ROWS as f32 * app.line_h
+    } else {
+        0.0
+    };
+    // The entropy strip and the filter banner sit between the
+    // chrome bars and the first row.
+    let rows_top = top
+        + if app.entropy_on { ENTROPY_H } else { 0.0 }
+        + if app.filter.is_some() {
+            app.line_h
+        } else {
+            0.0
+        };
     Layout {
         editor_top: top,
-        editor_bottom: (height - STATUS_H).max(top),
+        editor_bottom: bottom,
         width,
         gutter_w,
         editor_right,
+        rows_top,
+        rows_bottom: (bottom - strings_h).max(rows_top),
+        delta_w,
+        strings_h,
     }
 }
 
@@ -1473,8 +1757,420 @@ fn sync_hex_layout(app: &mut App) {
 
 fn page_rows(app: &mut App) -> u64 {
     let layout = compute_layout(app);
-    let rows = ((layout.editor_bottom - layout.editor_top) / app.line_h.max(1.0)).floor();
+    let rows = ((layout.rows_bottom - layout.rows_top) / app.line_h.max(1.0)).floor();
     (rows as u64).max(1)
+}
+
+/// Width of the time-delta gutter column, in character cells.
+const DELTA_GUTTER_CHARS: f32 = 10.0;
+/// Height of the entropy strip (DIPs).
+const ENTROPY_H: f32 = 6.0;
+/// Strings pane: header height (DIPs) and result rows shown.
+const STRINGS_HEADER_H: f32 = 22.0;
+const STRINGS_ROWS: u64 = 7;
+
+/// One painted row of the text view (R4b): a whole line, or one
+/// wrapped segment of a line, or one filtered line. All text-mode
+/// painting and text-mode pointer maths run over these rows, so
+/// word wrap, the freeze pane and the filter view share one exact
+/// model instead of three near-copies.
+struct DisplayRow {
+    /// The document line this row shows (0-based).
+    line_no: u64,
+    /// Byte offset where the line's content starts.
+    line_start: u64,
+    /// Byte range of THIS segment within the line's content.
+    start: u64,
+    end: u64,
+    /// Character column where this segment starts in the line
+    /// (0 for whole-line rows and continuation anchor).
+    char_start: u64,
+    /// The segment's display text (already truncated like the
+    /// editor's own rows).
+    text: String,
+    /// Part of the frozen block (painted from the top lines).
+    frozen: bool,
+}
+
+/// The character ranges a wrapped line of `char_count` characters
+/// breaks into at `cols` characters per row. An empty line still
+/// gets one (empty) row; `cols` is clamped to at least 1.
+fn wrap_char_ranges(char_count: u64, cols: u64) -> Vec<(u64, u64)> {
+    let cols = cols.max(1);
+    if char_count == 0 {
+        return vec![(0, 0)];
+    }
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < char_count {
+        let end = (at + cols).min(char_count);
+        out.push((at, end));
+        at = end;
+    }
+    out
+}
+
+/// The characters of `text` in the char range `from..to`, as a new
+/// string (char-boundary safe by construction).
+fn char_slice(text: &str, from: u64, to: u64) -> String {
+    text.chars()
+        .skip(from as usize)
+        .take((to - from) as usize)
+        .collect()
+}
+
+/// The display text for one line's content range, with exactly the
+/// editor's row truncation rules (fetch cap, character cap,
+/// truncation marker). Used for rows the editor's batch fetcher
+/// cannot address (filtered lines).
+fn line_row_text(ed: &Editor, start: u64, end: u64) -> String {
+    let fetch_len = (end - start).min(256 * 1024);
+    let bytes = ed.table().read(start, fetch_len);
+    let mut text = crate::editor::decode_lossy(&bytes, ed.encoding());
+    let truncated = fetch_len < end - start || text.chars().count() > crate::editor::MAX_ROW_CHARS;
+    if text.chars().count() > crate::editor::MAX_ROW_CHARS {
+        text = text.chars().take(crate::editor::MAX_ROW_CHARS).collect();
+    }
+    if truncated {
+        text.push_str(crate::editor::TRUNCATION_MARKER);
+    }
+    text
+}
+
+/// Whether word wrap is in effect for the text view right now:
+/// the setting is on, the view is the plain text view (never the
+/// filter view and never the delimiter grid, which has its own
+/// column model).
+fn wrap_active(app: &App) -> bool {
+    app.settings.word_wrap && app.filter.is_none() && !grid_active(app)
+}
+
+/// Whether the delimiter grid is in effect: toggled on, text mode,
+/// no filter up. (Detection itself happens per paint over the
+/// visible lines; a document with no consistent delimiter simply
+/// paints as plain text.)
+fn grid_active(app: &App) -> bool {
+    app.grid_on && app.filter.is_none() && app.editor.mode() == EditorMode::Text
+}
+
+/// Characters that fit across the text area at the current layout —
+/// the wrap column count.
+fn wrap_columns(app: &mut App) -> u64 {
+    let layout = compute_layout(app);
+    let text_w = (layout.editor_right - SCROLLBAR_W - layout.gutter_w - TEXT_PAD).max(app.char_w);
+    ((text_w / app.char_w.max(1.0)).floor() as u64).max(4)
+}
+
+/// Build the display rows for the text view, at most `max_rows`:
+/// frozen block first (when freezing is on), then the scrolled
+/// region. In the filter view, rows are the filtered lines from the
+/// filter's scroll position.
+fn display_rows(app: &mut App, max_rows: usize) -> Vec<DisplayRow> {
+    let mut out: Vec<DisplayRow> = Vec::new();
+    if app.editor.mode() != EditorMode::Text || max_rows == 0 {
+        return out;
+    }
+    if let Some(filter) = &app.filter {
+        let first = filter.first_row;
+        let total = filter.view.len();
+        for row_idx in first..total.min(first + max_rows) {
+            let Some(line) = filter.view.line_at_row(row_idx) else {
+                break;
+            };
+            let text = line_row_text(&app.editor, line.start, line.end);
+            out.push(DisplayRow {
+                line_no: line.line_no,
+                line_start: line.start,
+                start: line.start,
+                end: line.end,
+                char_start: 0,
+                text,
+                frozen: false,
+            });
+        }
+        return out;
+    }
+    let wrap = wrap_active(app);
+    let cols = if wrap { wrap_columns(app) } else { 0 };
+    let freeze = app.settings.freeze_lines as u64;
+    let push_line =
+        |app: &mut App, out: &mut Vec<DisplayRow>, row: crate::editor::TextRow, frozen: bool| {
+            if wrap {
+                let total_chars = row.text.chars().count() as u64;
+                for (cs, ce) in wrap_char_ranges(total_chars, cols) {
+                    let start = app
+                        .editor
+                        .offset_of_line_col(row.line_no, cs)
+                        .unwrap_or(row.start);
+                    let end = app
+                        .editor
+                        .offset_of_line_col(row.line_no, ce)
+                        .unwrap_or(row.end);
+                    out.push(DisplayRow {
+                        line_no: row.line_no,
+                        line_start: row.start,
+                        start,
+                        end,
+                        char_start: cs,
+                        text: char_slice(&row.text, cs, ce),
+                        frozen,
+                    });
+                    if out.len() >= max_rows {
+                        return;
+                    }
+                }
+            } else {
+                out.push(DisplayRow {
+                    line_no: row.line_no,
+                    line_start: row.start,
+                    start: row.start,
+                    end: row.end,
+                    char_start: 0,
+                    text: row.text,
+                    frozen,
+                });
+            }
+        };
+    if freeze > 0 {
+        let frozen_rows = app.editor.visible_text_rows(0, freeze as usize);
+        for row in frozen_rows {
+            if out.len() >= max_rows {
+                return out;
+            }
+            push_line(app, &mut out, row, true);
+        }
+    }
+    let first_line = app.editor.first_line().max(freeze);
+    let rest = app
+        .editor
+        .visible_text_rows(first_line, max_rows - out.len().min(max_rows));
+    for row in rest {
+        if out.len() >= max_rows {
+            break;
+        }
+        push_line(app, &mut out, row, false);
+    }
+    out
+}
+
+/// One painted run of a text row when the segment painter is
+/// active (ANSI colours and/or control-character tags): a run of
+/// ordinary characters in one SGR state, or one control character's
+/// glyph tag.
+struct PaintSeg {
+    /// What to draw (for a tag, the two-character caret notation).
+    text: String,
+    /// Character column (in the line) where this run starts.
+    char_from: u64,
+    /// Line characters this run covers (a tag covers 1).
+    char_len: u64,
+    /// Display width in character cells (a tag is 2 cells wide).
+    cells: u64,
+    /// ANSI palette index for the foreground, or `None` for the
+    /// row's ordinary brush.
+    fg: Option<usize>,
+    /// This run is a control-character glyph tag.
+    tag: bool,
+}
+
+/// Split one display row's text into painted runs (item 30
+/// expansion). With ANSI on, CSI escape sequences are consumed —
+/// SGR sequences update the colour state, other sequences are
+/// simply not painted — and the text between them becomes runs.
+/// With control tags on, a control character (other than tab)
+/// becomes a tag run with its caret notation (`^A`, `^?` for DEL).
+/// With both off the result is a single run, and callers skip this
+/// entirely. Character columns are counted in decoded characters,
+/// matching the editor's column model exactly.
+fn build_segments(text: &str, char_start: u64, ansi_on: bool, ctl_on: bool) -> Vec<PaintSeg> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut segs: Vec<PaintSeg> = Vec::new();
+    let mut fg: Option<usize> = None;
+    let mut bold = false;
+    let mut run = String::new();
+    let mut run_from = char_start;
+    let mut col = char_start;
+    let flush = |segs: &mut Vec<PaintSeg>, run: &mut String, from: u64, fg: Option<usize>| {
+        if !run.is_empty() {
+            let len = run.chars().count() as u64;
+            segs.push(PaintSeg {
+                text: std::mem::take(run),
+                char_from: from,
+                char_len: len,
+                cells: len,
+                fg,
+                tag: false,
+            });
+        }
+    };
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ansi_on && ch == '\u{1B}' && i + 1 < chars.len() && chars[i + 1] == '[' {
+            // A CSI sequence: parameter/intermediate bytes, then a
+            // final byte in 0x40..=0x7E.
+            let mut j = i + 2;
+            let mut params = String::new();
+            while j < chars.len() && ('\u{20}'..='\u{3F}').contains(&chars[j]) {
+                if ('\u{30}'..='\u{3F}').contains(&chars[j]) {
+                    params.push(chars[j]);
+                }
+                j += 1;
+            }
+            if j < chars.len() && ('\u{40}'..='\u{7E}').contains(&chars[j]) {
+                if chars[j] == 'm' {
+                    flush(&mut segs, &mut run, run_from, fg);
+                    for part in params.split(';') {
+                        let code: u32 = if part.is_empty() {
+                            0
+                        } else {
+                            part.parse().unwrap_or(u32::MAX)
+                        };
+                        match code {
+                            0 => {
+                                fg = None;
+                                bold = false;
+                            }
+                            1 => bold = true,
+                            22 => bold = false,
+                            30..=37 => fg = Some((code - 30) as usize + if bold { 8 } else { 0 }),
+                            39 => fg = None,
+                            90..=97 => fg = Some((code - 90) as usize + 8),
+                            _ => {}
+                        }
+                    }
+                    run_from = col;
+                }
+                i = j + 1;
+                continue;
+            }
+            // Unterminated sequence: fall through and treat the ESC
+            // as an ordinary control character below.
+        }
+        if ctl_on && ((ch as u32) < 0x20 && ch != '\t' || ch == '\u{7F}') {
+            flush(&mut segs, &mut run, run_from, fg);
+            let notation = match ch {
+                '\u{7F}' => "^?".to_string(),
+                _ => format!("^{}", (b'@' + (ch as u8)) as char),
+            };
+            segs.push(PaintSeg {
+                text: notation,
+                char_from: col,
+                char_len: 1,
+                cells: 2,
+                fg: None,
+                tag: true,
+            });
+            col += 1;
+            run_from = col;
+            i += 1;
+            continue;
+        }
+        run.push(ch);
+        col += 1;
+        i += 1;
+    }
+    flush(&mut segs, &mut run, run_from, fg);
+    segs
+}
+
+/// The display cell (counted from the first segment's start) of a
+/// line character column, under a segment list: ordinary
+/// characters are one cell each, a tag is two cells for its one
+/// character.
+fn seg_cell_of(segs: &[PaintSeg], col: u64) -> u64 {
+    let mut cells = 0u64;
+    for seg in segs {
+        if col <= seg.char_from {
+            break;
+        }
+        if col >= seg.char_from + seg.char_len {
+            cells += seg.cells;
+        } else {
+            cells += col - seg.char_from;
+        }
+    }
+    cells
+}
+
+/// The line character column at display cell `cell` under a segment
+/// list (the inverse of `seg_cell_of`, for pointer maths): a cell
+/// inside a tag maps to the tag's character.
+fn seg_col_of_cell(segs: &[PaintSeg], cell: u64) -> u64 {
+    let mut cells = 0u64;
+    let mut col = segs.first().map(|s| s.char_from).unwrap_or(0);
+    for seg in segs {
+        if cell < cells + seg.cells {
+            if seg.tag {
+                return seg.char_from;
+            }
+            return seg.char_from + (cell - cells).min(seg.char_len);
+        }
+        cells += seg.cells;
+        col = seg.char_from + seg.char_len;
+    }
+    col
+}
+
+/// Format a log time delta for the delta gutter: always signed,
+/// milliseconds under a second, seconds (two decimals, trimmed)
+/// under a minute and a half, minutes beyond.
+fn format_delta(ms: i64) -> String {
+    let sign = if ms < 0 { "-" } else { "+" };
+    let abs = ms.unsigned_abs();
+    if abs < 1000 {
+        format!("{sign}{abs}ms")
+    } else if abs < 90_000 {
+        let secs = abs as f64 / 1000.0;
+        let text = format!("{secs:.2}");
+        let text = text.trim_end_matches('0').trim_end_matches('.');
+        format!("{sign}{text}s")
+    } else {
+        let mins = abs as f64 / 60_000.0;
+        let text = format!("{mins:.1}");
+        let text = text.trim_end_matches('0').trim_end_matches('.');
+        format!("{sign}{text}m")
+    }
+}
+
+/// Post-move fixup for word wrap: the editor's own visibility rule
+/// is line-based, but with wrap a visible line's later segments can
+/// still sit below the fold. Advance the first line until the
+/// caret's segment is inside the display rows. A no-op whenever
+/// wrap is off (the common case costs one flag test).
+fn ensure_caret_segment_visible(app: &mut App) {
+    if !wrap_active(app) || app.editor.mode() != EditorMode::Text {
+        return;
+    }
+    // The editor's line-based pass (which always runs first) owns
+    // the caret-above-the-view case; this fixup only ever scrolls
+    // DOWN to a wrapped segment below the fold.
+    let (caret_line_now, _) = app.editor.line_col_of(app.editor.caret());
+    if caret_line_now < app.editor.first_line() {
+        return;
+    }
+    let page = page_rows(app).max(1) as usize;
+    for _ in 0..64 {
+        let rows = display_rows(app, page + 1);
+        let (caret_line, caret_col) = app.editor.line_col_of(app.editor.caret());
+        let visible = rows.iter().any(|row| {
+            row.line_no == caret_line
+                && caret_col >= row.char_start
+                && (caret_col < row.char_start + row.text.chars().count() as u64
+                    || row.char_start + row.text.chars().count() as u64
+                        == app.editor.line_char_count(caret_line))
+        });
+        if visible {
+            return;
+        }
+        // The caret sits below the visible segments: scroll one
+        // line further and re-check (bounded; each step is exact).
+        let first = app.editor.first_line();
+        app.editor.set_first_line(first + 1);
+        if app.editor.first_line() == first {
+            return;
+        }
+    }
 }
 
 /// Position every child window for the current client size / DPI /
@@ -1695,6 +2391,29 @@ fn refresh_title(app: &App) {
 
 fn refresh_status(app: &mut App) {
     let st = app.editor.status();
+    // While the structural filter is up, the left segment describes
+    // the filter, not the (frozen) document caret: the view is a
+    // read-only line picker, and the status bar says so.
+    if let Some(filter) = &app.filter {
+        let mut left = format!(
+            "Filter: {} \u{00B7} {} lines \u{00B7} row {} \u{00B7} read-only \u{00B7} Enter opens the line \u{00B7} Esc closes",
+            filter.pattern,
+            filter.view.len(),
+            if filter.view.is_empty() {
+                0
+            } else {
+                filter.cursor_row + 1
+            },
+        );
+        if !filter.view.is_complete() {
+            left.push_str(" \u{00B7} indexing\u{2026} (indexed prefix only)");
+        }
+        let wide = wstr(&left);
+        // SAFETY: our status control plus a NUL-terminated string.
+        unsafe { SetWindowTextW(app.status, wide.as_ptr()) };
+        refresh_status_right(app, &st);
+        return;
+    }
     // Left: caret position, plus the selection size when there is one.
     let mut left = format!(
         "Ln {} \u{00B7} Col {} \u{00B7} Offset {}",
@@ -1717,6 +2436,14 @@ fn refresh_status(app: &mut App) {
         // column is counting from this base.
         left.push_str(&format!(" \u{00B7} Offsets from base 0x{:X}", app.rel_base));
     }
+    if app.settings.follow_tail && app.editor.path().is_some() {
+        // Follow Tail (Ghost Tail, item 22) is armed: say so
+        // quietly whenever the document is file-backed.
+        left.push_str(" \u{00B7} Following");
+    }
+    if let Some(note) = &app.status_note {
+        left.push_str(&format!(" \u{00B7} {note}"));
+    }
     if let Some((indexed, total)) = app.indexing {
         // The staged line index is still building: report its
         // percentage. The status bar never presents the partial
@@ -1732,10 +2459,16 @@ fn refresh_status(app: &mut App) {
     let wide = wstr(&left);
     // SAFETY: our status control plus a NUL-terminated string.
     unsafe { SetWindowTextW(app.status, wide.as_ptr()) };
-    // Right: the zoom readout (polish pass — 100% is the default
-    // font size; this refresh runs on every font change, menu or
-    // Ctrl+wheel alike, so the percentage is always live), then
-    // the document facts.
+    refresh_status_right(app, &st);
+}
+
+/// The status bar's right segment: zoom readout, then the document
+/// facts. Split out of `refresh_status` because the filter view
+/// replaces the left segment but keeps these facts.
+fn refresh_status_right(app: &App, st: &crate::editor::StatusInfo) {
+    // The zoom readout (polish pass — 100% is the default font
+    // size; this refresh runs on every font change, menu or
+    // Ctrl+wheel alike, so the percentage is always live).
     let mut right = format!(
         "{}% \u{00B7} {} \u{00B7} {} \u{00B7} {}",
         zoom_percent(app.settings.font_size),
@@ -1765,6 +2498,14 @@ fn refresh_status(app: &mut App) {
 /// view's true position and extent within the file and settles into
 /// line units when the complete index lands.
 fn scroll_metrics(app: &mut App) -> (u64, u64, u64) {
+    // The filter view scrolls its own row list (R4b).
+    if let Some(filter) = &app.filter {
+        return (
+            filter.view.len() as u64,
+            filter.first_row as u64,
+            page_rows(app),
+        );
+    }
     let (total, first) = match app.editor.mode() {
         EditorMode::Text => {
             if app.editor.index_is_partial() {
@@ -1979,6 +2720,141 @@ fn inspector_rows(report: &crate::inspector::InspectorReport, caret: u64) -> Vec
     ]
 }
 
+/// The facts one text row's painting needs beyond the row itself,
+/// gathered once per paint by `render` and shared by the plain,
+/// wrapped, filtered and grid row painters.
+struct RowPaint<'a> {
+    caret_line: u64,
+    caret_col: u64,
+    caret_line_chars: u64,
+    selection: Option<(u64, u64)>,
+    matches: &'a [u64],
+    match_len: u64,
+    current_match: Option<(u64, u64)>,
+    bookmarks: &'a [u64],
+    deltas: &'a std::collections::HashMap<u64, i64>,
+    dim_range: Option<(u64, u64)>,
+    seg_mode: bool,
+    in_filter: bool,
+}
+
+/// Whether a line's content is blank for the paragraph model
+/// (spaces, tabs and carriage returns only; a line that cannot be
+/// read counts as blank — a separator, never content).
+fn line_is_blank(ed: &mut Editor, line: u64) -> bool {
+    match ed.line_content_range(line) {
+        Some((start, end)) => {
+            let bytes = ed.table().read(start, (end - start).min(512));
+            bytes.iter().all(|&b| b == b' ' || b == b'\t' || b == b'\r')
+        }
+        None => true,
+    }
+}
+
+/// The caret's paragraph for focus dimming (R4b): the run of
+/// non-blank lines containing `line`, bounded to 5000 lines each
+/// way so a pathological unbroken file costs a bounded scan. A
+/// caret on a blank line is its own paragraph.
+fn paragraph_range(app: &mut App, line: u64) -> Option<(u64, u64)> {
+    if line_is_blank(&mut app.editor, line) {
+        return Some((line, line));
+    }
+    let mut lo = line;
+    while lo > 0 && lo > line.saturating_sub(5000) && !line_is_blank(&mut app.editor, lo - 1) {
+        lo -= 1;
+    }
+    let count = app.editor.line_count();
+    let mut hi = line;
+    while hi + 1 < count && hi < line + 5000 && !line_is_blank(&mut app.editor, hi + 1) {
+        hi += 1;
+    }
+    Some((lo, hi))
+}
+
+/// The delimiter grid model over the visible display rows (R4b):
+/// the detected delimiter and the widest field per column, in
+/// characters (capped so one rogue field cannot push the rest of
+/// the grid off-screen).
+fn grid_model(
+    app: &mut App,
+    disp: &[DisplayRow],
+) -> Option<(crate::delimited::Delimiter, Vec<u64>)> {
+    let enc = app.editor.encoding();
+    let contents: Vec<Vec<u8>> = disp
+        .iter()
+        .filter(|r| r.char_start == 0)
+        .map(|r| {
+            app.editor
+                .table()
+                .read(r.line_start, (r.end - r.line_start).min(GRID_FETCH_BYTES))
+        })
+        .collect();
+    let refs: Vec<&[u8]> = contents.iter().map(|c| c.as_slice()).collect();
+    let delim = crate::delimited::detect_delimiter(&refs)?;
+    let mut widths: Vec<u64> = Vec::new();
+    for content in &contents {
+        for (fi, (fs, fe)) in crate::delimited::split_line(content, delim)
+            .into_iter()
+            .enumerate()
+        {
+            let n = crate::editor::decode_lossy(&content[fs as usize..fe as usize], enc)
+                .chars()
+                .count() as u64;
+            if widths.len() <= fi {
+                widths.resize(fi + 1, 0);
+            }
+            widths[fi] = widths[fi].max(n).min(GRID_COL_MAX_CHARS);
+        }
+    }
+    Some((delim, widths))
+}
+
+/// Field byte fetches for the grid are capped like row fetches.
+const GRID_FETCH_BYTES: u64 = 256 * 1024;
+/// Gap between grid columns, in character cells.
+const GRID_GAP_CHARS: u64 = 2;
+/// Widest grid column, in characters.
+const GRID_COL_MAX_CHARS: u64 = 120;
+
+/// Time-delta gutter values for the visible lines (R4b): each
+/// line's delta from the line before it, computed over the visible
+/// range plus one line of look-behind (the first visible line's
+/// delta is real too).
+fn row_deltas_map(app: &mut App, disp: &[DisplayRow]) -> std::collections::HashMap<u64, i64> {
+    let mut out = std::collections::HashMap::new();
+    let mut lines: Vec<u64> = disp
+        .iter()
+        .filter(|r| r.char_start == 0)
+        .map(|r| r.line_no)
+        .collect();
+    lines.dedup();
+    let Some(&first) = lines.first() else {
+        return out;
+    };
+    let Some(&last) = lines.last() else {
+        return out;
+    };
+    let from = first.saturating_sub(1);
+    let mut contents: Vec<Vec<u8>> = Vec::new();
+    let mut present: Vec<u64> = Vec::new();
+    for line in from..=last {
+        // The timestamp sits at the line's start, so a prefix is
+        // everything the parser needs.
+        if let Some((start, end)) = app.editor.line_content_range(line) {
+            contents.push(app.editor.table().read(start, (end - start).min(4096)));
+            present.push(line);
+        }
+    }
+    let refs: Vec<&[u8]> = contents.iter().map(|c| c.as_slice()).collect();
+    let deltas = crate::timedeltas::line_time_deltas(refs.iter().copied());
+    for (i, &line) in present.iter().enumerate() {
+        if let Some(Some(delta)) = deltas.get(i) {
+            out.insert(line, *delta);
+        }
+    }
+    out
+}
+
 fn render(app: &mut App) {
     ensure_format(app);
     ensure_target(app);
@@ -1987,7 +2863,7 @@ fn render(app: &mut App) {
     }
     let layout = compute_layout(app);
     let visible =
-        (((layout.editor_bottom - layout.editor_top) / app.line_h.max(1.0)).ceil() as usize).max(1);
+        (((layout.rows_bottom - layout.rows_top) / app.line_h.max(1.0)).ceil() as usize).max(1);
     let selection = app.editor.selection_range();
     let current_match = display_current_match(app);
     // Every match start (all matches share the needle's byte length),
@@ -2004,27 +2880,62 @@ fn render(app: &mut App) {
     let (sb_total, sb_first, sb_page) = scroll_metrics(app);
     let (caret_line, caret_col) = app.editor.line_col_of(app.editor.caret());
     let caret = app.editor.caret();
+    let caret_line_chars = app.editor.line_char_count(caret_line);
+    let in_filter = app.filter.is_some();
+    let seg_mode = app.ansi_on || app.ctl_on;
 
     // Gather rows first; the draw pass below uses no &mut editor calls.
     enum RowData {
-        Text(Vec<crate::editor::TextRow>),
+        Text(Vec<DisplayRow>),
         Hex(Vec<crate::editor::HexRow>),
     }
     let rows = match app.editor.mode() {
-        EditorMode::Text => RowData::Text(
-            app.editor
-                .visible_text_rows(app.editor.first_line(), visible),
-        ),
+        EditorMode::Text => RowData::Text(display_rows(app, visible)),
         EditorMode::Hex => {
             RowData::Hex(app.editor.visible_hex_rows(app.editor.first_row(), visible))
         }
+    };
+    // Delimiter grid model over the visible lines (R4b).
+    let grid = match &rows {
+        RowData::Text(disp) if grid_active(app) => grid_model(app, disp),
+        _ => None,
+    };
+    // Time-delta gutter values per visible line (R4b).
+    let row_deltas: std::collections::HashMap<u64, i64> =
+        if app.deltas_on && matches!(rows, RowData::Text(_)) && !in_filter {
+            match &rows {
+                RowData::Text(disp) => row_deltas_map(app, disp),
+                _ => std::collections::HashMap::new(),
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+    // Focus dimming (R4b): the caret's paragraph.
+    let dim_range: Option<(u64, u64)> =
+        if app.dim_on && matches!(rows, RowData::Text(_)) && !in_filter {
+            paragraph_range(app, caret_line)
+        } else {
+            None
+        };
+    let paint = RowPaint {
+        caret_line,
+        caret_col,
+        caret_line_chars,
+        selection,
+        matches: &all_matches,
+        match_len,
+        current_match,
+        bookmarks: &bookmark_offsets,
+        deltas: &row_deltas,
+        dim_range,
+        seg_mode,
+        in_filter,
     };
 
     let target = app.target;
     let brushes = app.brushes.as_ref().expect("checked above");
     let format = app.text_format;
     let table = app.editor.table();
-    let enc = app.editor.encoding();
     // SAFETY: slots 48/49/47 are BeginDraw/EndDraw/Clear per d2d1.h,
     // resolved from the live render target.
     let begin: unsafe extern "system" fn(*mut c_void) = unsafe { vfn(target, SLOT_RT_BEGIN_DRAW) };
@@ -2046,6 +2957,8 @@ fn render(app: &mut App) {
     let top = layout.editor_top;
     let bottom = layout.editor_bottom;
     let width = layout.width;
+    let rtop = layout.rows_top;
+    let rbottom = layout.rows_bottom;
     // The accent strip along the very top of the client area.
     fill_rect(
         fill,
@@ -2058,7 +2971,7 @@ fn render(app: &mut App) {
         },
         brushes.accent,
     );
-    // Gutter background for the editor strip.
+    // Gutter background for the rows strip.
     fill_rect(
         fill,
         target,
@@ -2066,159 +2979,132 @@ fn render(app: &mut App) {
             left: 0.0,
             top,
             right: layout.gutter_w,
-            bottom,
+            bottom: rbottom,
         },
         brushes.gutter,
     );
 
+    // The entropy strip (R4b): one colour step per block across the
+    // whole file, panel colour (low) to accent (high). Adjacent
+    // columns at the same ramp level merge into one fill.
+    if app.entropy_on {
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: 0.0,
+                top,
+                right: layout.editor_right,
+                bottom: top + ENTROPY_H,
+            },
+            brushes.panel,
+        );
+        if !app.entropy.values.is_empty() && layout.editor_right > 0.0 {
+            let n = app.entropy.values.len();
+            let w = layout.editor_right;
+            let level_at = |x: f32| -> usize {
+                let idx = ((x / w) * n as f32) as usize;
+                let v = app.entropy.values[idx.min(n - 1)];
+                ((v / 8.0) * 15.0).round().clamp(0.0, 15.0) as usize
+            };
+            let mut run_start = 0.0f32;
+            let mut run_level = level_at(0.0);
+            let mut x = 1.0f32;
+            while x <= w {
+                let level = if x >= w { usize::MAX } else { level_at(x) };
+                if level != run_level {
+                    fill_rect(
+                        fill,
+                        target,
+                        D2dRectF {
+                            left: run_start,
+                            top,
+                            right: x.min(w),
+                            bottom: top + ENTROPY_H,
+                        },
+                        brushes.ramp[run_level],
+                    );
+                    run_start = x;
+                    run_level = level;
+                }
+                x += 1.0;
+            }
+        }
+    }
+
+    // The filter banner (R4b): replaces the ruler row while the
+    // filter view is up, naming the pattern and the row count.
+    if let Some(filter) = &app.filter {
+        let by = rtop - app.line_h;
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: 0.0,
+                top: by,
+                right: width,
+                bottom: by + app.line_h,
+            },
+            brushes.panel,
+        );
+        let mut label = format!("Filter: {} ({} lines)", filter.pattern, filter.view.len());
+        if !filter.view.is_complete() {
+            label.push_str(&format!(
+                " \u{00B7} still indexing \u{00B7} matches in the first {} so far",
+                human_size(filter.view.indexed_bytes())
+            ));
+        }
+        draw_text(
+            draw,
+            target,
+            format,
+            &label,
+            D2dRectF {
+                left: TEXT_PAD,
+                top: by,
+                right: width - TEXT_PAD,
+                bottom: by + app.line_h,
+            },
+            brushes.text,
+        );
+    }
+
     match &rows {
-        RowData::Text(text_rows) => {
-            for (i, row) in text_rows.iter().enumerate() {
-                let y = top + i as f32 * app.line_h;
-                // Current-line band (polish pass): a raised strip
-                // behind the caret's row — background blended
-                // halfway toward the panel colour — spanning the
-                // text area only, not the gutter. It goes first, so
-                // match, selection, and text all draw over it.
-                if row.line_no == caret_line {
+        RowData::Text(disp) => {
+            let frozen_count = disp.iter().take_while(|r| r.frozen).count();
+            if let Some((delim, widths)) = &grid {
+                paint_grid_rows(app, disp, *delim, widths, &layout, &paint);
+            } else {
+                for (i, row) in disp.iter().enumerate() {
+                    let y = rtop + i as f32 * app.line_h;
+                    if y >= rbottom {
+                        break;
+                    }
+                    let banded = if in_filter {
+                        app.filter
+                            .as_ref()
+                            .map(|f| f.first_row + i == f.cursor_row)
+                            .unwrap_or(false)
+                    } else {
+                        row.line_no == caret_line
+                    };
+                    paint_text_row(app, row, y, &layout, banded, &paint);
+                }
+            }
+            // Freeze divider (R4b): a rule under the pinned block.
+            if frozen_count > 0 && !in_filter && grid.is_none() {
+                let fy = rtop + frozen_count as f32 * app.line_h;
+                if fy < rbottom {
                     fill_rect(
                         fill,
                         target,
                         D2dRectF {
-                            left: layout.gutter_w,
-                            top: y,
+                            left: 0.0,
+                            top: fy,
                             right: layout.editor_right,
-                            bottom: y + app.line_h,
+                            bottom: fy + 1.0,
                         },
-                        brushes.band,
-                    );
-                }
-                // Find-match highlights: every match overlapping this
-                // row gets the match wash; the current match also gets
-                // an accent outline so it stands out from the rest.
-                if match_len > 0 {
-                    let lo = row.start.saturating_sub(match_len);
-                    let begin = all_matches.partition_point(|&m| m < lo);
-                    for &ms in &all_matches[begin..] {
-                        if ms >= row.end {
-                            break;
-                        }
-                        let me = ms + match_len;
-                        if me <= row.start {
-                            continue;
-                        }
-                        let c0 = col_of_byte(table, enc, row.start, ms);
-                        let c1 = col_of_byte(table, enc, row.start, me.min(row.end));
-                        let rect = D2dRectF {
-                            left: layout.gutter_w + TEXT_PAD + c0 * app.char_w,
-                            top: y,
-                            right: layout.gutter_w + TEXT_PAD + c1 * app.char_w,
-                            bottom: y + app.line_h,
-                        };
-                        fill_rect(fill, target, rect, brushes.match_bg);
-                        if current_match == Some((ms, me)) {
-                            outline_rect(draw_rect, target, rect, brushes.accent);
-                        }
-                    }
-                }
-                // Selection highlight.
-                if let Some((ss, se)) = selection {
-                    if se > row.start && ss <= row.end {
-                        let from = ss.max(row.start);
-                        let c0 = col_of_byte(table, enc, row.start, from);
-                        let x1 = if se > row.end {
-                            layout.editor_right
-                        } else {
-                            layout.gutter_w
-                                + TEXT_PAD
-                                + col_of_byte(table, enc, row.start, se) * app.char_w
-                        };
-                        fill_rect(
-                            fill,
-                            target,
-                            D2dRectF {
-                                left: layout.gutter_w + TEXT_PAD + c0 * app.char_w,
-                                top: y,
-                                right: x1,
-                                bottom: y + app.line_h,
-                            },
-                            brushes.selection,
-                        );
-                    }
-                }
-                // Line number, right-aligned in the gutter (monospace
-                // metrics make the width exact).
-                let number = (row.line_no + 1).to_string();
-                let num_w = number.len() as f32 * app.char_w;
-                let num_brush = if row.line_no == caret_line {
-                    brushes.accent
-                } else {
-                    // Polish pass: off-current numbers sit one
-                    // step brighter than muted (a 50/50 blend
-                    // toward the text colour) for legibility.
-                    brushes.gutter_num
-                };
-                draw_text(
-                    draw,
-                    target,
-                    format,
-                    &number,
-                    D2dRectF {
-                        left: layout.gutter_w - TEXT_PAD - num_w,
-                        top: y,
-                        right: layout.gutter_w - TEXT_PAD,
-                        bottom: y + app.line_h,
-                    },
-                    num_brush,
-                );
-                // Bookmark marker (roadmap item 20): a small accent
-                // square at the gutter's left edge on a line holding
-                // a bookmark (the numbers are right-aligned, so the
-                // left edge is free).
-                let bm_at = bookmark_offsets.partition_point(|&b| b < row.start);
-                if matches!(bookmark_offsets.get(bm_at), Some(&b) if b < row.end || b == row.start)
-                {
-                    let size = 6.0;
-                    let my = y + (app.line_h - size) / 2.0;
-                    fill_rect(
-                        fill,
-                        target,
-                        D2dRectF {
-                            left: 2.0,
-                            top: my,
-                            right: 2.0 + size,
-                            bottom: my + size,
-                        },
-                        brushes.accent,
-                    );
-                }
-                // The line's text.
-                draw_text(
-                    draw,
-                    target,
-                    format,
-                    &row.text,
-                    D2dRectF {
-                        left: layout.gutter_w + TEXT_PAD,
-                        top: y,
-                        right: layout.editor_right,
-                        bottom: y + app.line_h,
-                    },
-                    brushes.text,
-                );
-                // Caret.
-                if app.has_focus && app.caret_on && row.line_no == caret_line {
-                    let x = layout.gutter_w + TEXT_PAD + caret_col as f32 * app.char_w;
-                    fill_rect(
-                        fill,
-                        target,
-                        D2dRectF {
-                            left: x,
-                            top: y,
-                            right: x + 2.0,
-                            bottom: y + app.line_h,
-                        },
-                        brushes.accent,
+                        brushes.line,
                     );
                 }
             }
@@ -2234,7 +3120,10 @@ fn render(app: &mut App) {
                     as f32
                     * app.char_w;
             for (i, row) in hex_rows.iter().enumerate() {
-                let y = top + i as f32 * app.line_h;
+                let y = rtop + i as f32 * app.line_h;
+                if y >= rbottom {
+                    break;
+                }
                 if caret >= row.address && caret < row.address + row.len {
                     // The same current-line band as text mode
                     // (polish pass), text area only, drawn before
@@ -2419,11 +3308,14 @@ fn render(app: &mut App) {
 
     // The column ruler (roadmap item 21): a quiet 1-DIP vertical
     // guideline at the configured character column, text mode only.
-    // It sits on the same x-grid as the caret and the text itself
-    // (gutter + padding + column × character width), and is drawn
-    // only when it falls inside the editor area, clear of the
-    // scrollbar.
-    if app.settings.ruler_column > 0 && matches!(rows, RowData::Text(_)) {
+    // With wrap, the filter, or the grid up, character columns no
+    // longer map to one fixed x, so the ruler steps aside.
+    if app.settings.ruler_column > 0
+        && matches!(rows, RowData::Text(_))
+        && !wrap_active(app)
+        && !in_filter
+        && grid.is_none()
+    {
         let x = layout.gutter_w + TEXT_PAD + app.settings.ruler_column as f32 * app.char_w;
         if x > layout.gutter_w && x < layout.editor_right - SCROLLBAR_W {
             fill_rect(
@@ -2431,9 +3323,9 @@ fn render(app: &mut App) {
                 target,
                 D2dRectF {
                     left: x,
-                    top,
+                    top: rtop,
                     right: x + 1.0,
-                    bottom,
+                    bottom: rbottom,
                 },
                 brushes.line,
             );
@@ -2443,21 +3335,22 @@ fn render(app: &mut App) {
     // The custom scrollbar, drawn over the editor's right edge: a
     // panel-coloured track with an accent thumb. Only drawn when the
     // document overflows the visible rows.
-    if let Some((thumb_y, thumb_h)) = scrollbar_geometry(bottom - top, sb_total, sb_page, sb_first)
+    if let Some((thumb_y, thumb_h)) =
+        scrollbar_geometry(rbottom - rtop, sb_total, sb_page, sb_first)
     {
         let track = D2dRectF {
             left: layout.editor_right - SCROLLBAR_W,
-            top,
+            top: rtop,
             right: layout.editor_right,
-            bottom,
+            bottom: rbottom,
         };
         fill_rect(fill, target, track, brushes.panel);
         fill_rect(
             fill,
             target,
             D2dRectF {
-                top: top + thumb_y,
-                bottom: top + thumb_y + thumb_h,
+                top: rtop + thumb_y,
+                bottom: rtop + thumb_y + thumb_h,
                 ..track
             },
             brushes.accent,
@@ -2470,8 +3363,8 @@ fn render(app: &mut App) {
             target,
             track.left,
             track.right,
-            top,
-            bottom - top,
+            rtop,
+            rbottom - rtop,
             &all_matches,
             table.len(),
             brushes.accent,
@@ -2481,8 +3374,8 @@ fn render(app: &mut App) {
             target,
             track.left,
             track.right,
-            top,
-            bottom - top,
+            rtop,
+            rbottom - rtop,
             &bookmark_offsets,
             table.len(),
             brushes.text,
@@ -2494,6 +3387,8 @@ fn render(app: &mut App) {
     // same monospace format as the editor. The readings are taken
     // from the 16 bytes at the caret on every paint, so caret moves
     // and edits refresh it with no extra plumbing.
+    app.bit_boxes.clear();
+    app.bit_mirror = None;
     if app.settings.inspector_open {
         let panel_left = layout.editor_right;
         fill_rect(
@@ -2503,7 +3398,7 @@ fn render(app: &mut App) {
                 left: panel_left,
                 top,
                 right: width,
-                bottom,
+                bottom: rbottom,
             },
             brushes.panel,
         );
@@ -2514,7 +3409,7 @@ fn render(app: &mut App) {
                 left: panel_left,
                 top,
                 right: panel_left + 1.0,
-                bottom,
+                bottom: rbottom,
             },
             brushes.line,
         );
@@ -2528,7 +3423,7 @@ fn render(app: &mut App) {
         let value_chars = (((value_right - value_x) / app.char_w.max(1.0)).floor() as usize).max(4);
         let mut y = top + 4.0;
         for (label, value) in inspector_rows(&report, caret) {
-            if y + app.line_h > bottom {
+            if y + app.line_h > rbottom {
                 break;
             }
             draw_text(
@@ -2547,7 +3442,7 @@ fn render(app: &mut App) {
             let chars: Vec<char> = value.chars().collect();
             let mut lines = 0usize;
             for chunk in chars.chunks(value_chars) {
-                if y + app.line_h > bottom {
+                if y + app.line_h > rbottom {
                     break;
                 }
                 let text: String = chunk.iter().collect();
@@ -2573,6 +3468,219 @@ fn render(app: &mut App) {
                 y += app.line_h;
             }
         }
+        // The bit row (R4b hex bit tooling): eight toggle boxes for
+        // the byte at the caret, bits 7..0. Clicking a box flips
+        // the bit through the editor's undoable byte-replace path;
+        // the boxes' rects are remembered for the click test. Text
+        // mode and a caret at the very end (no byte) hide the row.
+        if app.editor.mode() == EditorMode::Hex {
+            if let Some(byte) = table.byte_at(caret) {
+                let bits_y = y + 4.0;
+                if bits_y + 2.0 * app.line_h <= rbottom {
+                    draw_text(
+                        draw,
+                        target,
+                        format,
+                        "Bits",
+                        D2dRectF {
+                            left: panel_left + TEXT_PAD,
+                            top: bits_y + app.line_h,
+                            right: value_x - 4.0,
+                            bottom: bits_y + 2.0 * app.line_h,
+                        },
+                        brushes.muted,
+                    );
+                    let box_w = app.char_w * 2.0;
+                    let gap = 4.0;
+                    for i in 0..8usize {
+                        let bit = 7 - i as u32;
+                        let bx = value_x + i as f32 * (box_w + gap);
+                        let digit_x = bx + (box_w - app.char_w) / 2.0;
+                        draw_text(
+                            draw,
+                            target,
+                            format,
+                            &bit.to_string(),
+                            D2dRectF {
+                                left: digit_x,
+                                top: bits_y,
+                                right: bx + box_w,
+                                bottom: bits_y + app.line_h,
+                            },
+                            brushes.muted,
+                        );
+                        let rect = D2dRectF {
+                            left: bx,
+                            top: bits_y + app.line_h,
+                            right: bx + box_w,
+                            bottom: bits_y + 2.0 * app.line_h,
+                        };
+                        let is_set = (byte >> bit) & 1 == 1;
+                        if is_set {
+                            fill_rect(fill, target, rect, brushes.accent);
+                        } else {
+                            outline_rect(draw_rect, target, rect, brushes.line);
+                        }
+                        draw_text(
+                            draw,
+                            target,
+                            format,
+                            if is_set { "1" } else { "0" },
+                            D2dRectF {
+                                left: digit_x,
+                                top: rect.top,
+                                right: bx + box_w,
+                                bottom: rect.bottom,
+                            },
+                            if is_set { brushes.bg } else { brushes.text },
+                        );
+                        app.bit_boxes
+                            .push((rect.left, rect.top, rect.right, rect.bottom));
+                    }
+                    app.bit_mirror = Some((caret, byte));
+                }
+            }
+        }
+    }
+
+    // The strings pane (R4b): docked along the bottom while open.
+    if layout.strings_h > 0.0 {
+        let pane_top = rbottom;
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: 0.0,
+                top: pane_top,
+                right: width,
+                bottom,
+            },
+            brushes.panel,
+        );
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: 0.0,
+                top: pane_top,
+                right: width,
+                bottom: pane_top + 1.0,
+            },
+            brushes.line,
+        );
+        let header = if app.strings.searching {
+            "Strings \u{00B7} scanning\u{2026}".to_string()
+        } else {
+            format!("Strings ({})", app.strings.results.len())
+        };
+        draw_text(
+            draw,
+            target,
+            format,
+            &header,
+            D2dRectF {
+                left: TEXT_PAD,
+                top: pane_top + 3.0,
+                right: width - TEXT_PAD,
+                bottom: pane_top + STRINGS_HEADER_H,
+            },
+            brushes.text,
+        );
+        // Min-length chips at the header's right edge.
+        app.strings_chips.clear();
+        let mut cx = width - TEXT_PAD;
+        for min_len in [8u32, 6, 4] {
+            let label = format!("min {min_len}");
+            let chip_w = (label.len() as f32 + 2.0) * app.char_w;
+            cx -= chip_w + 4.0;
+            let rect = (
+                cx,
+                pane_top + 2.0,
+                cx + chip_w,
+                pane_top + STRINGS_HEADER_H - 2.0,
+            );
+            let active = min_len == app.settings.strings_min_len;
+            if active {
+                outline_rect(
+                    draw_rect,
+                    target,
+                    D2dRectF {
+                        left: rect.0,
+                        top: rect.1,
+                        right: rect.2,
+                        bottom: rect.3,
+                    },
+                    brushes.accent,
+                );
+            }
+            draw_text(
+                draw,
+                target,
+                format,
+                &label,
+                D2dRectF {
+                    left: cx + app.char_w,
+                    top: pane_top + 3.0,
+                    right: rect.2,
+                    bottom: pane_top + STRINGS_HEADER_H,
+                },
+                if active {
+                    brushes.accent
+                } else {
+                    brushes.muted
+                },
+            );
+            app.strings_chips.push((min_len, rect));
+        }
+        if app.strings.results.is_empty() && !app.strings.searching {
+            draw_text(
+                draw,
+                target,
+                format,
+                "No strings found",
+                D2dRectF {
+                    left: TEXT_PAD,
+                    top: pane_top + STRINGS_HEADER_H,
+                    right: width - TEXT_PAD,
+                    bottom: pane_top + STRINGS_HEADER_H + app.line_h,
+                },
+                brushes.muted,
+            );
+        }
+        for i in 0..STRINGS_ROWS as usize {
+            let idx = app.strings.first + i;
+            let Some(found) = app.strings.results.get(idx) else {
+                break;
+            };
+            let y = pane_top + STRINGS_HEADER_H + i as f32 * app.line_h;
+            if app.strings.selected == Some(idx) {
+                fill_rect(
+                    fill,
+                    target,
+                    D2dRectF {
+                        left: 0.0,
+                        top: y,
+                        right: width,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.selection,
+                );
+            }
+            let line = format!("0x{:X}  {}", found.offset, found.text);
+            draw_text(
+                draw,
+                target,
+                format,
+                &line,
+                D2dRectF {
+                    left: TEXT_PAD,
+                    top: y,
+                    right: width - TEXT_PAD,
+                    bottom: y + app.line_h,
+                },
+                brushes.text,
+            );
+        }
     }
 
     // SAFETY: pairs with the BeginDraw above; null tag pointers are
@@ -2584,14 +3692,563 @@ fn render(app: &mut App) {
     }
 }
 
+/// Paint one display row of the text view (R4b): the band,
+/// find-match and selection washes, the gutter (line number,
+/// time delta, bookmark marker), the text itself (plain, or in
+/// ANSI/tag segments), and the caret. Shared by the plain,
+/// wrapped, frozen and filtered views; `banded` is precomputed by
+/// the caller (the caret's line normally, the cursor row in the
+/// filter view).
+#[allow(clippy::too_many_arguments)]
+fn paint_text_row(
+    app: &App,
+    row: &DisplayRow,
+    y: f32,
+    layout: &Layout,
+    banded: bool,
+    paint: &RowPaint,
+) {
+    if app.target.is_null() || app.brushes.is_none() {
+        return;
+    }
+    let target = app.target;
+    let brushes = app.brushes.as_ref().expect("checked above");
+    let format = app.text_format;
+    let table = app.editor.table();
+    let enc = app.editor.encoding();
+    let fill: RtFillRect = unsafe { vfn(target, SLOT_RT_FILL_RECTANGLE) };
+    let draw_rect: RtDrawRectangle = unsafe { vfn(target, SLOT_RT_DRAW_RECTANGLE) };
+    let draw: RtDrawText = unsafe { vfn(target, SLOT_RT_DRAW_TEXT) };
+    let text_x = layout.gutter_w + TEXT_PAD;
+    let seg_chars = row.text.chars().count() as u64;
+    let segs: Vec<PaintSeg> = if paint.seg_mode {
+        build_segments(&row.text, row.char_start, app.ansi_on, app.ctl_on)
+    } else {
+        Vec::new()
+    };
+    // Line character column → display cell within this row.
+    let cell_of = |col: u64| -> f32 {
+        if paint.seg_mode {
+            seg_cell_of(&segs, col) as f32
+        } else {
+            col.saturating_sub(row.char_start) as f32
+        }
+    };
+
+    // Current-line band (polish pass): background blended halfway
+    // toward the panel colour, text area only. In the filter view
+    // the band marks the cursor row instead.
+    if banded {
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: layout.gutter_w,
+                top: y,
+                right: layout.editor_right,
+                bottom: y + app.line_h,
+            },
+            brushes.band,
+        );
+    }
+    // Find-match highlights (never in the filter view: the document
+    // caret and its matches are frozen there and painting them
+    // would mislead).
+    if paint.match_len > 0 && !paint.in_filter {
+        let lo = row.start.saturating_sub(paint.match_len);
+        let begin = paint.matches.partition_point(|&m| m < lo);
+        for &ms in &paint.matches[begin..] {
+            if ms >= row.end {
+                break;
+            }
+            let me = ms + paint.match_len;
+            if me <= row.start {
+                continue;
+            }
+            let c0 = col_of_byte(table, enc, row.line_start, ms) as u64;
+            let c1 = col_of_byte(table, enc, row.line_start, me.min(row.end)) as u64;
+            let seg_lo = row.char_start;
+            let seg_hi = row.char_start + seg_chars;
+            if c1 <= seg_lo || c0 >= seg_hi {
+                continue;
+            }
+            let rect = D2dRectF {
+                left: text_x + cell_of(c0.max(seg_lo)) * app.char_w,
+                top: y,
+                right: text_x + cell_of(c1.min(seg_hi)) * app.char_w,
+                bottom: y + app.line_h,
+            };
+            fill_rect(fill, target, rect, brushes.match_bg);
+            if paint.current_match == Some((ms, me)) {
+                outline_rect(draw_rect, target, rect, brushes.accent);
+            }
+        }
+    }
+    // Selection highlight.
+    if !paint.in_filter {
+        if let Some((ss, se)) = paint.selection {
+            if se > row.start && ss <= row.end {
+                let from = ss.max(row.start);
+                let c0 = col_of_byte(table, enc, row.line_start, from) as u64;
+                if c0 > row.char_start + seg_chars {
+                    // Starts past this segment: a later segment
+                    // (or none) owns it.
+                } else {
+                    let x0 = text_x + cell_of(c0.max(row.char_start)) * app.char_w;
+                    let x1 = if se > row.end {
+                        layout.editor_right
+                    } else {
+                        let c1 = col_of_byte(table, enc, row.line_start, se) as u64;
+                        text_x + cell_of(c1.min(row.char_start + seg_chars)) * app.char_w
+                    };
+                    fill_rect(
+                        fill,
+                        target,
+                        D2dRectF {
+                            left: x0,
+                            top: y,
+                            right: x1,
+                            bottom: y + app.line_h,
+                        },
+                        brushes.selection,
+                    );
+                }
+            }
+        }
+    }
+    // Gutter contents paint once per line, on its first segment.
+    if row.char_start == 0 {
+        // Time delta (R4b): right-aligned in its own gutter column.
+        if layout.delta_w > 0.0 {
+            if let Some(delta) = paint.deltas.get(&row.line_no) {
+                let text = format_delta(*delta);
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &text,
+                    D2dRectF {
+                        left: TEXT_PAD,
+                        top: y,
+                        right: TEXT_PAD + layout.delta_w - 4.0,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.muted,
+                );
+            }
+        }
+        // Line number, right-aligned in the gutter. In the filter
+        // view this is the ORIGINAL line number — the whole point
+        // of the view is knowing where each line lives.
+        let number = (row.line_no + 1).to_string();
+        let num_w = number.len() as f32 * app.char_w;
+        let num_brush = if banded {
+            brushes.accent
+        } else {
+            brushes.gutter_num
+        };
+        draw_text(
+            draw,
+            target,
+            format,
+            &number,
+            D2dRectF {
+                left: layout.gutter_w - TEXT_PAD - num_w,
+                top: y,
+                right: layout.gutter_w - TEXT_PAD,
+                bottom: y + app.line_h,
+            },
+            num_brush,
+        );
+        // Bookmark marker (roadmap item 20): a small accent square
+        // at the gutter's left edge — or just right of the delta
+        // column when that is showing.
+        let bm_at = paint.bookmarks.partition_point(|&b| b < row.start);
+        if matches!(paint.bookmarks.get(bm_at), Some(&b) if b < row.end || b == row.start) {
+            let size = 6.0;
+            let my = y + (app.line_h - size) / 2.0;
+            let bx = if layout.delta_w > 0.0 {
+                TEXT_PAD + layout.delta_w + 2.0
+            } else {
+                2.0
+            };
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: bx,
+                    top: my,
+                    right: bx + size,
+                    bottom: my + size,
+                },
+                brushes.accent,
+            );
+        }
+    }
+    // The row's text: one run normally, or the segment runs when
+    // ANSI colours / control tags are on. Focus dimming paints
+    // other paragraphs in the muted brush.
+    let dimmed = matches!(paint.dim_range, Some((lo, hi)) if row.line_no < lo || row.line_no > hi);
+    let text_brush = if dimmed { brushes.muted } else { brushes.text };
+    if paint.seg_mode {
+        let mut cx = text_x;
+        for seg in &segs {
+            if seg.tag {
+                // A small inverted tag: line-coloured box, muted
+                // notation, two cells wide for one character.
+                fill_rect(
+                    fill,
+                    target,
+                    D2dRectF {
+                        left: cx + 0.5,
+                        top: y + 1.0,
+                        right: cx + 2.0 * app.char_w - 0.5,
+                        bottom: y + app.line_h - 1.0,
+                    },
+                    brushes.line,
+                );
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &seg.text,
+                    D2dRectF {
+                        left: cx,
+                        top: y,
+                        right: cx + 2.0 * app.char_w,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.muted,
+                );
+            } else {
+                let brush = seg.fg.map(|ix| brushes.ansi[ix]).unwrap_or(text_brush);
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &seg.text,
+                    D2dRectF {
+                        left: cx,
+                        top: y,
+                        right: cx + seg.cells as f32 * app.char_w,
+                        bottom: y + app.line_h,
+                    },
+                    brush,
+                );
+            }
+            cx += seg.cells as f32 * app.char_w;
+        }
+    } else {
+        draw_text(
+            draw,
+            target,
+            format,
+            &row.text,
+            D2dRectF {
+                left: text_x,
+                top: y,
+                right: layout.editor_right,
+                bottom: y + app.line_h,
+            },
+            text_brush,
+        );
+    }
+    // Caret: a 2px accent bar at the caret's cell, on the segment
+    // that holds it (the line-end caret belongs to the last one).
+    if app.has_focus && app.caret_on && !paint.in_filter && row.line_no == paint.caret_line {
+        let in_segment = paint.caret_col >= row.char_start
+            && (paint.caret_col < row.char_start + seg_chars
+                || (paint.caret_col == paint.caret_line_chars
+                    && row.char_start + seg_chars == paint.caret_line_chars));
+        if in_segment {
+            let x = text_x + cell_of(paint.caret_col) * app.char_w;
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: x,
+                    top: y,
+                    right: x + 2.0,
+                    bottom: y + app.line_h,
+                },
+                brushes.accent,
+            );
+        }
+    }
+}
+
+/// Paint the visible rows in delimiter-grid form (R4b): each
+/// line's fields aligned into columns by padding in the PAINT step
+/// only — the file's bytes, the caret columns and copy all stay
+/// byte-true. Find and selection washes clip per field.
+#[allow(clippy::too_many_arguments)]
+fn paint_grid_rows(
+    app: &App,
+    disp: &[DisplayRow],
+    delim: crate::delimited::Delimiter,
+    widths: &[u64],
+    layout: &Layout,
+    paint: &RowPaint,
+) {
+    if app.target.is_null() || app.brushes.is_none() {
+        return;
+    }
+    let target = app.target;
+    let brushes = app.brushes.as_ref().expect("checked above");
+    let format = app.text_format;
+    let table = app.editor.table();
+    let enc = app.editor.encoding();
+    let fill: RtFillRect = unsafe { vfn(target, SLOT_RT_FILL_RECTANGLE) };
+    let draw_rect: RtDrawRectangle = unsafe { vfn(target, SLOT_RT_DRAW_RECTANGLE) };
+    let draw: RtDrawText = unsafe { vfn(target, SLOT_RT_DRAW_TEXT) };
+    let text_x = layout.gutter_w + TEXT_PAD;
+    let rtop = layout.rows_top;
+    let field_x = |fi: usize| -> f32 {
+        let mut cells: u64 = 0;
+        for (i, w) in widths.iter().enumerate() {
+            if i >= fi {
+                break;
+            }
+            cells += w + GRID_GAP_CHARS;
+        }
+        text_x + cells as f32 * app.char_w
+    };
+    for (i, row) in disp.iter().enumerate() {
+        let y = rtop + i as f32 * app.line_h;
+        if y >= layout.rows_bottom {
+            break;
+        }
+        // Current-line band, as in the plain painter.
+        if row.line_no == paint.caret_line {
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: layout.gutter_w,
+                    top: y,
+                    right: layout.editor_right,
+                    bottom: y + app.line_h,
+                },
+                brushes.band,
+            );
+        }
+        // Gutter: delta, number, bookmark — the plain painter's
+        // rules for whole-line rows.
+        if layout.delta_w > 0.0 {
+            if let Some(delta) = paint.deltas.get(&row.line_no) {
+                let text = format_delta(*delta);
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &text,
+                    D2dRectF {
+                        left: TEXT_PAD,
+                        top: y,
+                        right: TEXT_PAD + layout.delta_w - 4.0,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.muted,
+                );
+            }
+        }
+        let number = (row.line_no + 1).to_string();
+        let num_w = number.len() as f32 * app.char_w;
+        draw_text(
+            draw,
+            target,
+            format,
+            &number,
+            D2dRectF {
+                left: layout.gutter_w - TEXT_PAD - num_w,
+                top: y,
+                right: layout.gutter_w - TEXT_PAD,
+                bottom: y + app.line_h,
+            },
+            if row.line_no == paint.caret_line {
+                brushes.accent
+            } else {
+                brushes.gutter_num
+            },
+        );
+        let bm_at = paint.bookmarks.partition_point(|&b| b < row.start);
+        if matches!(paint.bookmarks.get(bm_at), Some(&b) if b < row.end || b == row.start) {
+            let size = 6.0;
+            let my = y + (app.line_h - size) / 2.0;
+            let bx = if layout.delta_w > 0.0 {
+                TEXT_PAD + layout.delta_w + 2.0
+            } else {
+                2.0
+            };
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: bx,
+                    top: my,
+                    right: bx + size,
+                    bottom: my + size,
+                },
+                brushes.accent,
+            );
+        }
+        // The fields themselves.
+        let content = table.read(
+            row.line_start,
+            (row.end - row.line_start).min(GRID_FETCH_BYTES),
+        );
+        let fields = crate::delimited::split_line(&content, delim);
+        let dimmed =
+            matches!(paint.dim_range, Some((lo, hi)) if row.line_no < lo || row.line_no > hi);
+        let text_brush = if dimmed { brushes.muted } else { brushes.text };
+        let mut caret_x: Option<f32> = None;
+        for (fi, &(fs, fe)) in fields.iter().enumerate() {
+            let fx = field_x(fi);
+            let f_abs = row.line_start + fs;
+            let f_end = row.line_start + fe;
+            // Find-match wash inside this field.
+            if paint.match_len > 0 {
+                let lo = f_abs.saturating_sub(paint.match_len);
+                let begin = paint.matches.partition_point(|&m| m < lo);
+                for &ms in &paint.matches[begin..] {
+                    if ms >= f_end {
+                        break;
+                    }
+                    let me = ms + paint.match_len;
+                    if me <= f_abs {
+                        continue;
+                    }
+                    let c0 = col_of_byte(table, enc, f_abs, ms.max(f_abs));
+                    let c1 = col_of_byte(table, enc, f_abs, me.min(f_end));
+                    let rect = D2dRectF {
+                        left: fx + c0 * app.char_w,
+                        top: y,
+                        right: fx + c1 * app.char_w,
+                        bottom: y + app.line_h,
+                    };
+                    fill_rect(fill, target, rect, brushes.match_bg);
+                    if paint.current_match == Some((ms, me)) {
+                        outline_rect(draw_rect, target, rect, brushes.accent);
+                    }
+                }
+            }
+            // Selection wash inside this field.
+            if let Some((ss, se)) = paint.selection {
+                if se > f_abs && ss < f_end {
+                    let c0 = col_of_byte(table, enc, f_abs, ss.max(f_abs));
+                    let c1 = col_of_byte(table, enc, f_abs, se.min(f_end));
+                    fill_rect(
+                        fill,
+                        target,
+                        D2dRectF {
+                            left: fx + c0 * app.char_w,
+                            top: y,
+                            right: fx + c1 * app.char_w,
+                            bottom: y + app.line_h,
+                        },
+                        brushes.selection,
+                    );
+                }
+            }
+            let text = crate::editor::decode_lossy(&content[fs as usize..fe as usize], enc);
+            draw_text(
+                draw,
+                target,
+                format,
+                &text,
+                D2dRectF {
+                    left: fx,
+                    top: y,
+                    right: layout.editor_right,
+                    bottom: y + app.line_h,
+                },
+                text_brush,
+            );
+            // The caret lives in exactly one field (or at the
+            // line's end, in the last one).
+            let caret = app.editor.caret();
+            if caret >= f_abs && caret <= f_end {
+                caret_x = Some(fx + col_of_byte(table, enc, f_abs, caret) * app.char_w);
+            }
+        }
+        if app.has_focus && app.caret_on && row.line_no == paint.caret_line {
+            if let Some(x) = caret_x {
+                fill_rect(
+                    fill,
+                    target,
+                    D2dRectF {
+                        left: x,
+                        top: y,
+                        right: x + 2.0,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.accent,
+                );
+            }
+        }
+    }
+}
+
 /// Map a mouse position (physical pixels) to a caret byte offset using
 /// monospace cell maths (the SPEC.md section 4 font is fixed-pitch, so
 /// cell maths is exact; documented in docs/PARITY.md).
+/// Pointer maths for the delimiter grid: find the field under the
+/// pointer using the same column widths the painter computed, then
+/// the character inside the field. The returned offset is a real
+/// document position — padding cells past a short field's text land
+/// on the field's end, never inside the next field.
+fn pos_to_offset_grid(app: &mut App, x: f32, row_in_view: usize) -> u64 {
+    let page = page_rows(app) as usize + 1;
+    let disp = display_rows(app, page);
+    if disp.is_empty() {
+        return 0;
+    }
+    let idx = row_in_view.min(disp.len() - 1);
+    let (line_no, line_start, line_end) = {
+        let row = &disp[idx];
+        (row.line_no, row.line_start, row.end)
+    };
+    let Some((delim, widths)) = grid_model(app, &disp) else {
+        return app.editor.offset_of_line_col(line_no, 0).unwrap_or(0);
+    };
+    let layout = compute_layout(app);
+    let text_x = layout.gutter_w + TEXT_PAD;
+    let enc = app.editor.encoding();
+    let content = app
+        .editor
+        .table()
+        .read(line_start, (line_end - line_start).min(GRID_FETCH_BYTES));
+    let fields = crate::delimited::split_line(&content, delim);
+    if fields.is_empty() {
+        return line_start;
+    }
+    let mut fx = text_x;
+    for (fi, &(fs, fe)) in fields.iter().enumerate() {
+        let col_w = widths.get(fi).copied().unwrap_or(0);
+        let field_w = (col_w + GRID_GAP_CHARS) as f32 * app.char_w;
+        let last = fi + 1 == fields.len();
+        if x < fx + field_w || last {
+            let own = crate::editor::decode_lossy(&content[fs as usize..fe as usize], enc)
+                .chars()
+                .count() as u64;
+            let within = (((x - fx) / app.char_w.max(1.0)).floor().max(0.0) as u64).min(own);
+            let f_abs = line_start + fs;
+            let field_chars = col_of_byte(app.editor.table(), enc, line_start, f_abs) as u64;
+            return app
+                .editor
+                .offset_of_line_col(line_no, field_chars + within)
+                .unwrap_or(line_start);
+        }
+        fx += field_w;
+    }
+    line_start
+}
+
 fn pos_to_offset(app: &mut App, x_px: i32, y_px: i32) -> u64 {
     let layout = compute_layout(app);
     let x = app.dip(x_px);
     let y = app.dip(y_px);
-    let row_in_view = ((y - layout.editor_top) / app.line_h.max(1.0)).floor();
+    let row_in_view = ((y - layout.rows_top) / app.line_h.max(1.0)).floor();
     if row_in_view < 0.0 {
         return app.editor.caret();
     }
@@ -2602,15 +4259,36 @@ fn pos_to_offset(app: &mut App, x_px: i32, y_px: i32) -> u64 {
     }
     match app.editor.mode() {
         EditorMode::Text => {
-            let count = app.editor.line_count();
-            if count == 0 {
+            // Text clicks resolve through the same display rows the
+            // painter uses (R4b), so wrap segments, frozen lines and
+            // filtered lines all hit-test exactly as drawn. In the
+            // filter view the returned offset names the clicked
+            // filtered line's position — callers use it only to
+            // place the filter cursor, never to edit.
+            if grid_active(app) {
+                return pos_to_offset_grid(app, x, row_in_view as usize);
+            }
+            let page = page_rows(app) as usize + 1;
+            let disp = display_rows(app, page);
+            if disp.is_empty() {
                 return 0;
             }
-            let line = (app.editor.first_line() + row_in_view as u64).min(count - 1);
-            let col = ((x - layout.gutter_w - TEXT_PAD) / app.char_w.max(1.0)).floor();
-            let col = col.max(0.0) as u64;
+            let idx = (row_in_view as usize).min(disp.len() - 1);
+            let (line_no, char_start, text) = {
+                let row = &disp[idx];
+                (row.line_no, row.char_start, row.text.clone())
+            };
+            let cell = ((x - layout.gutter_w - TEXT_PAD) / app.char_w.max(1.0))
+                .floor()
+                .max(0.0) as u64;
+            let col = if app.ansi_on || app.ctl_on {
+                let segs = build_segments(&text, char_start, app.ansi_on, app.ctl_on);
+                seg_col_of_cell(&segs, cell)
+            } else {
+                char_start + cell
+            };
             app.editor
-                .offset_of_line_col(line, col)
+                .offset_of_line_col(line_no, col)
                 .unwrap_or(app.editor.total_len())
         }
         EditorMode::Hex => {
@@ -2849,16 +4527,34 @@ fn message_box(hwnd: HWND, text: &str, caption: &str, style: u32) -> i32 {
 /// build outright (the editor keeps answering exactly from its
 /// stale index's valid prefix meanwhile).
 fn spawn_index_thread(app: &mut App, mmap: Arc<MmapFile>) {
+    spawn_index_thread_resume(app, mmap, None);
+}
+
+/// Spawn the background line-index build. With `resume`, the
+/// builder starts from that snapshot's frontier instead of from
+/// zero (Ghost Tail: the index held over the old length describes
+/// the grown document's prefix exactly, so the build continues
+/// where it stopped). A resume snapshot whose total disagrees with
+/// the mapping is ignored rather than trusted.
+fn spawn_index_thread_resume(app: &mut App, mmap: Arc<MmapFile>, resume: Option<LineIndex>) {
     app.index_epoch += 1;
     let epoch = app.index_epoch;
     let slot = app.index_slot.clone();
     if let Ok(mut guard) = slot.lock() {
         *guard = None;
     }
-    app.indexing = Some((0, mmap.len()));
+    let resume = resume.filter(|index| index.total_length() == mmap.len());
+    let start = resume
+        .as_ref()
+        .map(|index| index.indexed_bytes())
+        .unwrap_or(0);
+    app.indexing = Some((start, mmap.len()));
     std::thread::spawn(move || {
         let total = mmap.len();
-        let mut builder = LineIndexBuilder::new(total);
+        let mut builder = match &resume {
+            Some(index) => LineIndexBuilder::resume_from(index),
+            None => LineIndexBuilder::new(total),
+        };
         loop {
             let complete = builder.advance(
                 builder.indexed_bytes() + INDEX_PUBLISH_STEP,
@@ -2954,6 +4650,22 @@ fn load_session_bookmarks(app: &mut App) {
 /// startup for the initial document.
 fn begin_document_tracking(app: &mut App) {
     app.doc_epoch += 1;
+    // R4b view state belongs to the previous document: the filter
+    // view is dropped, the jump history clears on open (item 11),
+    // and the strings / entropy mirrors are staled so their panes
+    // rescan the new document.
+    app.filter = None;
+    app.jump_history.clear();
+    app.status_note = None;
+    app.tail_pin_view = false;
+    app.strings.gen += 1;
+    app.strings.results.clear();
+    app.strings.first = 0;
+    app.strings.selected = None;
+    app.strings.searching = false;
+    app.entropy.gen += 1;
+    app.entropy.values.clear();
+    app.entropy.computing = false;
     cancel_bg_find(app);
     app.change_visible = false;
     app.change_shown_for = None;
@@ -3056,6 +4768,7 @@ fn jump_bookmark(app: &mut App, forward: bool) {
     };
     if let Some(offset) = target {
         app.editor.move_caret_to(offset, false);
+        record_jump(app, caret, offset);
         after_caret_move(app);
     }
 }
@@ -3302,11 +5015,88 @@ fn check_external_change(app: &mut App) {
         }
         return;
     }
+    // Ghost Tail (roadmap item 22): with Follow Tail on and an
+    // unedited document, a file that only GREW is adopted silently
+    // — no bar, no reload, no disturbance. A shrink, a same-size
+    // rewrite, or an edited document never takes this path; a growth
+    // the core refuses (for example, history left behind by an edit
+    // that was undone) falls through to the bar as before.
+    if app.settings.follow_tail
+        && now.size > base.size
+        && !app.editor.is_dirty()
+        && try_follow_growth(app, &path, now)
+    {
+        return;
+    }
     if app.change_shown_for == Some(now) || app.change_ignored_for == Some(now) {
         return;
     }
     app.change_shown_for = Some(now);
     set_change_bar_visible(app, true);
+}
+
+/// Adopt an on-disk growth into the open document (Ghost Tail,
+/// roadmap item 22): re-map the grown file, hand the new mapping to
+/// the editor's growth adoption, and resume the line index from the
+/// frontier the editor already holds. The caret, selection, scroll
+/// position and mode are untouched — except the two "at the end"
+/// cases, which follow the tail: a caret at the very end rides to
+/// the new end at once, and a view scrolled to the end is pinned to
+/// the new end when the resumed index completes. Returns false when
+/// the growth cannot be adopted (the caller then shows the
+/// external-change bar).
+fn try_follow_growth(
+    app: &mut App,
+    path: &std::path::Path,
+    now: crate::bookmarks::FileStamp,
+) -> bool {
+    let (sb_total, sb_first, sb_page) = scroll_metrics(app);
+    let view_at_end = sb_first.saturating_add(sb_page) >= sb_total;
+    let caret_at_end = app.editor.caret() >= app.editor.total_len();
+    let Ok(mmap) = MmapFile::open(path) else {
+        return false;
+    };
+    if mmap.len() != now.size {
+        // The file moved again between the stamp and the map; leave
+        // this state to the change bar.
+        return false;
+    }
+    let mmap = Arc::new(mmap);
+    let old_len = app.editor.total_len();
+    if app
+        .editor
+        .adopt_grown_backing(now.size, OriginalBuffer::Mapped(mmap.clone()))
+        .is_err()
+    {
+        return false;
+    }
+    app.doc_mmap = Some(mmap.clone());
+    app.file_stamp = Some(now);
+    app.change_shown_for = None;
+    if app.change_visible {
+        set_change_bar_visible(app, false);
+    }
+    // Resume indexing from the snapshot the editor now holds (the
+    // held index was extended over the grown length by the core).
+    let resume = app.editor.line_index_snapshot();
+    spawn_index_thread_resume(app, mmap, resume);
+    // A filtered view was built over the old length; drop it rather
+    // than let it describe a document that no longer matches.
+    app.filter = None;
+    app.tail_pin_view = view_at_end && !caret_at_end;
+    if caret_at_end {
+        let end = app.editor.total_len();
+        let page = page_rows(app);
+        app.editor.move_caret_to(end, false);
+        app.editor.ensure_caret_visible(page);
+    }
+    app.status_note = Some(format!(
+        "File grew by {} — following",
+        human_size(now.size.saturating_sub(old_len))
+    ));
+    refresh_status(app);
+    invalidate(app);
+    true
 }
 
 /// Open `path` in the window: memory-mapped, encoding detected, index
@@ -4564,20 +6354,7 @@ fn apply_theme_visual(app: &mut App, theme_name: &str, accent: Option<&str>) {
     // Recreate the D2D brushes against the (possibly live) target.
     if !app.target.is_null() {
         let target = app.target;
-        let t = &app.theme;
-        app.brushes = Some(Brushes {
-            bg: make_brush(target, t.bg),
-            panel: make_brush(target, t.panel),
-            text: make_brush(target, t.text),
-            muted: make_brush(target, t.muted),
-            line: make_brush(target, t.line),
-            gutter: make_brush(target, t.gutter_bg),
-            band: make_brush(target, blend_rgba(t.bg, t.panel, 0.5)),
-            gutter_num: make_brush(target, blend_rgba(t.muted, t.text, 0.5)),
-            selection: make_brush(target, t.selection),
-            match_bg: make_brush(target, t.match_bg),
-            accent: make_brush(target, t.accent),
-        });
+        app.brushes = Some(Brushes::build(target, &app.theme));
     }
     refresh_status(app);
     // The owner-drawn buttons pick their colours up on repaint.
@@ -4691,6 +6468,815 @@ fn rebuild_recent_menu(app: &App) {
                 AppendMenuW(menu, MF_STRING, CMD_RECENT_BASE + i, label.as_ptr());
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Roadmap slice R4b — view wiring helpers: the generic prompt
+// dialog (filter pattern, freeze count), the structural filter
+// view, the jump history and pointer following, the strings and
+// entropy workers, and the scrollbar tick hover preview.
+// ---------------------------------------------------------------------------
+
+const PROMPT_CLASS: &str = "VeloEditPrompt";
+const ID_PROMPT_EDIT: usize = 5301;
+const ID_PROMPT_OK: usize = 5302;
+const ID_PROMPT_CANCEL: usize = 5303;
+
+struct PromptDialogState {
+    app: *mut App,
+    edit: HWND,
+    label: String,
+    initial: String,
+    result: Option<String>,
+}
+
+const PROP_PROMPT_OLD: &str = "VeloEdit.PromptOldProc";
+const PROP_PROMPT_DLG: &str = "VeloEdit.PromptDlg";
+
+/// Subclass the prompt's edit so Enter confirms and Esc cancels
+/// (the modal loop never sees the edit's keys otherwise) — the
+/// same property-based trick as the find-bar edits.
+fn subclass_prompt_edit(edit: HWND, dlg: HWND) {
+    let name_old = wstr(PROP_PROMPT_OLD);
+    let name_dlg = wstr(PROP_PROMPT_DLG);
+    // SAFETY: `edit` is our child window; the old proc is stored in
+    // a window property before the new proc is installed.
+    unsafe {
+        let old = SetWindowLongPtrW(
+            edit,
+            GWLP_WNDPROC,
+            prompt_edit_proc as *const () as usize as isize,
+        );
+        SetPropW(edit, name_old.as_ptr(), old as HANDLE);
+        SetPropW(edit, name_dlg.as_ptr(), dlg as HANDLE);
+    }
+}
+
+unsafe extern "system" fn prompt_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let name_old = wstr(PROP_PROMPT_OLD);
+    let name_dlg = wstr(PROP_PROMPT_DLG);
+    // SAFETY: the props were stored by subclass_prompt_edit before
+    // this proc was installed, and are removed at WM_NCDESTROY.
+    let old = unsafe { GetPropW(hwnd, name_old.as_ptr()) } as isize;
+    let dlg = unsafe { GetPropW(hwnd, name_dlg.as_ptr()) } as HWND;
+    if msg == WM_KEYDOWN {
+        let cmd = match wparam as u32 {
+            0x0D => Some(ID_PROMPT_OK),     // Enter: confirm
+            0x1B => Some(ID_PROMPT_CANCEL), // Esc: cancel
+            _ => None,
+        };
+        if let Some(cmd) = cmd {
+            // SAFETY: `dlg` is the prompt dialog stored at subclass
+            // time; the command is handled there.
+            unsafe { PostMessageW(dlg, WM_COMMAND, cmd, 0) };
+            return 0;
+        }
+    }
+    if msg == WM_NCDESTROY {
+        // SAFETY: restore the original proc and drop our props.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
+            RemovePropW(hwnd, name_old.as_ptr());
+            RemovePropW(hwnd, name_dlg.as_ptr());
+        }
+    }
+    let proc_fn: WNDPROC = unsafe { std::mem::transmute(old) };
+    // SAFETY: proc_fn is the edit control's original window
+    // procedure, retrieved from our own property above.
+    unsafe { CallWindowProcW(proc_fn, hwnd, msg, wparam, lparam) }
+}
+
+unsafe extern "system" fn prompt_dialog_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CREATE {
+        // SAFETY: lparam is the CREATESTRUCTW from CreateWindowExW,
+        // whose lpCreateParams is the caller's PromptDialogState.
+        let create = unsafe { &*(lparam as *const CREATESTRUCTW) };
+        let state_ptr = create.lpCreateParams as *mut PromptDialogState;
+        // SAFETY: storing the state pointer for the dialog's life.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
+        // SAFETY: the state outlives the dialog (caller's frame).
+        let state = unsafe { &mut *state_ptr };
+        // SAFETY: the App is alive and exclusively ours on this thread.
+        let app = unsafe { &*state.app };
+        let scale = app.scale();
+        let px = |dip: f32| (dip * scale).round() as i32;
+        let label_text = state.label.clone();
+        let initial = state.initial.clone();
+        let label = create_child(app, "Static", &label_text, WS_CHILD | WS_VISIBLE, 0, 0);
+        // SAFETY: reparent and position our fresh child window.
+        unsafe {
+            SetParent(label, hwnd);
+            MoveWindow(label, px(12.0), px(10.0), px(404.0), px(20.0), 1);
+        }
+        let edit_style = WS_CHILD | WS_VISIBLE | 0x80; // ES_AUTOHSCROLL
+        let edit = create_child(
+            app,
+            "Edit",
+            &initial,
+            edit_style,
+            WS_EX_CLIENTEDGE,
+            ID_PROMPT_EDIT,
+        );
+        // SAFETY: as above.
+        unsafe {
+            SetParent(edit, hwnd);
+            MoveWindow(edit, px(12.0), px(34.0), px(404.0), px(24.0), 1);
+            SetFocus(edit);
+            // Select the prefill so typing replaces it.
+            SendMessageW(edit, 0xB1, 0, -1isize); // EM_SETSEL all
+        }
+        state.edit = edit;
+        subclass_prompt_edit(edit, hwnd);
+        let button_style = WS_CHILD | WS_VISIBLE | 0xB; // BS_OWNERDRAW
+        let ok = create_child(app, "Button", "OK", button_style, 0, ID_PROMPT_OK);
+        let cancel = create_child(app, "Button", "Cancel", button_style, 0, ID_PROMPT_CANCEL);
+        // SAFETY: as above.
+        unsafe {
+            SetParent(ok, hwnd);
+            MoveWindow(ok, px(268.0), px(66.0), px(70.0), px(24.0), 1);
+            SetParent(cancel, hwnd);
+            MoveWindow(cancel, px(346.0), px(66.0), px(70.0), px(24.0), 1);
+        }
+        return 0;
+    }
+    // SAFETY: the state pointer was stored at WM_CREATE.
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut PromptDialogState;
+    if state_ptr.is_null() {
+        // SAFETY: default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    // SAFETY: the state outlives the dialog (see WM_CREATE).
+    let state = unsafe { &mut *state_ptr };
+    match msg {
+        WM_COMMAND => {
+            match wparam & 0xFFFF {
+                ID_PROMPT_OK => {
+                    // SAFETY: our edit control.
+                    state.result = Some(unsafe { window_text(state.edit) });
+                    // SAFETY: our dialog window.
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                ID_PROMPT_CANCEL => {
+                    // SAFETY: our dialog window.
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            // SAFETY: closing is cancelling.
+            unsafe { DestroyWindow(hwnd) };
+            0
+        }
+        // Owner-drawn buttons, drawn like the Split dialog's (the
+        // dialog procs cannot share the main window's draw code).
+        WM_DRAWITEM => {
+            // SAFETY: lparam is a DRAWITEMSTRUCT for one of our buttons.
+            let dis = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
+            // SAFETY: the App is alive (modal dialog, UI thread).
+            let app = unsafe { &*state.app };
+            let mut rect = dis.rcItem;
+            // SAFETY: GDI drawing on the button's own DC.
+            unsafe {
+                FillRect(dis.hDC, &rect, app.panel_brush);
+                FrameRect(dis.hDC, &rect, app.line_brush);
+                if dis.itemState & 0x10 != 0 {
+                    let mut inner = rect;
+                    inner.left += 2;
+                    inner.top += 2;
+                    inner.right -= 2;
+                    inner.bottom -= 2;
+                    FrameRect(dis.hDC, &inner, app.accent_brush);
+                }
+                SetBkMode(dis.hDC, TRANSPARENT as i32);
+                SetTextColor(dis.hDC, colorref(app.theme.text));
+                let text = window_text(dis.hwndItem);
+                let mut wide: Vec<u16> = text.encode_utf16().collect();
+                if !wide.is_empty() {
+                    DrawTextW(
+                        dis.hDC,
+                        wide.as_mut_ptr(),
+                        wide.len() as i32,
+                        &mut rect,
+                        0x1 | 0x4 | 0x20,
+                    );
+                }
+            }
+            1
+        }
+        // SAFETY: default handling for everything else.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Show the generic one-line prompt dialog (the Split dialog's
+/// modal pattern): a label, one edit prefilled with `initial`, OK /
+/// Cancel. Returns the confirmed text, or `None` on cancel.
+fn show_prompt(app: &mut App, title: &str, label: &str, initial: &str) -> Option<String> {
+    let mut state = PromptDialogState {
+        app: app as *mut App,
+        edit: std::ptr::null_mut(),
+        label: label.to_string(),
+        initial: initial.to_string(),
+        result: None,
+    };
+    let class = wstr(PROMPT_CLASS);
+    let title_w = wstr(title);
+    // SAFETY: the prompt class is registered in run_gui; the state
+    // travels in lpCreateParams and lives in this stack frame until
+    // the dialog is destroyed (the modal loop below).
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title_w.as_ptr(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            app.px(440.0),
+            app.px(138.0),
+            app.hwnd,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            &mut state as *mut PromptDialogState as *const c_void,
+        )
+    };
+    if hwnd.is_null() {
+        return None;
+    }
+    // SAFETY: modal behaviour, exactly like the Split dialog.
+    unsafe {
+        EnableWindow(app.hwnd, 0);
+        ShowWindow(hwnd, SW_SHOW);
+    }
+    loop {
+        // SAFETY: MSG is a plain C struct; GetMessageW fills it.
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; 0 = WM_QUIT, -1 = error.
+        let result = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+        if result <= 0 {
+            // SAFETY: preserve the quit for the main loop.
+            unsafe { PostQuitMessage(0) };
+            break;
+        }
+        // SAFETY: standard message pumping.
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        // SAFETY: a plain liveness query on our dialog.
+        if unsafe { IsWindow(hwnd) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: restore the main window and give it the focus back.
+    unsafe {
+        EnableWindow(app.hwnd, 1);
+        SetFocus(app.hwnd);
+    }
+    state.result
+}
+
+// ---- Structural filter view (roadmap item 18) --------------------
+
+/// Search ▸ Filter…: prompt for a pattern, then show only the
+/// lines that contain it.
+fn open_filter_prompt(app: &mut App) {
+    if app.editor.mode() != EditorMode::Text {
+        app.status_note = Some("Filter works in Text mode".to_string());
+        refresh_status(app);
+        return;
+    }
+    let initial = if !app.last_find_text.is_empty() {
+        app.last_find_text.clone()
+    } else {
+        app.editor.selected_text_lossy()
+    };
+    let Some(text) = show_prompt(app, "Filter Lines", "Show only lines containing:", &initial)
+    else {
+        return;
+    };
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    enter_filter(app, text);
+}
+
+/// Build the filter view for `pattern` and switch to it. The
+/// cursor starts on the row at (or nearest after) the caret's line,
+/// so Enter without moving returns to familiar ground.
+fn enter_filter(app: &mut App, pattern: String) {
+    let enc = app.editor.encoding();
+    let needle = match crate::encoding::encode_needle(&pattern, enc) {
+        Ok(needle) => needle,
+        Err(_) => {
+            message_box(
+                app.hwnd,
+                "That text cannot be written in this file's encoding.",
+                "VeloEdit",
+                MB_OK | MB_ICONERROR,
+            );
+            return;
+        }
+    };
+    app.last_find_text = pattern.clone();
+    // Consume the needle before borrowing it for the query: the
+    // editor borrows the table itself, so the query's lifetime is
+    // satisfied by keeping `needle` alive across the call.
+    let view = app.editor.filter_view(crate::filter::FilterQuery::literal(
+        &needle,
+        SearchOptions::default(),
+    ));
+    let Some(view) = view else {
+        return;
+    };
+    let caret_line = app.editor.line_col_of(app.editor.caret()).0;
+    let cursor_row = if view.is_empty() {
+        0
+    } else {
+        view.row_of_line(caret_line).unwrap_or_else(|| {
+            let after = view
+                .lines()
+                .partition_point(|line| line.line_no < caret_line);
+            after.min(view.len() - 1)
+        })
+    };
+    app.filter = Some(FilterState {
+        view,
+        pattern,
+        first_row: 0,
+        cursor_row,
+    });
+    filter_ensure_cursor_visible(app);
+    refresh_status(app);
+    invalidate(app);
+}
+
+/// Leave the filter view without moving the caret.
+fn exit_filter(app: &mut App) {
+    if app.filter.take().is_some() {
+        refresh_status(app);
+        invalidate(app);
+    }
+}
+
+/// Enter / double-click in the filter view: leave the filter and
+/// land the caret at the start of the cursor row's line.
+fn filter_jump_to_cursor(app: &mut App) {
+    let Some(line) = app
+        .filter
+        .as_ref()
+        .and_then(|f| f.view.line_at_row(f.cursor_row))
+    else {
+        exit_filter(app);
+        return;
+    };
+    let from = app.editor.caret();
+    app.filter = None;
+    app.editor.move_caret_to(line.start, false);
+    record_jump(app, from, line.start);
+    after_caret_move(app);
+}
+
+/// Move the filter's row cursor by `delta` rows (clamped), keeping
+/// it visible.
+fn filter_move_cursor(app: &mut App, delta: i64) {
+    let Some(filter) = &mut app.filter else {
+        return;
+    };
+    if filter.view.is_empty() {
+        return;
+    }
+    let last = filter.view.len() - 1;
+    let next = (filter.cursor_row as i64 + delta).clamp(0, last as i64);
+    filter.cursor_row = next as usize;
+    filter_ensure_cursor_visible(app);
+    refresh_status(app);
+    invalidate(app);
+}
+
+/// Keep the filter cursor inside the visible rows.
+fn filter_ensure_cursor_visible(app: &mut App) {
+    let page = page_rows(app).max(1) as usize;
+    let Some(filter) = &mut app.filter else {
+        return;
+    };
+    if filter.cursor_row < filter.first_row {
+        filter.first_row = filter.cursor_row;
+    }
+    if filter.cursor_row >= filter.first_row + page {
+        filter.first_row = filter.cursor_row + 1 - page;
+    }
+}
+
+/// When the line index completes, an active filter view built over
+/// the partial index is rebuilt over the whole document (the
+/// banner's "still indexing" note then clears).
+fn rebuild_filter_if_stale(app: &mut App) {
+    let Some(filter) = &app.filter else {
+        return;
+    };
+    if filter.view.is_complete() {
+        return;
+    }
+    let pattern = filter.pattern.clone();
+    let cursor_line = filter
+        .view
+        .line_at_row(filter.cursor_row)
+        .map(|line| line.line_no);
+    let enc = app.editor.encoding();
+    let Ok(needle) = crate::encoding::encode_needle(&pattern, enc) else {
+        return;
+    };
+    let Some(view) = app.editor.filter_view(crate::filter::FilterQuery::literal(
+        &needle,
+        SearchOptions::default(),
+    )) else {
+        return;
+    };
+    let cursor_row = match cursor_line {
+        Some(line_no) => view.row_of_line(line_no).unwrap_or(0),
+        None => 0,
+    };
+    if let Some(filter) = &mut app.filter {
+        filter.view = view;
+        filter.cursor_row = cursor_row.min(filter.view.len().saturating_sub(1));
+        filter_ensure_cursor_visible(app);
+    }
+    refresh_status(app);
+    invalidate(app);
+}
+
+// ---- Jump history + pointer following (roadmap item 11) ----------
+
+/// Record a deliberate jump in the shell's history: the core stack
+/// holds destinations, so both ends are pushed (the origin push is
+/// what Back lands on; pushing the position already current is a
+/// no-op in the core).
+fn record_jump(app: &mut App, from: u64, to: u64) {
+    app.jump_history.push(from);
+    app.jump_history.push(to);
+}
+
+/// Alt+Left / Alt+Right and their Search-menu items: walk the jump
+/// history. Walking never pushes.
+fn jump_history_move(app: &mut App, forward: bool) {
+    let target = if forward {
+        app.jump_history.forward()
+    } else {
+        app.jump_history.back()
+    };
+    if let Some(to) = target {
+        let to = to.min(app.editor.total_len());
+        app.editor.move_caret_to(to, false);
+        after_caret_move(app);
+    }
+}
+
+/// Ctrl+Enter (or Ctrl+click) pointer following: read the pointer
+/// core at the caret and jump to the first reading that lands
+/// inside the document — widest little-endian first, the order a
+/// Windows binary's pointers almost always take.
+fn pointer_jump(app: &mut App) {
+    let at = app.editor.caret();
+    let total = app.editor.total_len();
+    let bytes = app.editor.table().read(at, (total - at).min(8));
+    let targets = crate::pointers::pointer_targets(&bytes, total);
+    let pick = [
+        ("u64 LE", targets.u64_le),
+        ("u32 LE", targets.u32_le),
+        ("u64 BE", targets.u64_be),
+        ("u32 BE", targets.u32_be),
+    ]
+    .into_iter()
+    .find_map(|(label, reading)| reading.filter(|r| r.in_document).map(|r| (label, r.value)));
+    match pick {
+        Some((label, value)) => {
+            app.editor.move_caret_to(value, false);
+            record_jump(app, at, value);
+            after_caret_move(app);
+            app.status_note = Some(format!("Jumped via pointer 0x{value:X} ({label})"));
+            refresh_status(app);
+        }
+        None => {
+            app.status_note = Some(format!("No pointer at 0x{at:X} lands inside the document"));
+            refresh_status(app);
+        }
+    }
+}
+
+/// Pin the view to the document's end (Ghost Tail completion, and
+/// the scrollbar's End path shares the shape).
+fn pin_view_to_end(app: &mut App) {
+    let page = page_rows(app);
+    match app.editor.mode() {
+        EditorMode::Text => {
+            let count = app.editor.line_count();
+            app.editor.set_first_line(count.saturating_sub(page));
+        }
+        EditorMode::Hex => {
+            let width = app.editor.hex_layout().bytes_per_row.max(1);
+            let rows = hexview::row_count_w(app.editor.total_len(), width);
+            app.editor.set_first_row(rows.saturating_sub(page));
+        }
+    }
+}
+
+// ---- Strings pane + entropy strip workers -------------------------
+
+/// The strings pane's per-tick service: pick up a finished scan,
+/// and start one when the pane is open and the held results are
+/// stale (document changed, or the min length changed).
+fn service_strings(app: &mut App) {
+    let ready = match app.strings.slot.try_lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
+    if let Some((gen, min_len, results)) = ready {
+        if gen == app.strings.gen {
+            app.strings.results = results;
+            app.strings.scanned_gen = gen;
+            app.strings.scanned_min_len = min_len;
+            app.strings.searching = false;
+            app.strings.first = 0;
+            app.strings.selected = None;
+            invalidate(app);
+        }
+    }
+    if app.settings.strings_open
+        && !app.strings.searching
+        && (app.strings.scanned_gen != app.strings.gen
+            || app.strings.scanned_min_len != app.settings.strings_min_len)
+    {
+        start_strings_scan(app);
+    }
+}
+
+fn start_strings_scan(app: &mut App) {
+    let gen = app.strings.gen;
+    let min_len = app.settings.strings_min_len;
+    let total = app.editor.total_len();
+    if total <= BG_FIND_THRESHOLD {
+        let snap = snapshot_table(app);
+        app.strings.results = crate::strings::scan_strings_in_table(&snap, min_len as usize);
+        app.strings.scanned_gen = gen;
+        app.strings.scanned_min_len = min_len;
+        app.strings.first = 0;
+        app.strings.selected = None;
+        invalidate(app);
+        return;
+    }
+    app.strings.searching = true;
+    let snap = snapshot_table(app);
+    let slot = app.strings.slot.clone();
+    std::thread::spawn(move || {
+        let results = crate::strings::scan_strings_in_table(&snap, min_len as usize);
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some((gen, min_len, results));
+        }
+    });
+}
+
+/// Double-click / Enter on a strings result: select it and land the
+/// caret on the string's offset (the current mode is kept — the
+/// jump is a caret move, and it joins the jump history).
+fn strings_jump_to(app: &mut App, idx: usize) {
+    let Some(found) = app.strings.results.get(idx) else {
+        return;
+    };
+    let offset = found.offset;
+    app.strings.selected = Some(idx);
+    let from = app.editor.caret();
+    app.editor.move_caret_to(offset, false);
+    record_jump(app, from, offset);
+    after_caret_move(app);
+}
+
+/// The entropy strip's per-tick service: same shape as the strings
+/// service. The block count targets about two blocks per DIP of
+/// strip width, capped so the value list stays small.
+fn service_entropy(app: &mut App) {
+    let ready = match app.entropy.slot.try_lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
+    if let Some((gen, values)) = ready {
+        if gen == app.entropy.gen {
+            app.entropy.values = values;
+            app.entropy.scanned_gen = gen;
+            app.entropy.computing = false;
+            invalidate(app);
+        }
+    }
+    if app.entropy_on && !app.entropy.computing && app.entropy.scanned_gen != app.entropy.gen {
+        start_entropy_compute(app);
+    }
+}
+
+fn start_entropy_compute(app: &mut App) {
+    let total = app.editor.total_len();
+    let gen = app.entropy.gen;
+    if total == 0 {
+        app.entropy.values = Vec::new();
+        app.entropy.scanned_gen = gen;
+        app.entropy.computing = false;
+        return;
+    }
+    let width = compute_layout(app).editor_right.max(1.0);
+    let target_blocks = ((width * 2.0) as u64).clamp(256, 8192);
+    let block_size = (total / target_blocks).max(1);
+    app.entropy.computing = true;
+    if total <= BG_FIND_THRESHOLD {
+        let snap = snapshot_table(app);
+        app.entropy.values =
+            crate::entropy::entropy_map(total, |off, out| snap.read_into(off, out), block_size);
+        app.entropy.scanned_gen = gen;
+        app.entropy.computing = false;
+        invalidate(app);
+        return;
+    }
+    let snap = snapshot_table(app);
+    let slot = app.entropy.slot.clone();
+    std::thread::spawn(move || {
+        let values =
+            crate::entropy::entropy_map(total, |off, out| snap.read_into(off, out), block_size);
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some((gen, values));
+        }
+    });
+}
+
+/// Clicking the entropy strip seeks the view proportionally (the
+/// caret stays where it is — this is a scroll, not a jump).
+fn entropy_seek(app: &mut App, x_dip: f32) {
+    let layout = compute_layout(app);
+    let total = app.editor.total_len();
+    if total == 0 || layout.editor_right <= 0.0 {
+        return;
+    }
+    let frac = (x_dip / layout.editor_right).clamp(0.0, 1.0) as f64;
+    let byte = (frac * total as f64) as u64;
+    match app.editor.mode() {
+        EditorMode::Text => {
+            let (line, _) = app.editor.line_col_of(byte);
+            let page = page_rows(app);
+            app.editor.set_first_line(line.saturating_sub(page / 2));
+        }
+        EditorMode::Hex => {
+            let width = app.editor.hex_layout().bytes_per_row.max(1);
+            app.editor.set_first_row(byte / width);
+        }
+    }
+    invalidate(app);
+}
+
+// ---- Scrollbar tick hover previews (item 24 expansion) ------------
+
+/// The tick nearest the pointer inside the scrollbar track, as
+/// `(offset, is_bookmark)`: the same offsets the tick painter
+/// buckets. `None` off the track or when nothing is within a
+/// couple of DIPs along the track.
+fn tick_candidate_at(app: &mut App, x_dip: f32, y_dip: f32) -> Option<(u64, bool)> {
+    let layout = compute_layout(app);
+    if x_dip < layout.editor_right - SCROLLBAR_W || x_dip > layout.editor_right {
+        return None;
+    }
+    if y_dip < layout.rows_top || y_dip > layout.rows_bottom {
+        return None;
+    }
+    let total = app.editor.total_len();
+    if total == 0 {
+        return None;
+    }
+    // No scrollbar is drawn when the document fits the page — and
+    // no ticks are painted then either, so there is nothing to
+    // preview.
+    let (sb_total, _, sb_page) = scroll_metrics(app);
+    if sb_total <= sb_page {
+        return None;
+    }
+    let track_h = (layout.rows_bottom - layout.rows_top).max(1.0) as f64;
+    let frac = (y_dip - layout.rows_top) as f64 / track_h;
+    let threshold = 2.5 / track_h;
+    let mut best: Option<(u64, bool, f64)> = None;
+    let consider = |offset: u64, is_bookmark: bool, best: &mut Option<(u64, bool, f64)>| {
+        let d = ((offset as f64 / total as f64) - frac).abs();
+        if d <= threshold && best.map(|(_, _, bd)| d < bd).unwrap_or(true) {
+            *best = Some((offset, is_bookmark, d));
+        }
+    };
+    for &m in display_matches(app) {
+        consider(m, false, &mut best);
+    }
+    for b in app.bookmarks.iter() {
+        consider(b.offset, true, &mut best);
+    }
+    best.map(|(offset, is_bookmark, _)| (offset, is_bookmark))
+}
+
+/// The hover preview's per-tick service: a candidate that has
+/// settled (350 ms) shows its tooltip; anything else hides it.
+fn service_hover(app: &mut App) {
+    if !app.hover_tool_ready || app.tooltip.is_null() {
+        return;
+    }
+    // A shown preview survives only while the pointer still rests
+    // on the same tick (the pointer may have left the window
+    // entirely, which sends no mouse-move).
+    if app.hover_shown.is_some() {
+        // SAFETY: POINT is a plain C struct; both calls are plain
+        // coordinate queries/conversions.
+        let mut pt: POINT = unsafe { std::mem::zeroed() };
+        let still = unsafe {
+            GetCursorPos(&mut pt);
+            ScreenToClient(app.hwnd, &mut pt);
+            tick_candidate_at(app, app.dip(pt.x), app.dip(pt.y)) == app.hover_shown
+        };
+        if !still {
+            hide_hover(app);
+        }
+    }
+    match app.hover_cand {
+        Some((offset, is_bookmark, since)) => {
+            if app.hover_shown == Some((offset, is_bookmark)) {
+                return;
+            }
+            if since.elapsed() < std::time::Duration::from_millis(350) {
+                return;
+            }
+            let (line, _) = app.editor.line_col_of(offset);
+            let preview: String = app
+                .editor
+                .line_text(line)
+                .map(|text| text.chars().take(60).collect())
+                .unwrap_or_default();
+            let text = if is_bookmark {
+                format!("Bookmark \u{00B7} Line {}: {}", line + 1, preview)
+            } else {
+                format!("Line {}: {}", line + 1, preview)
+            };
+            set_hover_text(&text);
+            show_hover_tooltip(app);
+            app.hover_shown = Some((offset, is_bookmark));
+        }
+        None => hide_hover(app),
+    }
+}
+
+/// Activate the tracking tooltip at the cursor's position.
+fn show_hover_tooltip(app: &mut App) {
+    // SAFETY: POINT is a plain C struct; GetCursorPos fills it.
+    let mut pt: POINT = unsafe { std::mem::zeroed() };
+    // SAFETY: our tooltip window is live and the tool was
+    // registered in create_children; TTTOOLINFOW is a plain C
+    // struct — only the id fields are needed for activation.
+    unsafe {
+        GetCursorPos(&mut pt);
+        let packed = ((pt.x as u32 & 0xFFFF) | ((pt.y as u32 & 0xFFFF) << 16)) as LPARAM;
+        SendMessageW(app.tooltip, TTM_TRACKPOSITION, 0, packed);
+        let mut info: TTTOOLINFOW = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        info.hwnd = app.hwnd;
+        info.uId = TICK_TOOL_ID;
+        SendMessageW(
+            app.tooltip,
+            TTM_TRACKACTIVATE,
+            1,
+            &info as *const TTTOOLINFOW as LPARAM,
+        );
+    }
+}
+
+/// Deactivate the tracking tooltip if it is showing.
+fn hide_hover(app: &mut App) {
+    if app.hover_shown.take().is_none() || app.tooltip.is_null() {
+        return;
+    }
+    // SAFETY: our tooltip window is live; see show_hover_tooltip.
+    unsafe {
+        let mut info: TTTOOLINFOW = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        info.hwnd = app.hwnd;
+        info.uId = TICK_TOOL_ID;
+        SendMessageW(
+            app.tooltip,
+            TTM_TRACKACTIVATE,
+            0,
+            &info as *const TTTOOLINFOW as LPARAM,
+        );
     }
 }
 
@@ -5100,6 +7686,35 @@ fn create_children(app: &mut App) {
     // with the menus. The first six flow from the left; the Text / Hex
     // mode toggles are created last and anchored to the right end of
     // the row by layout_children.
+    // The canvas tracking tool for the scrollbar tick hover previews
+    // (item 24 expansion): a tool on the main window itself, driven
+    // manually (TTM_TRACKACTIVATE) so it only ever speaks for a tick
+    // the pointer is resting on. Its text is swapped in place.
+    app.tooltip = tooltip;
+    set_hover_text("");
+    {
+        // SAFETY: TTTOOLINFOW is a plain C struct, zero-initialised
+        // then filled; the text pointer stays fixed at the scratch
+        // buffer for the process life (its contents are rewritten in
+        // place by `set_hover_text` before each activation).
+        let mut info: TTTOOLINFOW = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<TTTOOLINFOW>() as u32;
+        info.uFlags = 0;
+        info.hwnd = app.hwnd;
+        info.uId = TICK_TOOL_ID;
+        info.lpszText = HOVER_TEXT_SCRATCH.with(|s| s.borrow().as_ptr() as *mut u16);
+        // SAFETY: the tooltip window is live; `info` outlives the call.
+        let added = unsafe {
+            SendMessageW(
+                tooltip,
+                TTM_ADDTOOLW,
+                0,
+                &info as *const TTTOOLINFOW as LPARAM,
+            )
+        };
+        app.hover_tool_ready = added != 0;
+    }
+
     let toolbar_defs: [(usize, &str, &str); 6] = [
         (CMD_OPEN, "Open", "Open a file (Ctrl+O)"),
         (CMD_SAVE, "Save", "Save the file (Ctrl+S)"),
@@ -5323,6 +7938,13 @@ fn build_menus(app: &mut App) {
         menu_sep(search);
         menu_item(search, CMD_FIND_NEXT, "Find Next\tF3");
         menu_item(search, CMD_FIND_PREV, "Find Previous\tShift+F3");
+        menu_sep(search);
+        // Structural filter (roadmap item 18) and the jump history
+        // (item 11 wiring).
+        menu_item(search, CMD_FILTER, "Filter\u{2026}");
+        menu_sep(search);
+        menu_item(search, CMD_JUMP_BACK, "Back\tAlt+Left");
+        menu_item(search, CMD_JUMP_FORWARD, "Forward\tAlt+Right");
 
         let view = CreatePopupMenu();
         app.view_menu = view;
@@ -5330,6 +7952,21 @@ fn build_menus(app: &mut App) {
         menu_item(view, CMD_MODE_HEX, "Hex Mode\tF6");
         menu_sep(view);
         menu_item(view, CMD_INSPECTOR, "Data Inspector");
+        menu_item(view, CMD_STRINGS, "Strings Pane");
+        menu_sep(view);
+        // Roadmap slice R4b view features. Follow Tail and Word
+        // Wrap persist; the rest are session view switches.
+        menu_item(view, CMD_FOLLOW_TAIL, "Follow Tail");
+        menu_item(view, CMD_WORD_WRAP, "Word Wrap");
+        menu_sep(view);
+        menu_item(view, CMD_GRID, "Delimiter Grid");
+        menu_item(view, CMD_ENTROPY, "Entropy Strip");
+        menu_item(view, CMD_TIME_DELTAS, "Time Deltas");
+        menu_item(view, CMD_FREEZE, "Freeze Top Lines\u{2026}");
+        menu_item(view, CMD_DIM, "Dim Inactive Paragraphs");
+        menu_sep(view);
+        menu_item(view, CMD_ANSI, "ANSI Colours");
+        menu_item(view, CMD_CTL_CHARS, "Show Control Characters");
         menu_sep(view);
         app.theme_menu = CreatePopupMenu();
         for (i, name) in crate::theme::names().iter().enumerate() {
@@ -5523,6 +8160,26 @@ fn refresh_menu_checks(app: &App) {
             CMD_REL_OFFSETS as u32,
             MF_BYCOMMAND | if app.rel_offsets { MF_CHECKED } else { 0 },
         );
+        // Roadmap slice R4b view toggles: checked while on. Freeze
+        // shows its check while any lines are frozen.
+        for (id, on) in [
+            (CMD_FOLLOW_TAIL, app.settings.follow_tail),
+            (CMD_WORD_WRAP, app.settings.word_wrap),
+            (CMD_STRINGS, app.settings.strings_open),
+            (CMD_GRID, app.grid_on),
+            (CMD_ENTROPY, app.entropy_on),
+            (CMD_TIME_DELTAS, app.deltas_on),
+            (CMD_FREEZE, app.settings.freeze_lines > 0),
+            (CMD_DIM, app.dim_on),
+            (CMD_ANSI, app.ansi_on),
+            (CMD_CTL_CHARS, app.ctl_on),
+        ] {
+            CheckMenuItem(
+                app.view_menu,
+                id as u32,
+                MF_BYCOMMAND | if on { MF_CHECKED } else { 0 },
+            );
+        }
         // Save Options radios (roadmap items 31/32).
         if !app.save_options_menu.is_null() {
             let eol_idx = match app.settings.save_eol_choice() {
@@ -5655,8 +8312,10 @@ fn show_help(app: &mut App) {
 // ---------------------------------------------------------------------------
 
 fn after_caret_move(app: &mut App) {
+    app.status_note = None;
     let page = page_rows(app);
     app.editor.ensure_caret_visible(page);
+    ensure_caret_segment_visible(app);
     refresh_status(app);
     invalidate(app);
 }
@@ -5675,6 +8334,9 @@ fn set_mode(app: &mut App, mode: EditorMode) {
     if app.editor.mode() == mode {
         return;
     }
+    // The filter view is a text-view concept; switching mode drops
+    // it rather than leaving it describing the wrong view.
+    app.filter = None;
     app.editor.set_mode(mode);
     refresh_menu_checks(app);
     refresh_status(app);
@@ -5687,6 +8349,15 @@ fn set_mode(app: &mut App, mode: EditorMode) {
 }
 
 fn scroll_by(app: &mut App, delta: i64) {
+    // The filter view scrolls its own rows (R4b).
+    let page = page_rows(app) as usize;
+    if let Some(filter) = &mut app.filter {
+        let max_first = filter.view.len().saturating_sub(page);
+        let next = (filter.first_row as i64 + delta).clamp(0, max_first as i64);
+        filter.first_row = next as usize;
+        invalidate(app);
+        return;
+    }
     match app.editor.mode() {
         EditorMode::Text => {
             let next = (app.editor.first_line() as i64 + delta).max(0) as u64;
@@ -5775,6 +8446,40 @@ fn parse_hex(text: &str) -> Option<Vec<u8>> {
 }
 
 fn on_command(app: &mut App, id: usize) {
+    // The filter view is read-only: editing commands are refused
+    // while it is up (typing itself is swallowed in on_char /
+    // on_keydown, which never reach this far).
+    if app.filter.is_some()
+        && matches!(
+            id,
+            CMD_UNDO
+                | CMD_REDO
+                | CMD_CUT
+                | CMD_PASTE
+                | CMD_SORT_LINES
+                | CMD_DEDUP_LINES
+                | CMD_DO_REPLACE
+                | CMD_DO_REPLACE_ALL
+                | CMD_SAVE_SELECTION
+        )
+    {
+        app.status_note = Some("Close the filter (Esc) to edit".to_string());
+        refresh_status(app);
+        return;
+    }
+    // Find / Replace work on the document the filter froze: close
+    // the filter first, then run the command as asked.
+    if app.filter.is_some() && matches!(id, CMD_FIND | CMD_REPLACE | CMD_FIND_NEXT | CMD_FIND_PREV)
+    {
+        exit_filter(app);
+    }
+    // Freeze pane: paste and cut are refused at a frozen caret
+    // like typed edits (typing itself checks in on_char /
+    // on_keydown).
+    if matches!(id, CMD_PASTE | CMD_CUT) && edit_blocked_by_freeze(app, false, false) {
+        frozen_note(app);
+        return;
+    }
     match id {
         CMD_OPEN => {
             if prompt_save_if_dirty(app) {
@@ -6011,6 +8716,99 @@ fn on_command(app: &mut App, id: usize) {
             refresh_status(app);
             invalidate(app);
         }
+        CMD_FOLLOW_TAIL => {
+            // Follow Tail / Ghost Tail (roadmap item 22): persisted.
+            app.settings.follow_tail = !app.settings.follow_tail;
+            save_settings(app);
+            refresh_menu_checks(app);
+            refresh_status(app);
+        }
+        CMD_WORD_WRAP => {
+            // Word wrap (roadmap item 19): persisted, text mode
+            // only, view-only.
+            app.settings.word_wrap = !app.settings.word_wrap;
+            save_settings(app);
+            refresh_menu_checks(app);
+            if app.settings.word_wrap {
+                ensure_caret_segment_visible(app);
+            }
+            invalidate(app);
+        }
+        CMD_STRINGS => {
+            app.settings.strings_open = !app.settings.strings_open;
+            save_settings(app);
+            refresh_menu_checks(app);
+            layout_children(app);
+            invalidate(app);
+        }
+        CMD_GRID => {
+            app.grid_on = !app.grid_on;
+            refresh_menu_checks(app);
+            invalidate(app);
+        }
+        CMD_ENTROPY => {
+            app.entropy_on = !app.entropy_on;
+            refresh_menu_checks(app);
+            layout_children(app);
+            invalidate(app);
+        }
+        CMD_TIME_DELTAS => {
+            app.deltas_on = !app.deltas_on;
+            refresh_menu_checks(app);
+            invalidate(app);
+        }
+        CMD_DIM => {
+            app.dim_on = !app.dim_on;
+            refresh_menu_checks(app);
+            invalidate(app);
+        }
+        CMD_ANSI => {
+            app.ansi_on = !app.ansi_on;
+            refresh_menu_checks(app);
+            invalidate(app);
+        }
+        CMD_CTL_CHARS => {
+            app.ctl_on = !app.ctl_on;
+            refresh_menu_checks(app);
+            invalidate(app);
+        }
+        CMD_FREEZE => {
+            // Freeze Top Lines (freeze pane): prompt for the count;
+            // 0 clears. Persisted, so the choice survives restarts.
+            let current = app.settings.freeze_lines.to_string();
+            if let Some(text) = show_prompt(
+                app,
+                "Freeze Top Lines",
+                "Lines to pin at the top (0-50, 0 = off):",
+                &current,
+            ) {
+                match text.trim().parse::<u32>() {
+                    Ok(n) if n <= 50 => {
+                        app.settings.freeze_lines = n;
+                        save_settings(app);
+                        refresh_menu_checks(app);
+                        invalidate(app);
+                    }
+                    _ => {
+                        message_box(
+                            app.hwnd,
+                            "Enter a whole number from 0 to 50.",
+                            "Freeze Top Lines",
+                            MB_OK | MB_ICONERROR,
+                        );
+                    }
+                }
+            }
+        }
+        CMD_FILTER => {
+            open_filter_prompt(app);
+        }
+        CMD_JUMP_BACK => {
+            jump_history_move(app, false);
+        }
+        CMD_JUMP_FORWARD => {
+            jump_history_move(app, true);
+        }
         _ if (CMD_HEXCOLS_BASE..CMD_HEXCOLS_BASE + HEX_COLS_MENU.len()).contains(&id) => {
             // Hex Columns (roadmap item 13): 0 is fit-to-window.
             app.settings.hex_cols = HEX_COLS_MENU[id - CMD_HEXCOLS_BASE];
@@ -6124,17 +8922,210 @@ fn on_command(app: &mut App, id: usize) {
 
 /// Handle WM_KEYDOWN for the main window. Returns true when handled.
 /// Virtual-key codes are the stable Win32 numbers, written literally.
+/// Whether an edit at the caret would touch the frozen block
+/// (R4b freeze pane): the caret or selection starts inside it, or
+/// the edit merges across its lower edge (Backspace at the first
+/// unfrozen line's start, Delete at the last frozen line's end).
+/// Freeze applies to the plain text view only.
+fn edit_blocked_by_freeze(app: &mut App, backspace: bool, delete: bool) -> bool {
+    let freeze = app.settings.freeze_lines as u64;
+    if freeze == 0
+        || app.editor.mode() != EditorMode::Text
+        || app.filter.is_some()
+        || grid_active(app)
+    {
+        return false;
+    }
+    let start = app
+        .editor
+        .selection_range()
+        .map(|(s, _)| s)
+        .unwrap_or_else(|| app.editor.caret());
+    let (line, col) = app.editor.line_col_of(start);
+    if line < freeze {
+        return true;
+    }
+    if backspace && line == freeze && col == 0 {
+        return true;
+    }
+    if delete && line + 1 == freeze {
+        let chars = app.editor.line_char_count(line);
+        if col >= chars {
+            return true;
+        }
+    }
+    false
+}
+
+/// Refuse an edit into the frozen block, saying why in the status
+/// bar.
+fn frozen_note(app: &mut App) {
+    app.status_note =
+        Some("That line is frozen \u{2014} View \u{25B8} Freeze Top Lines changes it".to_string());
+    refresh_status(app);
+}
+
+/// After an Up / PageUp move, keep the caret out of the frozen
+/// block: scrolling up stops at the first unfrozen line (the block
+/// can still be entered by clicking or jumping — viewing is free;
+/// only editing is refused there).
+fn clamp_freeze_up(app: &mut App, before_line: u64) {
+    let freeze = app.settings.freeze_lines as u64;
+    if freeze == 0 || app.filter.is_some() || grid_active(app) {
+        return;
+    }
+    let (now, col) = app.editor.line_col_of(app.editor.caret());
+    if before_line >= freeze && now < freeze {
+        if let Some(off) = app.editor.offset_of_line_col(freeze, col) {
+            app.editor.move_caret_to(off, false);
+        }
+    }
+}
+
+/// Display-row Up/Down under word wrap (R4b): move the caret one
+/// DISPLAY row, preserving the in-segment column. Returns false
+/// when wrap is off or the caret's segment is not in view (the
+/// caller then falls back to the editor's line move).
+fn wrap_move(app: &mut App, up: bool, extend: bool) -> bool {
+    if !wrap_active(app) || app.editor.mode() != EditorMode::Text {
+        return false;
+    }
+    let page = page_rows(app) as usize + 1;
+    let rows = display_rows(app, page);
+    let (line, col) = app.editor.line_col_of(app.editor.caret());
+    let line_chars = app.editor.line_char_count(line);
+    let mut caret_idx: Option<usize> = None;
+    for (i, row) in rows.iter().enumerate() {
+        if row.line_no == line
+            && col >= row.char_start
+            && (col < row.char_start + row.text.chars().count() as u64
+                || row.char_start + row.text.chars().count() as u64 == line_chars)
+        {
+            caret_idx = Some(i);
+            break;
+        }
+    }
+    let Some(i) = caret_idx else {
+        return false;
+    };
+    let target = if up {
+        i.checked_sub(1)
+    } else if i + 1 < rows.len() {
+        Some(i + 1)
+    } else {
+        None
+    };
+    let Some(t) = target else {
+        return false;
+    };
+    // Scrolling up stops at the frozen block's edge (see
+    // clamp_freeze_up for the line-move path).
+    if rows[t].frozen && !rows[i].frozen && !extend {
+        return true;
+    }
+    let in_seg = col - rows[i].char_start;
+    let trow = &rows[t];
+    let tcount = trow.text.chars().count() as u64;
+    let tcol = trow.char_start + in_seg.min(tcount);
+    let tline = trow.line_no;
+    if let Some(off) = app.editor.offset_of_line_col(tline, tcol) {
+        app.editor.move_caret_to(off, extend);
+    }
+    true
+}
+
 fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
     let vk = wparam as u32;
     // SAFETY: plain key-state reads (VK_CONTROL = 0x11, VK_SHIFT = 0x10).
     let ctrl = unsafe { GetKeyState(0x11) } as u16 & 0x8000 != 0;
     let shift = unsafe { GetKeyState(0x10) } as u16 & 0x8000 != 0;
+    let alt = unsafe { GetKeyState(0x12) } as u16 & 0x8000 != 0;
     let page = page_rows(app);
+    // Jump history (roadmap item 11 wiring): Alt+Left / Alt+Right
+    // walk it, in every mode.
+    if alt && (vk == 0x25 || vk == 0x27) {
+        jump_history_move(app, vk == 0x27);
+        return true;
+    }
+    // The filter view has its own key model: Up/Down walk the row
+    // cursor, Esc leaves without moving, and editing keys are
+    // swallowed (the view is read-only). A few commands fall
+    // through to the main handling below — Open and Save, F1, and
+    // the find commands, which close the filter first (see the
+    // guard at the top of on_command).
+    if app.filter.is_some() {
+        match vk {
+            0x26 => {
+                filter_move_cursor(app, -1);
+                return true;
+            }
+            0x28 => {
+                filter_move_cursor(app, 1);
+                return true;
+            }
+            0x21 => {
+                filter_move_cursor(app, -(page as i64));
+                return true;
+            }
+            0x22 => {
+                filter_move_cursor(app, page as i64);
+                return true;
+            }
+            0x24 => {
+                if let Some(filter) = &mut app.filter {
+                    filter.cursor_row = 0;
+                }
+                filter_ensure_cursor_visible(app);
+                refresh_status(app);
+                invalidate(app);
+                return true;
+            }
+            0x23 => {
+                if let Some(filter) = &mut app.filter {
+                    filter.cursor_row = filter.view.len().saturating_sub(1);
+                }
+                filter_ensure_cursor_visible(app);
+                refresh_status(app);
+                invalidate(app);
+                return true;
+            }
+            0x1B => {
+                exit_filter(app);
+                return true;
+            }
+            0x70 => {
+                show_help(app);
+                return true;
+            }
+            0x72 => {
+                // F3 falls through (find closes the filter first).
+            }
+            _ if ctrl && matches!(vk, 0x4F | 0x53 | 0x46 | 0x48) => {
+                // Ctrl+O / Ctrl+S / Ctrl+F / Ctrl+H fall through.
+            }
+            _ => return true,
+        }
+    }
     match vk {
         0x25 => app.editor.move_left(shift),  // VK_LEFT
         0x27 => app.editor.move_right(shift), // VK_RIGHT
-        0x26 => app.editor.move_up(shift),    // VK_UP
-        0x28 => app.editor.move_down(shift),  // VK_DOWN
+        0x26 => {
+            // VK_UP (wrap moves by display row; the freeze clamp
+            // keeps scrolling up out of the pinned block)
+            let before = app.editor.line_col_of(app.editor.caret()).0;
+            if !wrap_move(app, true, shift) {
+                app.editor.move_up(shift);
+                if !shift {
+                    clamp_freeze_up(app, before);
+                }
+            }
+        }
+        0x28 => {
+            // VK_DOWN (wrap moves by display row)
+            if !wrap_move(app, false, shift) {
+                app.editor.move_down(shift);
+            }
+        }
         0x24 => {
             // VK_HOME (Ctrl: document start)
             if ctrl {
@@ -6151,10 +9142,21 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
                 app.editor.move_end(shift)
             }
         }
-        0x21 => app.editor.move_page_up(page, shift), // VK_PRIOR
+        0x21 => {
+            // VK_PRIOR
+            let before = app.editor.line_col_of(app.editor.caret()).0;
+            app.editor.move_page_up(page, shift);
+            if !shift {
+                clamp_freeze_up(app, before);
+            }
+        }
         0x22 => app.editor.move_page_down(page, shift), // VK_NEXT
         0x08 => {
             // VK_BACK
+            if edit_blocked_by_freeze(app, true, false) {
+                frozen_note(app);
+                return true;
+            }
             if app.editor.backspace().unwrap_or(false) {
                 after_edit(app);
             }
@@ -6162,6 +9164,10 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
         }
         0x2E => {
             // VK_DELETE
+            if edit_blocked_by_freeze(app, false, true) {
+                frozen_note(app);
+                return true;
+            }
             if app.editor.delete_forward().unwrap_or(false) {
                 after_edit(app);
             }
@@ -6221,6 +9227,13 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
                 0x48 => on_command(app, CMD_REPLACE),     // Ctrl+H
                 0xBB => on_command(app, CMD_FONT_BIGGER), // Ctrl+'+' (VK_OEM_PLUS)
                 0xBD => on_command(app, CMD_FONT_SMALLER), // Ctrl+'-' (VK_OEM_MINUS)
+                0x0D => {
+                    // Ctrl+Enter: pointer following in hex mode
+                    // (roadmap item 11 wiring).
+                    if app.editor.mode() == EditorMode::Hex {
+                        pointer_jump(app);
+                    }
+                }
                 _ => return false,
             }
             // Navigation arms above fall through to the caret update;
@@ -6254,6 +9267,24 @@ fn insert_char(app: &mut App, c: char) {
 /// Handle WM_CHAR for the main window. Returns true when handled.
 fn on_char(app: &mut App, wparam: WPARAM) -> bool {
     let ch = wparam as u32;
+    // The filter view is read-only: Enter opens the cursor row's
+    // line, and every other character is swallowed.
+    if app.filter.is_some() {
+        if ch == 0x0D {
+            filter_jump_to_cursor(app);
+        }
+        return true;
+    }
+    // Freeze pane: typed input at a frozen caret is refused
+    // (Enter and Tab edit too; the other control characters are
+    // swallowed by the text branch anyway).
+    if app.editor.mode() == EditorMode::Text
+        && (matches!(ch, 0x09 | 0x0D) || ch >= 0x20)
+        && edit_blocked_by_freeze(app, false, false)
+    {
+        frozen_note(app);
+        return true;
+    }
     match app.editor.mode() {
         EditorMode::Hex => {
             if let Some(c) = char::from_u32(ch) {
@@ -6325,11 +9356,150 @@ fn mouse_xy(lparam: LPARAM) -> (i32, i32) {
     )
 }
 
+/// Flip one bit of the byte at the caret from the Data
+/// Inspector's bit row (R4b): a normal undoable edit through the
+/// editor's byte-replace path; the caret does not move.
+fn flip_inspector_bit(app: &mut App, bit: u32) {
+    let Some((offset, byte)) = app.bit_mirror else {
+        return;
+    };
+    if app.editor.caret() != offset {
+        return;
+    }
+    let new_byte = byte ^ (1u8 << bit);
+    if app.editor.replace_byte_at(offset, new_byte).is_ok() {
+        after_edit(app);
+    }
+}
+
+/// A click in the strings pane (R4b): a min-length chip rescan, or
+/// a result row (select; double-click jumps to the string).
+fn strings_click(app: &mut App, x: f32, y: f32, double: bool, layout: &Layout) {
+    for i in 0..app.strings_chips.len() {
+        let (min_len, r) = app.strings_chips[i];
+        if x >= r.0 && x < r.2 && y >= r.1 && y < r.3 {
+            if app.settings.strings_min_len != min_len {
+                app.settings.strings_min_len = min_len;
+                save_settings(app);
+                service_strings(app);
+                invalidate(app);
+            }
+            return;
+        }
+    }
+    let row = ((y - layout.rows_bottom - STRINGS_HEADER_H) / app.line_h.max(1.0)).floor();
+    if row < 0.0 {
+        return;
+    }
+    let idx = app.strings.first + row as usize;
+    if idx < app.strings.results.len() {
+        app.strings.selected = Some(idx);
+        if double {
+            strings_jump_to(app, idx);
+        } else {
+            invalidate(app);
+        }
+    }
+}
+
+/// Wheel over the strings pane scrolls the pane's rows (R4b),
+/// sharing the window's wheel remainder like all its scrolling.
+fn strings_wheel(app: &mut App, wparam: WPARAM) {
+    let delta = ((wparam >> 16) as u16) as i16 as i32;
+    app.wheel_rem += delta;
+    let max_first = app
+        .strings
+        .results
+        .len()
+        .saturating_sub(STRINGS_ROWS as usize);
+    let mut changed = false;
+    while app.wheel_rem >= 120 {
+        app.strings.first = app.strings.first.saturating_sub(3);
+        app.wheel_rem -= 120;
+        changed = true;
+    }
+    while app.wheel_rem <= -120 {
+        app.strings.first = (app.strings.first + 3).min(max_first);
+        app.wheel_rem += 120;
+        changed = true;
+    }
+    if changed {
+        invalidate(app);
+    }
+}
+
 fn on_mouse_down(app: &mut App, lparam: LPARAM, double: bool) {
     // SAFETY: clicking the editor surface focuses the main window.
     unsafe { SetFocus(app.hwnd) };
     let (x, y) = mouse_xy(lparam);
+    let layout = compute_layout(app);
+    let xd = app.dip(x);
+    let yd = app.dip(y);
+    // Any press dismisses the tick hover preview.
+    app.hover_cand = None;
+    hide_hover(app);
+    // Strings pane (R4b): chips and rows live below the rows region.
+    if layout.strings_h > 0.0 && yd >= layout.rows_bottom {
+        strings_click(app, xd, yd, double, &layout);
+        return;
+    }
+    // Entropy strip (R4b): a click seeks proportionally.
+    if app.entropy_on && yd >= layout.editor_top && yd < layout.editor_top + ENTROPY_H {
+        entropy_seek(app, xd);
+        return;
+    }
+    // The filter banner and other chrome above the rows are not
+    // editor clicks.
+    if yd < layout.rows_top {
+        return;
+    }
+    // Data Inspector bit boxes (R4b): a click flips the bit.
+    if app.settings.inspector_open {
+        let hit = app
+            .bit_boxes
+            .iter()
+            .position(|r| xd >= r.0 && xd < r.2 && yd >= r.1 && yd < r.3);
+        if let Some(i) = hit {
+            flip_inspector_bit(app, 7 - i as u32);
+            return;
+        }
+    }
+    // The filter view (R4b): clicks place the row cursor; a double
+    // click opens the line.
+    if app.filter.is_some() {
+        let row_in_view = ((yd - layout.rows_top) / app.line_h.max(1.0)).floor();
+        if row_in_view >= 0.0 {
+            let (first, len) = {
+                let filter = app.filter.as_ref().expect("checked above");
+                (filter.first_row, filter.view.len())
+            };
+            if len > 0 {
+                let idx = (first + row_in_view as usize).min(len - 1);
+                if let Some(filter) = &mut app.filter {
+                    filter.cursor_row = idx;
+                }
+                if double {
+                    filter_jump_to_cursor(app);
+                    return;
+                }
+                refresh_status(app);
+                invalidate(app);
+            }
+        }
+        return;
+    }
     let offset = pos_to_offset(app, x, y);
+    // Ctrl+click in hex mode follows the pointer at the clicked
+    // byte (roadmap item 11 wiring).
+    // SAFETY: plain key-state read (VK_CONTROL = 0x11).
+    let ctrl = unsafe { GetKeyState(0x11) } as u16 & 0x8000 != 0;
+    if ctrl && app.editor.mode() == EditorMode::Hex {
+        app.editor.move_caret_to(offset, false);
+        pointer_jump(app);
+        app.caret_on = true;
+        invalidate(app);
+        return;
+    }
     if double && app.editor.mode() == EditorMode::Text {
         app.editor.move_caret_to(offset, false);
         select_word_at_caret(app);
@@ -6361,15 +9531,15 @@ fn scrollbar_hit(app: &mut App, x_px: i32, y_px: i32) -> Option<ScrollHit> {
     let y = app.dip(y_px);
     if x < layout.editor_right - SCROLLBAR_W
         || x >= layout.editor_right
-        || y < layout.editor_top
-        || y >= layout.editor_bottom
+        || y < layout.rows_top
+        || y >= layout.rows_bottom
     {
         return None;
     }
     let (total, first, visible) = scroll_metrics(app);
-    let track_h = layout.editor_bottom - layout.editor_top;
+    let track_h = layout.rows_bottom - layout.rows_top;
     let (thumb_y, thumb_h) = scrollbar_geometry(track_h, total, visible, first)?;
-    let rel = y - layout.editor_top;
+    let rel = y - layout.rows_top;
     // A page step is expressed in the editor's scroll unit (text
     // lines / hex rows) even while the geometry above runs in bytes
     // (partial index): in line units `visible` already is a page of
@@ -6420,9 +9590,19 @@ fn on_scrollbar_move(app: &mut App, lparam: LPARAM) -> bool {
     let (_, y_px) = mouse_xy(lparam);
     let layout = compute_layout(app);
     let (total, _, visible) = scroll_metrics(app);
-    let track_h = layout.editor_bottom - layout.editor_top;
-    let thumb_y = app.dip(y_px) - layout.editor_top - grab;
+    let track_h = layout.rows_bottom - layout.rows_top;
+    let thumb_y = app.dip(y_px) - layout.rows_top - grab;
     let first = scrollbar_first_row(track_h, total, visible, thumb_y);
+    // The filter view's drag sets its own first row (R4b).
+    if app.filter.is_some() {
+        let page = page_rows(app) as usize;
+        if let Some(filter) = &mut app.filter {
+            let max_first = filter.view.len().saturating_sub(page);
+            filter.first_row = (first as usize).min(max_first);
+        }
+        invalidate(app);
+        return true;
+    }
     match app.editor.mode() {
         EditorMode::Text => {
             if app.editor.index_is_partial() {
@@ -6569,7 +9749,23 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_MOUSEWHEEL => {
-            on_wheel(app, wparam);
+            // The wheel message carries SCREEN coordinates: over
+            // the strings pane it scrolls the pane, anywhere else
+            // the document (R4b).
+            let (sx, sy) = mouse_xy(lparam);
+            let mut pt = POINT { x: sx, y: sy };
+            // SAFETY: our window; converts the point in place.
+            unsafe { ScreenToClient(hwnd, &mut pt) };
+            let layout = compute_layout(app);
+            if layout.strings_h > 0.0
+                && wparam & 0xFFFF & 0x0008 == 0
+                && app.dip(pt.y) >= layout.rows_bottom
+                && !app.strings.results.is_empty()
+            {
+                strings_wheel(app, wparam);
+            } else {
+                on_wheel(app, wparam);
+            }
             0
         }
         WM_LBUTTONDOWN => {
@@ -6591,6 +9787,26 @@ unsafe extern "system" fn wnd_proc(
                 app.editor.move_caret_to(offset, true);
                 refresh_status(app);
                 invalidate(app);
+            } else if app.scroll_drag.is_none() && !app.dragging {
+                // Tick hover preview (item 24 expansion): track the
+                // candidate under the pointer; the tick service
+                // shows it once it settles.
+                let (x, y) = mouse_xy(lparam);
+                match tick_candidate_at(app, app.dip(x), app.dip(y)) {
+                    Some((offset, is_bookmark)) => {
+                        let settled = matches!(
+                            app.hover_cand,
+                            Some((o, b, _)) if o == offset && b == is_bookmark
+                        );
+                        if !settled {
+                            app.hover_cand = Some((offset, is_bookmark, Instant::now()));
+                        }
+                    }
+                    None => {
+                        app.hover_cand = None;
+                        hide_hover(app);
+                    }
+                }
             }
             0
         }
@@ -6724,6 +9940,18 @@ unsafe extern "system" fn wnd_proc(
                                 } else {
                                     Some((progress.indexed_bytes, total))
                                 };
+                                if complete && app.tail_pin_view {
+                                    // Ghost Tail: the view was at
+                                    // the end when the growth was
+                                    // adopted — pin it to the new
+                                    // end now that the index can
+                                    // name it.
+                                    app.tail_pin_view = false;
+                                    pin_view_to_end(app);
+                                }
+                                if complete {
+                                    rebuild_filter_if_stale(app);
+                                }
                                 refresh_status(app);
                                 invalidate(app);
                             } else if app.indexing.is_some() {
@@ -6734,7 +9962,9 @@ unsafe extern "system" fn wnd_proc(
                     }
                     if app.pending_goto.is_some() && app.editor.has_complete_index() {
                         let line = app.pending_goto.take().expect("checked above");
+                        let from = app.editor.caret();
                         app.editor.goto_line(line);
+                        record_jump(app, from, app.editor.caret());
                         after_caret_move(app);
                     }
                     // Pick up the original file's fingerprint for
@@ -6795,6 +10025,15 @@ unsafe extern "system" fn wnd_proc(
                             }
                         }
                     }
+                    // Strings pane + entropy strip: start owed
+                    // scans and pick up finished ones (both workers
+                    // are epoch-guarded on their own generations).
+                    service_strings(app);
+                    service_entropy(app);
+                    // Scrollbar tick hover preview (item 24
+                    // expansion): a settled candidate shows; a moved
+                    // or vanished one hides.
+                    service_hover(app);
                     // Recovery: one second after the last edit,
                     // write the record. A delta write that must wait
                     // for the fingerprint keeps the debounce open
@@ -7349,6 +10588,40 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         last_edit: None,
         custom_colors: [0; 16],
         index_epoch: 0,
+        status_note: None,
+        tail_pin_view: false,
+        filter: None,
+        strings: StringsState {
+            slot: Arc::new(Mutex::new(None)),
+            gen: 0,
+            results: Vec::new(),
+            first: 0,
+            selected: None,
+            searching: false,
+            scanned_gen: 0,
+            scanned_min_len: 0,
+        },
+        entropy: EntropyState {
+            slot: Arc::new(Mutex::new(None)),
+            gen: 0,
+            values: Vec::new(),
+            computing: false,
+            scanned_gen: 0,
+        },
+        entropy_on: false,
+        grid_on: false,
+        deltas_on: false,
+        dim_on: false,
+        ansi_on: false,
+        ctl_on: false,
+        jump_history: JumpHistory::new(),
+        tooltip: std::ptr::null_mut(),
+        hover_tool_ready: false,
+        hover_shown: None,
+        hover_cand: None,
+        bit_boxes: Vec::new(),
+        bit_mirror: None,
+        strings_chips: Vec::new(),
         last_find_text: String::new(),
         pending_goto: if options.file.is_some() {
             options.line
@@ -7505,6 +10778,23 @@ fn register_classes(hinstance: HINSTANCE) -> bool {
     };
     // SAFETY: as above.
     if unsafe { RegisterClassW(&split_class) } == 0 {
+        return false;
+    }
+    let prompt = wstr(PROMPT_CLASS);
+    let prompt_class = WNDCLASSW {
+        style: 0x2 | 0x1,
+        lpfnWndProc: Some(prompt_dialog_proc),
+        cbClsExtra: 0,
+        cbWndExtra: 0,
+        hInstance: hinstance,
+        hIcon: icon,
+        hCursor: cursor,
+        hbrBackground: std::ptr::null_mut(),
+        lpszMenuName: std::ptr::null(),
+        lpszClassName: prompt.as_ptr(),
+    };
+    // SAFETY: as above.
+    if unsafe { RegisterClassW(&prompt_class) } == 0 {
         return false;
     }
     let hash = wstr(HASH_CLASS);
@@ -7927,5 +11217,80 @@ mod tests {
         let rows = inspector_rows(&report, 0);
         assert_eq!(rows[9].1, "\u{2014}"); // Int32 LE
         assert_eq!(rows[24].1, "\u{2014}"); // GUID
+    }
+
+    // ---- R4b pure helpers -----------------------------------------
+
+    #[test]
+    fn wrap_ranges_cover_the_line_exactly() {
+        assert_eq!(wrap_char_ranges(0, 8), vec![(0, 0)]);
+        assert_eq!(wrap_char_ranges(5, 8), vec![(0, 5)]);
+        assert_eq!(wrap_char_ranges(8, 8), vec![(0, 8)]);
+        assert_eq!(wrap_char_ranges(21, 8), vec![(0, 8), (8, 16), (16, 21)]);
+        // A zero column count is clamped, never a hang.
+        assert_eq!(wrap_char_ranges(3, 0), vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn segments_without_toggles_are_one_plain_run() {
+        let segs = build_segments("plain text", 0, false, false);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].text, "plain text");
+        assert_eq!(segs[0].cells, 10);
+        assert_eq!(segs[0].fg, None);
+    }
+
+    #[test]
+    fn segments_apply_sgr_colours_and_consume_the_sequence() {
+        let segs = build_segments("a\u{1B}[31mred\u{1B}[0m plain", 0, true, false);
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "red", " plain"]);
+        assert_eq!(segs[0].fg, None);
+        assert_eq!(segs[1].fg, Some(1)); // red, code 31
+        assert_eq!(segs[2].fg, None); // reset by code 0
+                                      // The escape bytes occupy no character columns.
+        assert_eq!(segs[1].char_from, 1);
+        assert_eq!(segs[2].char_from, 4);
+        // Bright + bold mappings.
+        let segs = build_segments("\u{1B}[1;34mB\u{1B}[96mC", 0, true, false);
+        assert_eq!(segs[0].fg, Some(12)); // bold blue -> bright blue
+        assert_eq!(segs[1].fg, Some(14)); // bright cyan, code 96
+    }
+
+    #[test]
+    fn segments_tag_control_characters_when_asked() {
+        let segs = build_segments("a\u{1}b\u{7F}\t", 0, false, true);
+        let texts: Vec<&str> = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["a", "^A", "b", "^?", "\t"]);
+        assert!(segs[1].tag && segs[3].tag);
+        assert_eq!(segs[1].cells, 2); // a tag is two cells for one char
+        assert_eq!(segs[1].char_len, 1);
+        assert!(!segs[4].tag); // tab stays a plain character
+    }
+
+    #[test]
+    fn segment_cell_and_column_maps_are_inverses() {
+        let segs = build_segments("ab\u{2}cd", 0, false, true);
+        // Cells: a=0, b=1, tag=2..4, c=4, d=5, end=6.
+        assert_eq!(seg_cell_of(&segs, 0), 0);
+        assert_eq!(seg_cell_of(&segs, 2), 2);
+        assert_eq!(seg_cell_of(&segs, 3), 4);
+        assert_eq!(seg_cell_of(&segs, 5), 6);
+        assert_eq!(seg_col_of_cell(&segs, 0), 0);
+        assert_eq!(seg_col_of_cell(&segs, 3), 2); // inside the tag
+        assert_eq!(seg_col_of_cell(&segs, 4), 3);
+        assert_eq!(seg_col_of_cell(&segs, 6), 5);
+    }
+
+    #[test]
+    fn delta_formatting_reads_like_a_log() {
+        assert_eq!(format_delta(0), "+0ms");
+        assert_eq!(format_delta(45), "+45ms");
+        assert_eq!(format_delta(-3), "-3ms");
+        assert_eq!(format_delta(1000), "+1s");
+        assert_eq!(format_delta(1250), "+1.25s");
+        assert_eq!(format_delta(1500), "+1.5s");
+        assert_eq!(format_delta(90_000), "+1.5m");
+        assert_eq!(format_delta(-120_000), "-2m");
     }
 }
