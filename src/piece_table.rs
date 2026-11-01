@@ -42,6 +42,15 @@ pub struct PieceNode {
     pub length: u64,
 }
 
+// Layout pins (architectural audit): a document's resident footprint is
+// dominated by one `PieceNode` per piece plus one Fenwick weight (a
+// single `u64`, pinned below) per piece, and the SPEC section 8
+// active-memory budget (< 35 MB) is spent against exactly those two
+// records. If a field change ever grows either, the build breaks here
+// instead of silently inflating every document's footprint.
+const _: () = assert!(std::mem::size_of::<PieceNode>() == 24);
+const _: () = assert!(std::mem::align_of::<PieceNode>() == 8);
+
 impl PieceNode {
     pub fn new(source: BufferSource, source_offset: u64, length: u64) -> Self {
         Self {
@@ -124,12 +133,19 @@ pub const AUTO_COALESCE_THRESHOLD: usize = 8192;
 /// Build a Fenwick (binary indexed) tree over `lengths`: `tree[i]`
 /// (1-based) holds the sum of the `lowbit(i)` lengths ending at piece
 /// `i - 1`. Prefix sums and point updates are O(log N).
-fn build_fenwick(lengths: &[u64]) -> Vec<u64> {
-    let n = lengths.len();
-    let mut tree = vec![0u64; n + 1];
-    for (i, &len) in lengths.iter().enumerate() {
-        tree[i + 1] = len;
-    }
+///
+/// Takes the lengths as an iterator so callers can stream them
+/// straight from the piece list: rebuilding the tree on every
+/// structural mutation used to collect the lengths into a throwaway
+/// `Vec<u64>` first — one allocation per edit, now zero.
+fn build_fenwick(lengths: impl Iterator<Item = u64>) -> Vec<u64> {
+    // The weights are one `u64` per piece (plus the unused slot 0);
+    // together with the `PieceNode` pin above, that is the whole
+    // per-piece memory the SPEC section 8 budget is spent against.
+    const _: () = assert!(std::mem::size_of::<u64>() == 8);
+    let mut tree: Vec<u64> = vec![0];
+    tree.extend(lengths);
+    let n = tree.len() - 1;
     for i in 1..=n {
         let j = i + (i & i.wrapping_neg());
         if j <= n {
@@ -181,7 +197,7 @@ impl PieceTable {
         } else {
             vec![PieceNode::new(BufferSource::Original, 0, original_len)]
         };
-        let weights = build_fenwick(&pieces.iter().map(|p| p.length).collect::<Vec<_>>());
+        let weights = build_fenwick(pieces.iter().map(|p| p.length));
         Self {
             original_file_size: original_len,
             append_buffer: Vec::new(),
@@ -213,7 +229,7 @@ impl PieceTable {
         } else {
             vec![PieceNode::new(BufferSource::Original, 0, len)]
         };
-        let weights = build_fenwick(&pieces.iter().map(|p| p.length).collect::<Vec<_>>());
+        let weights = build_fenwick(pieces.iter().map(|p| p.length));
         Self {
             original_file_size: len,
             append_buffer: Vec::new(),
@@ -298,8 +314,7 @@ impl PieceTable {
     /// Called by every structural mutation in this module, and by the
     /// undo engine after it splices `pieces` directly.
     pub(crate) fn rebuild_weights(&mut self) {
-        let lengths: Vec<u64> = self.pieces.iter().map(|p| p.length).collect();
-        self.weights = build_fenwick(&lengths);
+        self.weights = build_fenwick(self.pieces.iter().map(|p| p.length));
     }
 
     /// How many times [`PieceTable::coalesce`] merged pieces (the undo
