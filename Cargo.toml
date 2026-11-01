@@ -48,18 +48,29 @@ path = "src/main.rs"
 #                                 onto the window to open it)
 #   Win32_UI_WindowsAndMessaging  windows, menus, messages, the scrollbar,
 #                                 SystemParametersInfoW (wheel lines)
+# Slice R4c adds, per feature:
+#   Win32_Globalization           code-page conversion for the extended
+#                                 code pages (roadmap item 29):
+#                                 MultiByteToWideChar / WideCharToMultiByte
+#   Win32_System_IO               DeviceIoControl for the block-clone
+#                                 fast save (roadmap item 4)
+#   Win32_System_Ioctl            FSCTL_DUPLICATE_EXTENTS_TO_FILE and
+#                                 DUPLICATE_EXTENTS_DATA (same feature)
 # Direct2D / DirectWrite are NOT part of windows-sys 0.61 (its Graphics
 # features stop at Gdi/GdiPlus/Dwm/Hlsl/OpenGL/Printing), so gui_win.rs
 # declares the few COM interfaces it uses by hand — still no other crate.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Globalization",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_DataExchange",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Ole",
