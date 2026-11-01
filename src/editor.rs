@@ -54,6 +54,12 @@ pub const TRUNCATION_MARKER: &str = " \u{2026}"; // " …"
 /// Most bytes fetched for one row while locating its end.
 const ROW_FETCH_BYTES: u64 = 256 * 1024;
 
+/// Largest text range the sort / dedup line operations will process
+/// (roadmap item 23): the range is materialised once to reorder its
+/// lines, so it is capped — the rest of the editor never materialises
+/// document content at all.
+pub const MAX_LINE_OP_BYTES: u64 = 64 * 1024 * 1024;
+
 /// How a document is being viewed/edited.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EditorMode {
@@ -75,6 +81,9 @@ pub enum EditorError {
     Save(String),
     /// A file could not be read.
     Io(String),
+    /// A line operation's range expanded past the size limit
+    /// (carries the expanded size in bytes).
+    RangeTooLarge(u64),
 }
 
 impl fmt::Display for EditorError {
@@ -85,6 +94,11 @@ impl fmt::Display for EditorError {
             EditorError::Encode(e) => write!(f, "{e}"),
             EditorError::Save(m) => write!(f, "save failed: {m}"),
             EditorError::Io(m) => write!(f, "{m}"),
+            EditorError::RangeTooLarge(n) => write!(
+                f,
+                "the range covers {n} bytes of text; line operations are limited to {} bytes",
+                MAX_LINE_OP_BYTES
+            ),
         }
     }
 }
@@ -1256,6 +1270,78 @@ impl Editor {
         Ok(self.matches.len())
     }
 
+    /// Run a find limited to the byte range `[start, end)` and select
+    /// the first match at or after the caret (wrapping to the first
+    /// match in the range) — the "search in selection" surface over
+    /// the scoped core (roadmap item 11). Only matches lying fully
+    /// inside the range are ever in the match list, so
+    /// [`Editor::find_next`] / [`Editor::find_prev`] walk the range
+    /// and nothing outside it. The UTF-16 alignment filter of
+    /// [`Editor::set_find`] applies the same way. Returns the number
+    /// of matches in the range.
+    pub fn set_find_in_range(
+        &mut self,
+        needle_text: &str,
+        options: SearchOptions,
+        start: u64,
+        end: u64,
+    ) -> Result<usize, EditorError> {
+        let needle =
+            encoding::encode_needle(needle_text, self.encoding()).map_err(EditorError::Encode)?;
+        self.needle_bytes = needle;
+        self.needle_text = needle_text.to_string();
+        self.find_options = options;
+        let mut found =
+            search::find_in_range(&self.table, &self.needle_bytes, &options, start, end);
+        if matches!(
+            self.encoding(),
+            TextEncoding::Utf16Le | TextEncoding::Utf16Be
+        ) {
+            let bom = self.detection.bom_len as u64;
+            found.retain(|&m| m >= bom && (m - bom) % 2 == 0);
+        }
+        self.matches = found;
+        if self.matches.is_empty() {
+            self.match_index = None;
+            return Ok(0);
+        }
+        let idx = self
+            .matches
+            .iter()
+            .position(|&m| m >= self.caret)
+            .unwrap_or(0);
+        self.select_match(idx);
+        Ok(self.matches.len())
+    }
+
+    /// Run a masked byte-pattern find (roadmap item 12) and select the
+    /// first match at or after the caret, wrapping like
+    /// [`Editor::set_find`]. The match list and
+    /// [`Editor::current_match`] behave exactly as for a text find —
+    /// the stored needle is a stand-in of the pattern's length, which
+    /// is all the selection and highlight maths use — so the hex
+    /// surface drives the same caret/selection flow. The saved needle
+    /// *text* is empty on purpose: a masked pattern is not text, and
+    /// an edit that clears the match list must not silently re-run it
+    /// as one. Returns the number of matches.
+    pub fn set_find_masked(&mut self, pattern: &search::MaskedPattern) -> usize {
+        self.needle_bytes = vec![0u8; pattern.len()];
+        self.needle_text = String::new();
+        self.find_options = SearchOptions::default();
+        self.matches = search::find_masked_all(&self.table, pattern, None);
+        if self.matches.is_empty() {
+            self.match_index = None;
+            return 0;
+        }
+        let idx = self
+            .matches
+            .iter()
+            .position(|&m| m >= self.caret)
+            .unwrap_or(0);
+        self.select_match(idx);
+        self.matches.len()
+    }
+
     fn refresh_matches(&mut self) {
         if self.needle_bytes.is_empty() {
             self.matches.clear();
@@ -1399,6 +1485,148 @@ impl Editor {
             self.after_mutation(first);
         }
         Ok(report.count)
+    }
+
+    /// Replace every occurrence of the last find needle lying fully
+    /// inside `[start, end)` with `replacement`, as one undo entry
+    /// (roadmap item 11). Returns the number replaced.
+    pub fn replace_all_in_range(
+        &mut self,
+        replacement: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<usize, EditorError> {
+        self.require_writable()?;
+        if self.needle_bytes.is_empty() || start >= end {
+            return Ok(0);
+        }
+        let bytes = encoding::encode(replacement, self.encoding()).map_err(EditorError::Encode)?;
+        let needle = self.needle_bytes.clone();
+        let options = self.find_options;
+        let first = search::find_in_range(&self.table, &needle, &options, start, end)
+            .first()
+            .copied();
+        let report = search::replace_all_in_range(
+            &mut self.table,
+            &mut self.history,
+            &needle,
+            &bytes,
+            &options,
+            start,
+            end,
+        );
+        if report.count > 0 {
+            if self.nl_delta_known {
+                self.nl_delta +=
+                    report.count as i64 * (count_newlines(&bytes) - count_newlines(&needle));
+            }
+            self.caret = self.caret.min(self.total_len());
+            self.anchor = None;
+            self.after_mutation(first.unwrap_or(start));
+        }
+        Ok(report.count)
+    }
+
+    // ---- Line operations (roadmap item 23) ---------------------------
+
+    /// Expand `[start, end)` to whole lines: returns the byte range
+    /// covering every line the range touches. Line 0 starts after any
+    /// byte-order mark, so the mark is never sorted away from the top.
+    fn expand_to_lines(&mut self, start: u64, end: u64) -> (u64, u64) {
+        let (_, raw_start) = self.line_and_start(start);
+        let region_start = if raw_start == 0 {
+            (self.detection.bom_len as u64).max(raw_start)
+        } else {
+            raw_start
+        };
+        let (_, last_start) = self.line_and_start(end - 1);
+        let (_, _, next) = self.line_bounds(last_start);
+        (region_start, next)
+    }
+
+    /// Sort the lines touched by `[start, end)` (expanded to whole
+    /// lines), byte-wise and stable, as ONE undoable edit. Each line
+    /// keeps its own terminator, so CRLF lines stay CRLF. Returns the
+    /// number of lines in the region. Refuses — with no change — when
+    /// the expanded region exceeds [`MAX_LINE_OP_BYTES`].
+    pub fn sort_lines_in_range(&mut self, start: u64, end: u64) -> Result<usize, EditorError> {
+        let (lines, _) = self.transform_lines_in_range(start, end, false)?;
+        Ok(lines)
+    }
+
+    /// Remove duplicate lines within `[start, end)` (expanded to
+    /// whole lines), keeping the first occurrence of each line, as
+    /// ONE undoable edit. Lines compare by content (terminator
+    /// excluded). Returns the number of lines removed. Same size
+    /// limit and refusal behaviour as [`Editor::sort_lines_in_range`].
+    pub fn dedup_lines_in_range(&mut self, start: u64, end: u64) -> Result<usize, EditorError> {
+        let (_, removed) = self.transform_lines_in_range(start, end, true)?;
+        Ok(removed)
+    }
+
+    /// Shared body of the sort / dedup operations: returns
+    /// (lines in the region, lines removed by dedup — always 0 for a
+    /// sort).
+    fn transform_lines_in_range(
+        &mut self,
+        start: u64,
+        end: u64,
+        dedup: bool,
+    ) -> Result<(usize, usize), EditorError> {
+        self.require_writable()?;
+        if end <= start || start >= self.total_len() {
+            return Ok((0, 0));
+        }
+        let end = end.min(self.total_len());
+        if end - start > MAX_LINE_OP_BYTES {
+            return Err(EditorError::RangeTooLarge(end - start));
+        }
+        let (rs, re) = self.expand_to_lines(start, end);
+        if re - rs > MAX_LINE_OP_BYTES {
+            return Err(EditorError::RangeTooLarge(re - rs));
+        }
+        if re <= rs {
+            return Ok((0, 0));
+        }
+        let old = self.table.read(rs, re - rs);
+        // Split into lines that keep their own terminators (the last
+        // line may have none).
+        let chunks: Vec<&[u8]> = old.split_inclusive(|&b| b == b'\n').collect();
+        let line_count = chunks.len();
+        let (new_chunks, removed): (Vec<&[u8]>, usize) = if dedup {
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            let mut kept: Vec<&[u8]> = Vec::with_capacity(line_count);
+            let mut removed = 0usize;
+            for chunk in &chunks {
+                let mut key = *chunk;
+                if key.last() == Some(&b'\n') {
+                    key = &key[..key.len() - 1];
+                }
+                if key.last() == Some(&b'\r') {
+                    key = &key[..key.len() - 1];
+                }
+                if seen.insert(key.to_vec()) {
+                    kept.push(chunk);
+                } else {
+                    removed += 1;
+                }
+            }
+            (kept, removed)
+        } else {
+            let mut sorted = chunks.clone();
+            sorted.sort(); // stable, byte-wise on the line bytes
+            (sorted, 0)
+        };
+        let new: Vec<u8> = new_chunks.concat();
+        if new == old {
+            return Ok((line_count, 0));
+        }
+        self.note_newline_delta(&new, &old);
+        search::replace_one(&mut self.table, &mut self.history, rs, re - rs, &new);
+        self.caret = self.caret.min(self.total_len());
+        self.anchor = None;
+        self.after_mutation(rs);
+        Ok((line_count, removed))
     }
 
     // ---- Save -----------------------------------------------------------
@@ -1776,6 +2004,120 @@ mod tests {
             crate::encoding::decode(&all[2..], TextEncoding::Utf16Le).unwrap(),
             "aXbX!"
         );
+    }
+
+    #[test]
+    fn replace_all_in_range_scopes_to_the_selection() {
+        let mut e = ed(b"foo bar foo baz foo");
+        e.set_find("foo", SearchOptions::default()).unwrap();
+        // Replace only inside the middle of the document.
+        let n = e.replace_all_in_range("quux", 4, 15).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(content(&e), b"foo bar quux baz foo");
+        assert!(e.undo(), "scoped replace-all is one history entry");
+        assert_eq!(content(&e), b"foo bar foo baz foo");
+    }
+
+    #[test]
+    fn find_in_range_scopes_navigation_to_the_range() {
+        let mut e = ed(b"foo bar foo baz foo");
+        // Scope to the middle of the document: only the match at
+        // offset 8 is inside 4..15.
+        let count = e
+            .set_find_in_range("foo", SearchOptions::default(), 4, 15)
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(e.matches(), &[8]);
+        assert_eq!(e.current_match(), Some((8, 11)));
+        // Navigation wraps inside the scoped list, never outside it.
+        assert_eq!(e.find_next(), Some((8, 11)));
+        // A wider scope sees its own matches only.
+        let count = e
+            .set_find_in_range("foo", SearchOptions::default(), 0, 12)
+            .unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(e.matches(), &[0, 8]);
+    }
+
+    #[test]
+    fn masked_find_drives_the_match_flow() {
+        let mut e = Editor::open_from_bytes(
+            vec![0x4A, 0x11, 0xFF, 0x00, 0x2B, 0x99, 0x4A, 0x77, 0xFF],
+            None,
+            false,
+        );
+        let pattern = search::parse_masked_pattern("4A ?? FF").unwrap();
+        let count = e.set_find_masked(&pattern);
+        assert_eq!(count, 2);
+        assert_eq!(e.matches(), &[0, 6]);
+        // The current match spans the pattern's full length, so the
+        // selection is the matched bytes.
+        assert_eq!(e.current_match(), Some((0, 3)));
+        assert_eq!(e.selection_range(), Some((0, 3)));
+        assert_eq!(e.find_next(), Some((6, 9)));
+        assert_eq!(e.find_next(), Some((0, 3)), "wraps like a text find");
+        // A pattern with no occurrence leaves no current match.
+        let pattern = search::parse_masked_pattern("DE AD").unwrap();
+        assert_eq!(e.set_find_masked(&pattern), 0);
+        assert_eq!(e.current_match(), None);
+    }
+
+    #[test]
+    fn sort_lines_in_range_sorts_whole_lines_as_one_undo() {
+        let mut e = ed(b"banana\napple\ncherry\n");
+        // A partial range expands to the whole lines it touches
+        // (bytes 2..14 touch all three lines).
+        let n = e.sort_lines_in_range(2, 14).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(content(&e), b"apple\nbanana\ncherry\n");
+        assert!(e.undo());
+        assert_eq!(content(&e), b"banana\napple\ncherry\n");
+        assert!(!e.can_undo(), "the sort was a single history entry");
+    }
+
+    #[test]
+    fn sort_lines_preserves_crlf_terminators() {
+        let mut e = ed(b"b\r\na\r\nc\r\n");
+        let n = e.sort_lines_in_range(0, e.total_len()).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(content(&e), b"a\r\nb\r\nc\r\n");
+    }
+
+    #[test]
+    fn dedup_lines_keeps_first_occurrences_as_one_undo() {
+        let mut e = ed(b"x\ny\nx\nz\ny\n");
+        let removed = e.dedup_lines_in_range(0, e.total_len()).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(content(&e), b"x\ny\nz\n");
+        assert!(e.undo());
+        assert_eq!(content(&e), b"x\ny\nx\nz\ny\n");
+        assert!(!e.can_undo());
+        // Dedup of an already-unique range changes and records nothing.
+        let removed = e.dedup_lines_in_range(0, 3).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn line_ops_refuse_an_oversized_range_without_changing_anything() {
+        // A document past the 64 MB line-op limit (built as one big
+        // allocation of short lines; the refusal must come before any
+        // edit is recorded).
+        let mut bytes = Vec::new();
+        while (bytes.len() as u64) <= MAX_LINE_OP_BYTES {
+            bytes.extend_from_slice(b"line\n");
+        }
+        let mut e = Editor::open_from_bytes(bytes, None, false);
+        let total = e.total_len();
+        assert_eq!(
+            e.sort_lines_in_range(0, total),
+            Err(EditorError::RangeTooLarge(total))
+        );
+        assert_eq!(
+            e.dedup_lines_in_range(0, total),
+            Err(EditorError::RangeTooLarge(total))
+        );
+        assert!(!e.can_undo());
+        assert!(!e.is_dirty());
     }
 
     #[test]
