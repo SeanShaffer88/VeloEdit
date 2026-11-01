@@ -65,12 +65,20 @@ until it has shipped in a release.
 
 - **20. Bookmarks** — named anchors at byte offsets
   (Ctrl+F2 toggles, F2 / Shift+F2 jump), persisted per file.
+  Bookmarks grow colour tags and free-text notes (annotations);
+  they stay in the portable store, not in sidecar files next to
+  the document, so read-only folders and the portable layout keep
+  working.
 - **10 + 24. Background find-all + scrollbar tick map** — matches
   are populated on a worker thread and drawn as ticks in the custom
   scrollbar track, alongside bookmark and edited-region ticks.
+  Later the strip gains hover previews (line number and a text
+  glimpse at that depth).
 - **15. Data inspector** — a docked panel reading the bytes at the
   caret as int8–64 (signed/unsigned), float, double, hex, binary,
   and Unix timestamp.
+  Also reads a GUID, a Windows FILETIME timestamp, and a short
+  UTF-8 string preview of the bytes at the caret.
 - **13/14. Hex layout options** — 8/16/24/32 bytes per row or
   fit-to-window, and grouping by 1/2/4/8 bytes in either byte order.
 - **16. Relative offsets** — the offset column can count from the
@@ -85,27 +93,36 @@ until it has shipped in a release.
 - **37. File hashes** — MD5, SHA-1, and SHA-256 computed by
   streaming (hand-written, no dependencies), with a compare field.
   (BLAKE3 is not included: a from-scratch implementation is out of
-  proportion for this program's dependency rules.)
+  proportion for this program's dependency rules.) The hash set
+  grows CRC32 and xxHash64 checksums, and hashing gains a
+  background mode that fills the status bar in on a low-priority
+  thread while work continues.
 
 ## Slice R4 — reach (v1.2)
 
 - **1. Mapping windows** — for files beyond comfortable address
-  space, an LRU cache of mapped windows (512 MB–2 GB) replaces the
-  single whole-file map.
+  space, an LRU cache of sliding mapped windows (512 MB–4 GB)
+  replaces the single whole-file map.
 - **4. Fast save by block cloning (opt-in)** — on filesystems that
   support it, `FSCTL_DUPLICATE_EXTENTS_TO_FILE` clones the file and
   patches only the changed extents; the streamed atomic save stays
   the default and the fallback.
 - **18. Log filter mode** — temporarily show only lines matching a
   query, over the line index, without creating files.
+  Any filtered line jumps back into the full file at its exact
+  byte offset with one click.
 - **19. Soft wrap** — view-bounded wrapping computed for visible
   rows only.
-- **22. Follow mode** — watch the file for appends with
-  `ReadDirectoryChangesW` and tail new bytes live.
+- **22. Follow mode ("Ghost Tail")** — watch the file for appends
+  with `ReadDirectoryChangesW` and tail new bytes live, extending
+  the line index and the mapping as the file grows, without
+  disturbing the current position, selection, or mode.
 - **29. Extended code pages** — Shift-JIS, GBK, EUC-KR, and
   ISO-8859 viewing and save-back through the Win32 conversion APIs.
 - **30. Invalid-byte tokens** — malformed sequences render as
-  `[0xFE]`-style tokens in text mode instead of replacement marks.
+  `[0xFE]`-style tokens in text mode instead of replacement marks,
+  and control characters (NUL, CR, LF, ESC) render as small glyph
+  tags inline rather than invisibly.
 - **33. Protected-file saving** — a lock badge for read-only or
   protected-path files and a plain-words "Save as administrator"
   path through an elevated copy of the program.
@@ -114,16 +131,69 @@ until it has shipped in a release.
 - **43. Structural diff** — `--diff` grows unified block-level
   output for text and binary files, still streaming.
 
+- **Slicing export (extends 44)** — carve several non-contiguous
+  byte or line ranges (for example lines 1,000,000–1,050,000 and
+  84,000,000–84,020,000) into one new file, streamed in order with
+  near-zero working memory.
+
+- **Entropy strip** — a one-pixel-wide lane beside the scrollbar
+  shading each sampled chunk by Shannon entropy / null density,
+  computed on a background thread, so packed, encrypted, textual,
+  and zero regions are visible at a glance and clickable.
+- **Bit-level hex tooling** — toggle a single bit, byte-swap
+  (BSWAP), apply AND / OR / XOR / NOT masks, and shift bits across
+  any selection in hex mode, all as ordinary undoable edits.
+- **Delta patch export** — write the session's edits as a small
+  patch file instead of a full copy (the program's own patch
+  format and IPS first; VCDIFF as the standard-format follow-on),
+  built on the delta recovery format.
+- **Zero-run insert** — insert any number of zero bytes, or resize
+  a range, as a single piece-table node with no storage behind it
+  until a save streams it out.
+- **Pointer following + jump history** — read the 32/64-bit value
+  at the caret as a target offset, Ctrl+Click to jump there, and
+  Alt+Left / Alt+Right to walk the jump history.
+- **Strings pane** — a background scan lists ASCII and UTF-16
+  strings (configurable minimum length) in a side drawer; clicking
+  one jumps to its offset.
+- **Delimiter grid mode** — CSV / TSV / pipe files align into
+  visual columns computed for the visible lines only.
+- **ANSI colour rendering** — terminal escape sequences in raw
+  logs (build output, container logs) paint as colours; the bytes
+  themselves are never changed.
+- **Time-delta gutter** — timestamps detected on visible log lines
+  show the elapsed gap to the previous entry in the gutter, so
+  stalls and freezes stand out.
+- **Freeze pane** — pin the first lines (a header row or a log
+  preamble) to the top of the view while the rest scrolls.
+- **Focus dimming** — rows outside the current selection or match
+  set dim toward black, for long auditing sessions.
+
 ## Slice R5 — large projects and open decisions (v1.3+)
 
 - **39. Tabs and multiple windows** — several documents in one
   workspace; the largest single interface project on this list.
 - **28. Text/hex split view** — both representations side by side,
   synchronised by offset.
+- **Side-by-side streaming diff** — two large files compared
+  chunk by chunk over their memory maps in locked-scroll panes
+  (text or hex), differences painted directly on the surface; no
+  full-file loads. A lighter sync-scroll compare (same locked
+  panes, no difference computation) comes first.
+- **Multi-cursor and rectangular editing** — column/rectangular
+  selections and synchronised multi-point insert/overwrite across
+  hex columns and tabular text.
+- **Disassembly gutter** — a small built-in, table-driven
+  length-accurate decoder (x86-64 first, ARM64 later) rendering
+  instruction text beside the bytes in hex mode. Scoped tightly:
+  correct instruction boundaries over cleverness.
 - **9. Streaming regular expressions** — a backtracking-free regex
   engine that matches across piece boundaries in bounded memory.
-- **17. Binary templates** — C-style struct definitions mapped over
-  offsets for header and packet inspection.
+- **17. Binary templates** — a plain-text struct definition
+  language (for example `PE_HEADER { u32 signature; u16 machine;
+  ... }`) kept in `data/templates/`, mapped over offsets for
+  header and packet inspection, field names echoed in the status
+  bar.
 - **40. Taskbar jump list** — recent and pinned files on the
   Windows taskbar icon.
 - **47. Screen-reader support (scoped)** — UI Automation exposure
@@ -142,6 +212,15 @@ until it has shipped in a release.
 - **42. `.com` wrapper — not needed.** The requirement (terminal
   launches behaving like a console program) is already met by the
   GUI-subsystem binary attaching to the parent console (v1.0.1).
+- **Direct I/O bypass — not applicable.** `FILE_FLAG_NO_BUFFERING`
+  governs handle-based reads; a memory-mapped editor's reads go
+  through the cache manager by design, so there is no unbuffered
+  path to switch to. The streaming tools already read sequentially
+  without extra buffering.
+- **Raw device paths — not planned.** Crash-dump and disk-image
+  *files* open today like any other file. Raw volume/device access
+  (`\\.\…`) needs administrator rights and sits outside the
+  file model the whole editor is built on.
 - **41. Borderless mode — not planned; snap layouts already work**
   because the window keeps the standard Windows frame. A frameless
   window would trade working snap, resize, and accessibility for
