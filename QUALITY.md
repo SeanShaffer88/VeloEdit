@@ -28,7 +28,7 @@ is the owner's call — and every Windows-runtime verification.
 | --- | --- | --- |
 | Architecture & foundation | 4 | Frozen module layout in `PROJECT_RULES.md`; original-bytes seam (`OriginalBuffer`) now carries the Windows mmap backing with no API change; the piece Vec carries a Fenwick weight index for O(log N) lookups (R2a) in place of the sketched B-tree, with the trade-off recorded in Known gaps |
 | Correctness (core operations) | 4 | Insert/delete/coalescence, multi-piece reads, undo/redo layout restoration, line checkpoints, hex/scroll math, diff counting, encoding detection/decode/encode, boundary-spanning search, single-undo replace-all, and the atomic save round trips (including both staged failure paths) are all covered by unit tests that exercise the real code paths |
-| Tests | 4 | 416 host unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1 + 16 roadmap R2a + 9 roadmap R2b + 37 roadmap R3a: Fenwick piece-index equivalence against a naive model over random edit scripts, 100k-piece lookups, coalescing, SWAR-vs-scalar and parallel-vs-serial line-index equivalence, SWAR search equivalence, scoped find/replace, masked search, line sort/dedup, scoped find navigation, masked find flow, the file splitter, CLI size parsing and split runs, hash known-answer vectors, inspector readings and civil-date conversion, bookmark store round trips and staleness, delta-recovery rebuilds and refusals, save EOL/BOM transforms, windowed find + 15 roadmap R3b-2: GUID, FILETIME and text-preview inspector readings, width-parameterised hex row maths, grouped and big-endian hex formatting and click hit-testing, fit-to-window widths, settings validation for the new hex/save keys, editor hex movement and formatting at row widths 8 and 32, save-with-options transforms + 7 instant-open: the indexing percent/suffix helper, staged-build prefix and completion identity against the one-shot build, small-file head-build completeness, forward-resolver agreement within and beyond the indexed prefix, staged-open exactness with a head-only frontier, staged completion attach with a monotonic frontier, and edit-during-staged-build discard ending exact + 57 roadmap R4a: zero-run reads proven on every read path with exact undo (including a 5,000,000-byte run stored as one piece and a 1 GB run as one piece), Ghost Tail growth extension and refusal rules with builder-resume identity from a mid-grid frontier, CRC32 and xxHash64 known-answer vectors (reference-checked against a reference implementation), filter line mapping on complete and partial indexes, the slicing grammar with its reversed / out-of-range / overlap / order refusals, VELOPAT1 patch round trips (insert-at-start, delete-at-end, no-change, duplicated original bytes) and corruption refusals, strings runs across the 64 KiB window edge in both encodings, entropy known values, pointer readings and the 128-entry jump-history cap, timestamp validation and consecutive-pair deltas, delimiter splitting, quoting and detection + 3 roadmap R4b (the window paths behind the view wiring): growth adoption through a fresh backing — the shell's re-map route — with the piece table's length refusal surfaced, the caret-preserving in-place byte replace behind the inspector's bit row, and the editor-level filter view with its index-snapshot discipline + 38 roadmap R4c: the ISO-8859-1 all-256-byte round trip and the ISO-8859-15 specials table, code-page re-decode/re-encode through the editor codec, the keybinding parser/merger (defaults, per-action fallback on unknown actions and bad chords, unbind, duplicate-chord problems), structural-diff block regions with coalescing and first divergence, mapping-window maths (alignment, clamping, forward-walk coverage), the incremental filter builder proven equal to the one-shot build at five window sizes with honest mid-build snapshots, bookmark annotation storage (old-format files load with defaults and re-serialise without annotation keys; annotations round-trip and validate), the read-only attribute helpers, the fast-clone fallback save (memory-backed tables fall back and save byte-exact), the R4c settings keys' round trip and validation, and the CLI runs for --slice (byte and line ranges), the patch export/apply round trip, --insert-zeroes in place, and --compare region reporting + 50 roadmap R5a (regex equivalence against an independent backtracking reference over generated cases, template parsing/apply with truncation, linediff alignment, disassembler known lengths and truncation, the external-tools protocol, multi-range and rectangular editing as single undo entries) + 19 roadmap R5b (tab order open/close/reorder/active-index invariants across a full close-out, strip width fitting, the session list mapping with its active-index rule, restore planning against an existence probe, session normalisation, the settings session round trip with duplicates kept, and the tab actions' default chords) — plus 2 ignored 1 GB bench tests for staged open versus the one-shot build), host gate fully green (see below); the Windows-only GUI suite adds layout/formatting/menu/theme-preview tests plus R3b-1's scrollbar-tick bucketing, R3b-2's inspector-rows, hash-verdict and armed-save-suffix tests, and the polish pass's zoom-percentage and colour-blend tests, plus R4b's wrap-range, ANSI/control-tag segment, segment cell-mapping and log-delta-format tests, and runs in CI. Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
+| Tests | 4 | 426 host unit tests (55 foundation + 39 Slice 2 + 14 Slice 3 + 42 Slice 4 + 15 roadmap R1 + 16 roadmap R2a + 9 roadmap R2b + 37 roadmap R3a: Fenwick piece-index equivalence against a naive model over random edit scripts, 100k-piece lookups, coalescing, SWAR-vs-scalar and parallel-vs-serial line-index equivalence, SWAR search equivalence, scoped find/replace, masked search, line sort/dedup, scoped find navigation, masked find flow, the file splitter, CLI size parsing and split runs, hash known-answer vectors, inspector readings and civil-date conversion, bookmark store round trips and staleness, delta-recovery rebuilds and refusals, save EOL/BOM transforms, windowed find + 15 roadmap R3b-2: GUID, FILETIME and text-preview inspector readings, width-parameterised hex row maths, grouped and big-endian hex formatting and click hit-testing, fit-to-window widths, settings validation for the new hex/save keys, editor hex movement and formatting at row widths 8 and 32, save-with-options transforms + 7 instant-open: the indexing percent/suffix helper, staged-build prefix and completion identity against the one-shot build, small-file head-build completeness, forward-resolver agreement within and beyond the indexed prefix, staged-open exactness with a head-only frontier, staged completion attach with a monotonic frontier, and edit-during-staged-build discard ending exact + 57 roadmap R4a: zero-run reads proven on every read path with exact undo (including a 5,000,000-byte run stored as one piece and a 1 GB run as one piece), Ghost Tail growth extension and refusal rules with builder-resume identity from a mid-grid frontier, CRC32 and xxHash64 known-answer vectors (reference-checked against a reference implementation), filter line mapping on complete and partial indexes, the slicing grammar with its reversed / out-of-range / overlap / order refusals, VELOPAT1 patch round trips (insert-at-start, delete-at-end, no-change, duplicated original bytes) and corruption refusals, strings runs across the 64 KiB window edge in both encodings, entropy known values, pointer readings and the 128-entry jump-history cap, timestamp validation and consecutive-pair deltas, delimiter splitting, quoting and detection + 3 roadmap R4b (the window paths behind the view wiring): growth adoption through a fresh backing — the shell's re-map route — with the piece table's length refusal surfaced, the caret-preserving in-place byte replace behind the inspector's bit row, and the editor-level filter view with its index-snapshot discipline + 38 roadmap R4c: the ISO-8859-1 all-256-byte round trip and the ISO-8859-15 specials table, code-page re-decode/re-encode through the editor codec, the keybinding parser/merger (defaults, per-action fallback on unknown actions and bad chords, unbind, duplicate-chord problems), structural-diff block regions with coalescing and first divergence, mapping-window maths (alignment, clamping, forward-walk coverage), the incremental filter builder proven equal to the one-shot build at five window sizes with honest mid-build snapshots, bookmark annotation storage (old-format files load with defaults and re-serialise without annotation keys; annotations round-trip and validate), the read-only attribute helpers, the fast-clone fallback save (memory-backed tables fall back and save byte-exact), the R4c settings keys' round trip and validation, and the CLI runs for --slice (byte and line ranges), the patch export/apply round trip, --insert-zeroes in place, and --compare region reporting + 50 roadmap R5a (regex equivalence against an independent backtracking reference over generated cases, template parsing/apply with truncation, linediff alignment, disassembler known lengths and truncation, the external-tools protocol, multi-range and rectangular editing as single undo entries) + 19 roadmap R5b (tab order open/close/reorder/active-index invariants across a full close-out, strip width fitting, the session list mapping with its active-index rule, restore planning against an existence probe, session normalisation, the settings session round trip with duplicates kept, and the tab actions' default chords) + 10 roadmap R5c (divider ratio clamping and non-finite restore, divider minimum widths and the narrow-span midpoint, the ratio round trip, the offset↔hex-row anchor at five row widths, scroll-follow delta clamping, region lookup on both sides including zero-count regions, next/previous difference navigation with wrap, and the split settings round trip with ratio clamping) — plus 2 ignored 1 GB bench tests for staged open versus the one-shot build), host gate fully green (see below); the Windows-only GUI suite adds layout/formatting/menu/theme-preview tests plus R3b-1's scrollbar-tick bucketing, R3b-2's inspector-rows, hash-verdict and armed-save-suffix tests, and the polish pass's zoom-percentage and colour-blend tests, plus R4b's wrap-range, ANSI/control-tag segment, segment cell-mapping and log-delta-format tests, and runs in CI. Coverage percentage not yet measured with a coverage tool — the 85% core / 70% overall floors are asserted by test breadth, not yet by a measured number |
 | Reliability & data safety | 4 | Undo never touches the append buffer; deletes return their removed pieces; `--clean` is guarded to the adjacent `data/` folder and tested. The atomic save safety path (SPEC §5.1) is implemented and covered by host tests for the success, replace, empty, staging-failure and swap-failure cases, with the table provably unchanged after a failed save; its Windows runtime behaviour (real `ReplaceFileW` under a live mapping) is still Unverified — see Known gaps |
 | Performance (SPEC §8 budgets) | Unverified | Host proxies are now measured and recorded in `docs/BENCHMARKS.md` (200 MB diff median 330 ms, find 1073 ms, save-copy 466 ms, `--version` start proxy median 1.07 ms, all Linux host build; the instant-open slice adds the 1 GB staged-open proxies: one-shot index build 3,112 ms against a 4.89 ms head prefix, editor first line question 32.81 ms) — evidence about the core only. Every §8 metric itself (cold start <50 ms, 100 GB open <100 ms, <15 MB idle / <35 MB active, <16 ms frame) is a Windows measurement and remains a target, not a result |
 | Security & privacy | 4 | 100% offline, zero telemetry by construction (no network code at all); crate root is `#![deny(unsafe_code)]` with `unsafe` confined to `src/mmap_win.rs`, `src/gui_win.rs` and the Windows half of `src/save.rs`, every block carrying a `// SAFETY:` comment (PROJECT_RULES.md confinement rule); the only dependency crate is `windows-sys`, gated to `cfg(windows)` |
@@ -1568,6 +1568,95 @@ scored from real Windows evidence before any release.
     switches behaved before tabs), and the settings-backed
     view toggles (`word_wrap`, `follow_tail`, `freeze_lines`)
     remain program-wide rather than per-tab.
+- 2026-11-01, roadmap slice R5c (text/hex split view,
+  roadmap item 28, and the side-by-side streaming diff — the
+  R5 addition expanding item 18). What landed: (1)
+  `src/panes.rs` — the pure pane maths both features share:
+  divider ratio clamping (non-finite restores the default),
+  divider placement with per-pane minimums and a midpoint
+  fallback on narrow spans, the byte-offset ↔ hex-row anchor
+  (delegating to the width-parameterised hexview row maths),
+  the scroll-follow rule (`follow_first`) and jump pairing
+  (`jump_delta`), and difference-region lookup plus
+  next/previous navigation over `linediff` regions
+  (zero-count regions match their start line; navigation
+  wraps). (2) Split view: settings gain `split_view` and
+  `split_ratio_permille` (JSON keys `split_view` /
+  `split_ratio`, load-clamped); View ▸ Split Text/Hex plus
+  the rebindable action `toggle_split` (default Ctrl+\ —
+  verified free in the merged map; VK_OEM_5 added to the
+  chord translation). The panes paint through the existing
+  renderers — `paint_text_row` with a pane-bounded layout,
+  and the hex painter extracted from render's inline block
+  into `paint_hex_rows` (the single-pane call passes the
+  canvas bounds, behaviour unchanged) — tied by one anchor
+  re-tied in render's prologue: the focused pane's top
+  offset maps to the other pane's top line/row. The mode IS
+  the focus: mode commands route through a focus switch
+  that preserves both tops; clicks and wheel-over-pane
+  focus; the toolbar pair honestly shows both segments
+  active; the unfocused pane's caret is a passive marker
+  (muted bar / muted outline box), gated by a new
+  `caret_live` flag so no second live caret ever paints.
+  Composition: filter and split decline each other, freeze
+  and split decline each other (status notes both ways);
+  the delimiter grid steps aside while split; wrap, focus
+  dimming, ANSI/control segments, time deltas, strings,
+  entropy and the inspector compose (text-only ones inside
+  the text pane); fit-to-window hex resolves against the
+  hex pane. Tooltips on the divider and both panes via a
+  new fixed-text hover kind. (3) Side-by-side diff:
+  File ▸ Compare Side by Side… opens a second file into a
+  window-owned `CompareState` (its own read-only Editor,
+  mapping and staged index thread — not a tab), panes tied
+  by `compare_sync_scroll` on the pairing delta; the
+  compare pane swallows all mouse input and takes no text
+  input. Phase 2 runs `linediff` on a worker over table
+  snapshots (generation-guarded; a missing index is built
+  in-worker, a partial one yields a labelled prefix run
+  with one automatic rerun on completion); regions paint
+  as paired bands from two new brushes — a dedicated diff
+  tint derived from the accent (bg blended 25% toward it,
+  50% for the current region); Search ▸ Next/Previous
+  Difference (`diff_next` F7 / `diff_prev` Shift+F7 —
+  verified free) jump and re-pair the panes; the status
+  bar carries the comparing/computing/stale/count text.
+  Edits stale the regions via `note_edit`; a save with an
+  armed EOL/BOM conversion stales them via a new
+  `note_saved` hook in both save funnels (a plain save
+  changes no bytes and does not stale). Esc, the menu
+  item, a tab switch or a fresh open closes the compare;
+  the inspector steps aside while it is open. The Guide
+  gains Split View and Compare Side by Side sections.
+  Ten new host tests (416 → 426), all in `panes` plus the
+  settings round trip.
+  - Gate, run locally on this tree: `cargo fmt --check`
+    clean (exit 0). Host `cargo test`: **426 passed;
+    0 failed; 2 ignored**. `cargo clippy --all-targets --
+    -D warnings` clean (exit 0, host) and
+    `cargo clippy --target x86_64-pc-windows-gnu
+    --all-targets -- -D warnings` clean (exit 0).
+    `cargo check --target x86_64-pc-windows-msvc
+    --all-targets` clean (exit 0). Release build
+    (`cargo build --release --target x86_64-pc-windows-gnu`,
+    exit 0): `VeloEdit.exe` 1 374 208 bytes, SHA-256
+    `d4225169c8c79da5a5c33299b8bdb7baaac376f31bd0be2badeb8e0ced7d52e5`
+    (R5b build: 1 278 464 bytes — the growth is the split
+    and compare shell, now linked in; the binary's strings
+    were checked for the new action names and the
+    `split_ratio` key to prove the shipped program is the
+    gated build).
+  - Honest status: the pane maths and the settings
+    additions are host-verified; the GUI wiring (the split
+    painters and focus routing, the compare session, the
+    diff worker's attach path) is compile-verified on both
+    Windows targets only, and Windows runtime behaviour
+    stays **Unverified** until the field checks on a real
+    machine. Stated limits (also in PARITY): phase 2 is
+    text-mode only — hex compare is sync-scroll plus the
+    structural dialog; the main scrollbar stays the focused
+    (split) / left (compare) pane's own, painted at the
+    canvas edge / divider as before.
 
 ## Known gaps (honest list)
 
