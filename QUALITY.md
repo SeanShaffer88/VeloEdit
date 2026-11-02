@@ -1808,6 +1808,22 @@ scored from real Windows evidence before any release.
   UIA provider are compile-verified even by that standard
   (nothing here can prove a shell integration from this host).
 
+- 2026-11-01, post-v1.1.0 field fixes (owner's screenshots of
+  the released build): (1) tab labels painted "Untitle" — the
+  strip's natural width came from a character-count estimate
+  against a digit-probe cell width plus a chrome allowance
+  smaller than the painter's actual spend, and the painter
+  clips the label to the tab's rect. Tabs now measure the
+  label with a real text layout (`tab_name_width`) and budget
+  the painter's exact chrome (`tabs::natural_width`, host-
+  tested). (2) Status bar text shaved at the bottom — the two
+  status statics kept the window class's default font with no
+  vertical centring in a 22-DIP strip. They now carry an
+  app-sized font (Segoe UI, 13-DIP em) via WM_SETFONT, centre
+  vertically (SS_CENTERIMAGE), and the strip is 26 DIPs.
+  Windows runtime **Unverified** until the owner's field run
+  of the test build.
+
 ## Known gaps (honest list)
 
 - The installers have been *built* by the release workflow and their
