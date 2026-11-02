@@ -269,6 +269,13 @@ pub const ACTIONS: &[(&str, Option<&str>)] = &[
     ("tab_7", Some("Ctrl+7")),
     ("tab_8", Some("Ctrl+8")),
     ("tab_last", Some("Ctrl+9")),
+    // Split view and side-by-side diff (roadmap item 28 and
+    // the R5 diff, slice R5c). Ctrl+\ toggles the text/hex
+    // split; F7 / Shift+F7 walk the compare's difference
+    // regions.
+    ("toggle_split", Some("Ctrl+\\")),
+    ("diff_next", Some("F7")),
+    ("diff_prev", Some("Shift+F7")),
 ];
 
 /// Whether `name` is a known rebindable action.
