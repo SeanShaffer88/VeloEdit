@@ -3,7 +3,7 @@
 All notable changes to VeloEdit are recorded here. Versions follow the
 release asset naming in the specification.
 
-## [Unreleased]
+## [1.1.1] — Unreleased
 
 ### Fixed
 
