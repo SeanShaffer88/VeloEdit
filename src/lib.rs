@@ -63,6 +63,7 @@ pub mod linediff;
 pub mod mapwindow;
 #[cfg(windows)]
 pub mod mmap_win;
+pub mod panes;
 pub mod patch;
 pub mod piece_table;
 pub mod pointers;
