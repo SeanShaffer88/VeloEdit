@@ -2670,9 +2670,10 @@ fn split_sync_from_focus(app: &mut App) {
 /// Move keyboard focus to one pane of the split (slice R5c):
 /// the mode becomes the pane's representation — the mode IS the
 /// focus while split — with both panes' tops preserved across
-/// the switch (a plain `set_mode` would re-derive the incoming
-/// pane's top from the caret) and the anchor re-tied. Outside
-/// the split this is exactly `set_mode`.
+/// the switch and the anchor re-tied. Reached by clicking a
+/// pane and by F6's toggle; the Text/Hex commands themselves
+/// leave the split instead (see `mode_command`). Outside the
+/// split this is exactly `set_mode`.
 /// A compare opened in hex mode has no differences yet
 /// (phase 2 is text-only): start its diff when text mode
 /// arrives (slice R5c).
@@ -2711,6 +2712,36 @@ fn split_set_focus(app: &mut App, hex: bool) {
     app.editor.set_first_line(first_line);
     app.editor.set_first_row(first_row);
     split_sync_from_focus(app);
+    invalidate(app);
+    maybe_start_compare_diff(app);
+}
+
+/// The Text/Hex commands (toolbar pair, View menu): they name a
+/// single view. With no split this is a plain mode switch.
+/// While split, the command LEAVES the split for the named
+/// view, opening exactly where that pane was — the field found
+/// no way back to one view from these commands when they only
+/// moved the focus. (Focus inside the split still moves by
+/// clicking a pane or pressing F6.)
+fn mode_command(app: &mut App, target: EditorMode) {
+    if !split_active(app) {
+        set_mode(app, target);
+        maybe_start_compare_diff(app);
+        return;
+    }
+    let first_line = app.editor.first_line();
+    let first_row = app.editor.first_row();
+    app.settings.split_view = false;
+    save_settings(app);
+    set_mode(app, target);
+    // set_mode translated the focused pane's top into the
+    // target's scroll unit; put both stored tops back so the
+    // single view opens exactly where its own pane was.
+    app.editor.set_first_line(first_line);
+    app.editor.set_first_row(first_row);
+    refresh_menu_checks(app);
+    sync_hex_layout(app);
+    refresh_status(app);
     invalidate(app);
     maybe_start_compare_diff(app);
 }
@@ -16268,12 +16299,14 @@ fn on_command(app: &mut App, id: usize) {
                 }
             }
         }
-        // Mode switches route through the split's focus switch
-        // (slice R5c): while split, Text/Hex choose which pane
-        // has the keyboard instead of replacing the view; with
-        // no split this is exactly `set_mode`.
-        CMD_MODE_TEXT => split_set_focus(app, false),
-        CMD_MODE_HEX => split_set_focus(app, true),
+        // The Text/Hex commands name a single view: with no
+        // split they switch mode; while split they LEAVE the
+        // split for the named view (field report: there was no
+        // way back to one view from them). Focus inside the
+        // split still moves by clicking a pane or pressing F6,
+        // which keeps its toggle meaning below.
+        CMD_MODE_TEXT => mode_command(app, EditorMode::Text),
+        CMD_MODE_HEX => mode_command(app, EditorMode::Hex),
         CMD_MODE_TOGGLE => {
             let hex = app.editor.mode() == EditorMode::Text;
             split_set_focus(app, hex);
