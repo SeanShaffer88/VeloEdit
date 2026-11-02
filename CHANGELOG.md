@@ -344,6 +344,30 @@ release asset naming in the specification.
   reuses the file's unchanged extents where the drive supports
   it and silently falls back to the normal save when it
   cannot).
+- Tabs: one window holds many documents, one tab each in a
+  strip under the top edge. Each tab keeps its own caret,
+  scroll, text/hex mode, undo history, encoding, bookmarks,
+  find and filter state (a search, filter or index build on an
+  inactive tab keeps running and lands in its own tab), and
+  its own armed Save Options. A filled square marks unsaved
+  changes, a hollow square a read-only file; resting on a tab
+  shows its full path. Ctrl+T new tab, Ctrl+W close tab,
+  Ctrl+Tab / Ctrl+Shift+Tab next / previous, Ctrl+1…8 jump to
+  a tab, Ctrl+9 to the last; click switches, middle-click
+  closes, dragging reorders, right-click offers Close, Close
+  Others, Close All, Copy Path and Open in New Window. File ▸
+  Open, the Recent list and dropped files open into a new tab
+  when the current tab holds a file or unsaved changes, and
+  replace an untouched empty tab otherwise. Closing a dirty
+  tab asks Save / Don't Save / Cancel; closing the last tab
+  leaves a fresh empty document; closing the window asks
+  about every dirty document in turn. File ▸ New Window
+  starts a separate VeloEdit window; the open tabs and the
+  active one are remembered at a clean exit and reopened at
+  the next launch (missing files skipped silently; untitled
+  documents are not remembered). The new tab shortcuts are
+  ordinary rebindable actions (`new_tab`, `close_tab`,
+  `next_tab`, `prev_tab`, `tab_1`…`tab_8`, `tab_last`).
 
 ### Changed
 
