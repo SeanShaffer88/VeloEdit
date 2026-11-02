@@ -34,10 +34,11 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Globalization::{MultiByteToWideChar, WideCharToMultiByte};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
-    FrameRect, GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo, MoveToEx, Rectangle,
-    ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, HBRUSH, HDC,
-    HGDIOBJ, HPEN, NULL_BRUSH, OPAQUE, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse,
+    EndPaint, FillRect, FrameRect, GetStockObject, GetTextExtentPoint32W, InvalidateRect, LineTo,
+    MoveToEx, Rectangle, ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+    UpdateWindow, HBRUSH, HDC, HFONT, HGDIOBJ, HPEN, NULL_BRUSH, OPAQUE, PAINTSTRUCT, PS_SOLID,
+    TRANSPARENT,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
@@ -282,7 +283,7 @@ const FINDBAR_H: f32 = 30.0;
 /// Height of the external-change notice bar (roadmap item 34) when
 /// it is showing, directly under the toolbar.
 const CHANGEBAR_H: f32 = 30.0;
-const STATUS_H: f32 = 22.0;
+const STATUS_H: f32 = 26.0;
 const TEXT_PAD: f32 = 6.0;
 /// Accent strip along the very top of the client area (design mockup).
 const STRIP_H: f32 = 2.0;
@@ -8427,6 +8428,34 @@ const TAB_GAP: f32 = 4.0;
 /// from the tab names at the editor's character width, fitted by
 /// `crate::tabs::fit_widths`; the "+" button is pinned at the
 /// right edge when the tabs overflow.
+/// The rendered width (DIPs) of a tab label in the app's text
+/// format, measured with a real text layout. The estimate this
+/// replaces (character count × the cell width from a ten-digit
+/// probe) is wrong whenever the machine's actual font metrics
+/// differ from the probe's — and the painter clips the label to
+/// the tab's rect, so an under-estimate cost the last character
+/// of every label in the field ("Untitled" painted as "Untitle").
+/// Falls back to the estimate when measurement is unavailable.
+fn tab_name_width(app: &App, name: &str) -> f32 {
+    let layout = create_line_layout(app, name);
+    if !layout.is_null() {
+        let mut metrics = DWriteTextMetrics::default();
+        // SAFETY: slot 60 is IDWriteTextLayout::GetMetrics per
+        // dwrite.h; `metrics` is a writable struct of exactly the
+        // header's layout; the layout is ours and released below.
+        let get_metrics: unsafe extern "system" fn(*mut c_void, *mut DWriteTextMetrics) -> i32 =
+            unsafe { vfn(layout, SLOT_LAYOUT_GET_METRICS) };
+        // SAFETY: as above.
+        let hr = unsafe { get_metrics(layout, &mut metrics) };
+        // SAFETY: the layout is owned by us, released exactly once.
+        unsafe { com_release(layout) };
+        if hr >= 0 && metrics.width > 0.0 {
+            return metrics.width.ceil();
+        }
+    }
+    name.chars().count() as f32 * app.char_w
+}
+
 fn tab_strip_layout(app: &App) -> (Vec<TabGeom>, (f32, f32)) {
     let mut client: RECT = unsafe { std::mem::zeroed() };
     // SAFETY: our window plus a writable RECT.
@@ -8437,9 +8466,14 @@ fn tab_strip_layout(app: &App) -> (Vec<TabGeom>, (f32, f32)) {
     let naturals: Vec<f32> = (0..count)
         .map(|i| {
             let name = tab_display_name(app, i);
-            let text_w = name.chars().count() as f32 * app.char_w;
-            // Text + left padding + marker slot + close box.
-            (text_w + 8.0 + 12.0 + TAB_CLOSE_W).clamp(TAB_MIN_W, TAB_MAX_W)
+            let text_w = tab_name_width(app, &name);
+            // The label's measured width plus exactly the chrome
+            // the painter spends (tabs::natural_width) — a smaller
+            // budget clips the label's last character, because the
+            // painter clips the text to the tab's rect.
+            let markers =
+                usize::from(tab_is_dirty(app, i)) + usize::from(tab_is_read_only_file(app, i));
+            crate::tabs::natural_width(text_w, markers).clamp(TAB_MIN_W, TAB_MAX_W)
         })
         .collect();
     let widths = crate::tabs::fit_widths(&naturals, TAB_MIN_W, avail);
@@ -15024,9 +15058,46 @@ fn create_children(app: &mut App) {
 
     // Status strip: two static controls, themed via WM_CTLCOLORSTATIC
     // — position on the left, document facts right-aligned (SS_RIGHT
-    // = 0x2).
-    app.status = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE, 0, 0);
-    app.status_right = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE | 0x2, 0, 0);
+    // = 0x2), both vertically centred (SS_CENTERIMAGE = 0x200).
+    app.status = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE | 0x200, 0, 0);
+    app.status_right = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE | 0x2 | 0x200, 0, 0);
+    // The statics otherwise keep the window class's default font,
+    // whose line height can exceed the strip; top-aligned, its
+    // descenders shaved against the strip's bottom edge in the
+    // field. Give both an app-sized font instead (a 13-DIP em at
+    // the current scale). The handle is kept for the process life,
+    // like the tooltip text buffers.
+    let status_font: HFONT = {
+        let face = wstr("Segoe UI");
+        // SAFETY: plain creation parameters; the face name
+        // outlives the call; weight 400, DEFAULT_CHARSET = 1,
+        // CLEARTYPE_QUALITY = 5.
+        unsafe {
+            CreateFontW(
+                -app.px(13.0),
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                1,
+                0,
+                0,
+                5,
+                0,
+                face.as_ptr(),
+            )
+        }
+    };
+    if !status_font.is_null() {
+        // SAFETY: our controls; WM_SETFONT = 0x0030.
+        unsafe {
+            SendMessageW(app.status, 0x0030, status_font as WPARAM, 0);
+            SendMessageW(app.status_right, 0x0030, status_font as WPARAM, 0);
+        }
+    }
 
     // External-change notice bar (roadmap item 34): created hidden,
     // shown by check_external_change. The label is a static (themed
