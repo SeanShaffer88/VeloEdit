@@ -1,0 +1,26 @@
+// PNG (Portable Network Graphics) file header, per the public
+// PNG specification (ISO/IEC 15948). Copy this file into the
+// data\templates folder next to VeloEdit.exe to use it from
+// Tools > Apply Template.
+//
+// Apply PNG_FILE at offset 0 of a .png file: the 8-byte
+// signature, then the first chunk, which is always the IHDR
+// image header. PNG integers are big-endian.
+
+PNG_IHDR_CHUNK {
+    u32be data_length;         // always 13 for IHDR
+    char  chunk_type[4];       // "IHDR"
+    u32be width;
+    u32be height;
+    u8    bit_depth;
+    u8    color_type;
+    u8    compression;         // always 0
+    u8    filter;              // always 0
+    u8    interlace;
+    u32be crc;
+}
+
+PNG_FILE {
+    char           signature[8];
+    PNG_IHDR_CHUNK ihdr;
+}

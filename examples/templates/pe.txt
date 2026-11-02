@@ -1,0 +1,45 @@
+// Windows PE (Portable Executable) headers, per the public
+// Microsoft PE format specification. Copy this file into the
+// data\templates folder next to VeloEdit.exe to use it from
+// Tools > Apply Template.
+//
+// Apply IMAGE_DOS_HEADER at offset 0 of an .exe or .dll file.
+// Its last field, pe_header_offset, tells you where the
+// PE_SIGNATURE struct lives — apply that at that offset next.
+
+IMAGE_DOS_HEADER {
+    char  magic[2];            // "MZ"
+    u16le last_page_bytes;
+    u16le pages;
+    u16le relocations;
+    u16le header_paragraphs;
+    u16le min_alloc;
+    u16le max_alloc;
+    u16le initial_ss;
+    u16le initial_sp;
+    u16le checksum;
+    u16le initial_ip;
+    u16le initial_cs;
+    u16le relocation_table_offset;
+    u16le overlay_number;
+    u16le reserved[4];
+    u16le oem_id;
+    u16le oem_info;
+    u16le reserved2[10];
+    u32le pe_header_offset;    // offset of the PE signature
+}
+
+IMAGE_FILE_HEADER {
+    u16le machine;             // 0x8664 = x64, 0x14C = x86
+    u16le section_count;
+    u32le time_stamp;
+    u32le symbol_table_offset;
+    u32le symbol_count;
+    u16le optional_header_size;
+    u16le characteristics;
+}
+
+PE_SIGNATURE {
+    char              signature[4];   // "PE\0\0"
+    IMAGE_FILE_HEADER file_header;
+}
