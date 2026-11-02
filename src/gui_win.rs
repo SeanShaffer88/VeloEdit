@@ -2252,16 +2252,30 @@ struct Layout {
     strings_h: f32,
 }
 
+/// The canvas top: the full chrome stack the rows must clear —
+/// accent strip, tab bar (roadmap item 39), toolbar, then the
+/// change bar and find bar while they show. This MUST stay the
+/// same stack `layout_children` positions the child windows
+/// against (they hang from STRIP_H + TABBAR_H): when the tab
+/// bar landed in R5b the canvas top was left one bar short, so
+/// the first rows painted underneath the toolbar buttons until
+/// a field screenshot caught it (2026-11-01). The test below
+/// pins the sum.
+fn chrome_stack_top(change_visible: bool, find_visible: bool) -> f32 {
+    STRIP_H
+        + TABBAR_H
+        + TOOLBAR_H
+        + if change_visible { CHANGEBAR_H } else { 0.0 }
+        + if find_visible { FINDBAR_H } else { 0.0 }
+}
+
 fn compute_layout(app: &mut App) -> Layout {
     let mut client: RECT = unsafe { std::mem::zeroed() };
     // SAFETY: our window plus a writable RECT.
     unsafe { GetClientRect(app.hwnd, &mut client) };
     let width = app.dip(client.right - client.left);
     let height = app.dip(client.bottom - client.top);
-    let top = STRIP_H
-        + TOOLBAR_H
-        + if app.change_visible { CHANGEBAR_H } else { 0.0 }
-        + if app.find_visible { FINDBAR_H } else { 0.0 };
+    let top = chrome_stack_top(app.change_visible, app.find_visible);
     // Time-delta gutter (R4b): an extra column inside the text
     // gutter, wide enough for "+999.9s"-shaped deltas. In the
     // split view the text pane carries it whatever the focus.
@@ -16334,6 +16348,27 @@ mod tests {
         // One step up from the default (the menu/Ctrl+wheel step
         // is 2 points) rounds to the nearest whole percent.
         assert_eq!(zoom_percent(DEFAULT_FONT_SIZE + 2), 114);
+    }
+
+    /// The canvas top clears the whole chrome stack — accent
+    /// strip, TAB BAR, toolbar, and the optional bars. (The tab
+    /// bar's arrival in R5b left this sum one bar short and the
+    /// first rows painted under the toolbar until a field
+    /// screenshot caught it; this pins the stack.)
+    #[test]
+    fn chrome_stack_top_clears_every_bar() {
+        assert_eq!(
+            chrome_stack_top(false, false),
+            STRIP_H + TABBAR_H + TOOLBAR_H
+        );
+        assert_eq!(
+            chrome_stack_top(true, false),
+            STRIP_H + TABBAR_H + TOOLBAR_H + CHANGEBAR_H
+        );
+        assert_eq!(
+            chrome_stack_top(false, true),
+            STRIP_H + TABBAR_H + TOOLBAR_H + FINDBAR_H
+        );
     }
 
     /// The polish pass's two derived tones are exact 50/50 blends.
