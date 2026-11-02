@@ -62,7 +62,7 @@ use windows_sys::Win32::UI::HiDpi::{
     GetDpiForWindow, SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
+    EnableWindow, GetFocus, GetKeyState, ReleaseCapture, SetCapture, SetFocus,
 };
 use windows_sys::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, ShellExecuteW, HDROP,
@@ -159,6 +159,20 @@ const CMD_BOOKMARK_EDIT: usize = 1058;
 const CMD_BOOKMARK_TOGGLE: usize = 1059;
 const CMD_BOOKMARK_NEXT: usize = 1060;
 const CMD_BOOKMARK_PREV: usize = 1061;
+// Tabs (roadmap item 39, slice R5b): the File-menu and keyboard
+// commands, then the tab strip's right-click menu commands (they
+// act on `app.tab_context`, set before the menu opens).
+const CMD_NEW_TAB: usize = 1062;
+const CMD_CLOSE_TAB: usize = 1063;
+const CMD_NEXT_TAB: usize = 1064;
+const CMD_PREV_TAB: usize = 1065;
+const CMD_NEW_WINDOW: usize = 1066;
+const CMD_OPEN_IN_NEW_WINDOW: usize = 1067;
+const CMD_TAB_CLOSE: usize = 1070;
+const CMD_TAB_CLOSE_OTHERS: usize = 1071;
+const CMD_TAB_CLOSE_ALL: usize = 1072;
+const CMD_TAB_COPY_PATH: usize = 1073;
+const CMD_TAB_NEW_WINDOW: usize = 1074;
 const CMD_THEME_BASE: usize = 3000; // + theme index (20 themes)
 const CMD_ACCENT_BASE: usize = 3100; // 0 = theme default, 1..=11 presets, then Custom…
 const CMD_ACCENT_CUSTOM: usize = CMD_ACCENT_BASE + 1 + ACCENT_PRESETS.len();
@@ -223,6 +237,16 @@ struct IndexProgress {
 
 // Layout constants (in DIPs; scaled to physical pixels for child windows).
 const TOOLBAR_H: f32 = 30.0;
+/// The tab strip's height (roadmap item 39): one row of document
+/// tabs between the accent strip and the toolbar.
+const TABBAR_H: f32 = 28.0;
+/// Tab width bounds (DIPs): a tab never renders narrower or wider
+/// than these; overflow past the minimum scrolls the strip.
+const TAB_MIN_W: f32 = 76.0;
+const TAB_MAX_W: f32 = 208.0;
+/// Space reserved inside every tab for its close ×, so tabs never
+/// change width when the × appears on the active/hovered tab.
+const TAB_CLOSE_W: f32 = 18.0;
 /// The find bar row matches the toolbar row's height, so the find
 /// bar's controls come out the same size as the toolbar buttons
 /// (both rows place their controls at `row height − 6` DIPs).
@@ -639,6 +663,38 @@ every time you save. While a conversion is switched on, the status\r\n\
 bar shows it (for example → CRLF or +BOM), so you can see what the\r\n\
 next save will do before you save.\r\n\
 \r\n\
+TABS\r\n\
+One window can hold many documents, one tab each, in the strip\r\n\
+under the top edge. Each tab keeps its own place — caret, scroll,\r\n\
+text or hex mode, undo history, find and filter work, even a\r\n\
+search or filter still running — so switching tabs never loses\r\n\
+anything. A filled square on a tab means unsaved changes; a\r\n\
+hollow square means the file is read-only. Rest the pointer on\r\n\
+a tab to see its full path. The + button opens a new empty tab.\r\n\
+File \u{25B8} Open, the Recent list, and files dropped on the window\r\n\
+open into a new tab when the current tab already holds a file\r\n\
+or has unsaved changes; an untouched empty tab is used instead,\r\n\
+so opening a file never disturbs what you are doing or asks\r\n\
+about its changes. Ctrl+T opens a new tab, Ctrl+W closes the\r\n\
+current one, Ctrl+Tab and Ctrl+Shift+Tab move between tabs,\r\n\
+and Ctrl+1 to Ctrl+8 jump to a tab by number (Ctrl+9 jumps to\r\n\
+the last tab). Click a tab to switch to it, middle-click to\r\n\
+close it, drag it sideways to reorder it, and right-click it\r\n\
+for Close, Close Others, Close All, Copy Path, and Open in New\r\n\
+Window. When the tabs no longer fit, they shrink and then the\r\n\
+strip scrolls — turn the mouse wheel over the strip to scroll\r\n\
+it. Closing a tab with unsaved changes asks whether to save\r\n\
+it, like closing the window always has; closing the last tab\r\n\
+leaves a fresh empty document, and closing the window asks\r\n\
+about every document with unsaved changes in turn. File \u{25B8} New\r\n\
+Window starts a separate VeloEdit window (its own program\r\n\
+copy), and Open in New Window opens the current file in one.\r\n\
+When the window closes cleanly, the list of open tabs is\r\n\
+remembered and reopened next time, on the tab you left active;\r\n\
+files that have gone missing are skipped without a fuss.\r\n\
+Untitled documents are not remembered this way — an unsaved\r\n\
+one still relies on the recovery record described above.\r\n\
+\r\n\
 FINDING MORE\r\n\
 Tick \"In selection\" on the find bar to search and replace only\r\n\
 inside the part of the document you selected first. In hex mode\r\n\
@@ -781,8 +837,10 @@ find Ctrl+F \u{00B7} replace Ctrl+H \u{00B7} find_next F3 \u{00B7} find_prev\r\n
 Shift+F3 \u{00B7} toggle_hex F6 \u{00B7} guide F1 \u{00B7} font_bigger Ctrl++ \u{00B7}\r\n\
 font_smaller Ctrl+- \u{00B7} toggle_bookmark Ctrl+F2 \u{00B7} bookmark_next\r\n\
 F2 \u{00B7} bookmark_prev Shift+F2 \u{00B7} jump_back Alt+Left \u{00B7}\r\n\
-jump_forward Alt+Right \u{00B7} pointer_follow Ctrl+Enter.\r\n\
-follow_tail, filter and clear_filter start unbound.\r\n\
+jump_forward Alt+Right \u{00B7} pointer_follow Ctrl+Enter \u{00B7} new_tab\r\n\
+Ctrl+T \u{00B7} close_tab Ctrl+W \u{00B7} next_tab Ctrl+Tab \u{00B7} prev_tab\r\n\
+Ctrl+Shift+Tab \u{00B7} tab_1 to tab_8 Ctrl+1 to Ctrl+8 \u{00B7} tab_last\r\n\
+Ctrl+9. follow_tail, filter and clear_filter start unbound.\r\n\
 Two settings live only in settings.json in the data folder:\r\n\
 \"map_window_mb\" (0, 512, 1024, 2048 or 4096; 0 maps the whole\r\n\
 file, a number reads very large files through a moving window\r\n\
@@ -1276,6 +1334,113 @@ struct EntropyState {
     scanned_gen: u64,
 }
 
+/// What the hover tooltip is previewing: a scrollbar tick (a match
+/// or bookmark offset) or a document tab (its full path). One
+/// tracking tooltip serves both.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HoverKind {
+    Tick(u64, bool),
+    Tab(usize),
+}
+
+/// One document's complete shell state (tabs, roadmap item 39,
+/// slice R5b): everything that belongs to a document rather than
+/// to the window — the editor itself (caret, scroll, selection,
+/// mode, undo, encoding all live inside it), the find state and
+/// its background worker, the filter view and its builder, the
+/// staged line-index build, follow-tail, bookmarks, the
+/// external-change bar, delta recovery, the inspector/hex
+/// transients, the jump history, and the armed save options.
+///
+/// The ACTIVE document's state lives in `App`'s own fields of the
+/// same names — every feature was written against those, and they
+/// keep working unchanged. Inactive documents keep their state in
+/// a `DocState` in `App::parked`; switching tabs swaps the two
+/// field by field (`App::swap_state`). Background workers hold
+/// clones of their document's delivery slots, so a worker started
+/// for a parked document keeps publishing into that document's
+/// state and its results are picked up when the tab returns.
+struct DocState {
+    /// Stable identity for the close-others/all sweeps (indices
+    /// shift as tabs close; ids do not).
+    id: u64,
+    editor: Editor,
+    find_in_selection: bool,
+    find_scope_range: Option<(u64, u64)>,
+    last_scope_range: Option<(u64, u64)>,
+    last_find_kind: FindKind,
+    doc_mmap: Option<Arc<MmapFile>>,
+    find_slot: Arc<Mutex<Option<FindProgress>>>,
+    find_gen: u64,
+    bg_active: bool,
+    bg_matches: Vec<u64>,
+    bg_done: bool,
+    bg_current: Option<usize>,
+    bg_needle_len: u64,
+    find_sync_once: bool,
+    bookmarks: crate::bookmarks::BookmarkList,
+    doc_stamp: Option<crate::bookmarks::FileStamp>,
+    file_stamp: Option<crate::bookmarks::FileStamp>,
+    change_visible: bool,
+    change_shown_for: Option<crate::bookmarks::FileStamp>,
+    change_ignored_for: Option<crate::bookmarks::FileStamp>,
+    fingerprint_slot: Arc<Mutex<Option<(u64, crate::recovery::FileFingerprint)>>>,
+    doc_epoch: u64,
+    doc_fingerprint: Option<crate::recovery::FileFingerprint>,
+    eol: &'static str,
+    rel_offsets: bool,
+    rel_base: u64,
+    find_visible: bool,
+    pending_high_surrogate: Option<u16>,
+    hex_nibble: Option<u8>,
+    index_slot: Arc<Mutex<Option<(u64, IndexProgress)>>>,
+    indexing: Option<(u64, u64)>,
+    doc_generation: u64,
+    open_generation: u64,
+    last_edit: Option<Instant>,
+    last_find_text: String,
+    pending_goto: Option<u64>,
+    index_epoch: u64,
+    status_note: Option<String>,
+    tail_pin_view: bool,
+    filter: Option<FilterState>,
+    strings: StringsState,
+    entropy: EntropyState,
+    entropy_on: bool,
+    grid_on: bool,
+    deltas_on: bool,
+    dim_on: bool,
+    ansi_on: bool,
+    ctl_on: bool,
+    jump_history: JumpHistory,
+    filter_slot: Arc<Mutex<Option<FilterProgress>>>,
+    filter_gen: u64,
+    doc_read_only_file: bool,
+    /// The armed File ▸ Save Options choices (roadmap items
+    /// 31/32), per document: a fresh document starts from the
+    /// persisted settings, and the menu writes both the document
+    /// and the settings (so the choice stays the default for the
+    /// next document and the next run).
+    save_eol: crate::save::EolChoice,
+    save_bom: crate::save::BomChoice,
+    /// The find bar's control texts, which live in the child
+    /// windows while the document is active: parked here so a tab
+    /// switch restores the bar exactly as it was left.
+    find_box: String,
+    replace_box: String,
+    find_count: String,
+}
+
+/// A tab drag in progress (slice R5b): the tab being dragged, the
+/// pointer's DIP x at the grab and now, and whether the pointer
+/// has moved far enough to count as a drag (rather than a click).
+struct TabDrag {
+    index: usize,
+    start_x: f32,
+    x: f32,
+    moved: bool,
+}
+
 struct App {
     hwnd: HWND,
     editor: Editor,
@@ -1468,12 +1633,11 @@ struct App {
     tooltip: HWND,
     /// The canvas tooltip tool was registered.
     hover_tool_ready: bool,
-    /// The tick the hover preview currently shows, as
-    /// `(offset, is_bookmark)`.
-    hover_shown: Option<(u64, bool)>,
-    /// The hover candidate under the pointer and when it settled:
-    /// `(offset, is_bookmark, since)`.
-    hover_cand: Option<(u64, bool, Instant)>,
+    /// The preview the hover tooltip currently shows (a
+    /// scrollbar tick or a document tab).
+    hover_shown: Option<HoverKind>,
+    /// The hover candidate under the pointer and when it settled.
+    hover_cand: Option<(HoverKind, Instant)>,
     /// The Data Inspector's bit boxes from the last render (DIPs),
     /// bit 7 first, plus the caret offset and byte they mirror.
     bit_boxes: Vec<(f32, f32, f32, f32)>,
@@ -1502,6 +1666,41 @@ struct App {
     /// check-mark sync (item 29).
     encoding_menu: HMENU,
     codepage_menu: HMENU,
+    // --- Tabs (roadmap item 39, slice R5b) -----------------------
+    /// The live document's identity (its parked form is
+    /// `DocState::id`).
+    doc_id: u64,
+    /// The live document's armed save-options choices; the parked
+    /// form is `DocState::save_eol` / `save_bom`.
+    save_eol: crate::save::EolChoice,
+    save_bom: crate::save::BomChoice,
+    /// Conceptual tab order (count + active index); the pure
+    /// bookkeeping lives in `crate::tabs`.
+    tabs: crate::tabs::TabOrder,
+    /// The inactive documents' states, in conceptual order with
+    /// the active document left out (the `crate::tabs`
+    /// invariant): `parked.len() == tabs.count() - 1` always.
+    parked: Vec<DocState>,
+    /// Source of `DocState` identities.
+    next_doc_id: u64,
+    /// The tab strip's horizontal scroll offset in DIPs (only
+    /// nonzero while the tabs overflow the window width).
+    tab_scroll_x: f32,
+    /// The tab under the pointer, for the close × and the hover
+    /// fill; recomputed on every mouse move over the strip.
+    tab_hover: Option<usize>,
+    /// The pointer is over the strip's "+" button.
+    tab_plus_hover: bool,
+    /// A tab drag in progress (reorder by insertion point).
+    tab_drag: Option<TabDrag>,
+    /// The tab the strip's context menu acts on (set just before
+    /// the menu opens).
+    tab_context: Option<usize>,
+    /// While session restore runs, `open_document` must not
+    /// delete the crash-recovery files: an accepted recovery is
+    /// sitting in the first tab, and its record is only replaced
+    /// by the next edit's debounce, as before.
+    suppress_recovery_delete: bool,
 }
 
 impl App {
@@ -1542,6 +1741,74 @@ impl App {
         // and bump the generation so the worker's late results are
         // never picked up.
         cancel_bg_find(self);
+    }
+
+    /// Exchange every per-document field with `other` (tabs,
+    /// roadmap item 39): the parking primitive. After the call the
+    /// live fields hold `other`'s document and `other` holds the
+    /// one that was live. Window-global state — settings, theme,
+    /// the child-window handles, the menus, the render targets —
+    /// is never swapped; the field list below is exactly the
+    /// `DocState` list, and the two must be kept in step.
+    fn swap_state(&mut self, other: &mut DocState) {
+        std::mem::swap(&mut self.doc_id, &mut other.id);
+        std::mem::swap(&mut self.editor, &mut other.editor);
+        std::mem::swap(&mut self.find_in_selection, &mut other.find_in_selection);
+        std::mem::swap(&mut self.find_scope_range, &mut other.find_scope_range);
+        std::mem::swap(&mut self.last_scope_range, &mut other.last_scope_range);
+        std::mem::swap(&mut self.last_find_kind, &mut other.last_find_kind);
+        std::mem::swap(&mut self.doc_mmap, &mut other.doc_mmap);
+        std::mem::swap(&mut self.find_slot, &mut other.find_slot);
+        std::mem::swap(&mut self.find_gen, &mut other.find_gen);
+        std::mem::swap(&mut self.bg_active, &mut other.bg_active);
+        std::mem::swap(&mut self.bg_matches, &mut other.bg_matches);
+        std::mem::swap(&mut self.bg_done, &mut other.bg_done);
+        std::mem::swap(&mut self.bg_current, &mut other.bg_current);
+        std::mem::swap(&mut self.bg_needle_len, &mut other.bg_needle_len);
+        std::mem::swap(&mut self.find_sync_once, &mut other.find_sync_once);
+        std::mem::swap(&mut self.bookmarks, &mut other.bookmarks);
+        std::mem::swap(&mut self.doc_stamp, &mut other.doc_stamp);
+        std::mem::swap(&mut self.file_stamp, &mut other.file_stamp);
+        std::mem::swap(&mut self.change_visible, &mut other.change_visible);
+        std::mem::swap(&mut self.change_shown_for, &mut other.change_shown_for);
+        std::mem::swap(&mut self.change_ignored_for, &mut other.change_ignored_for);
+        std::mem::swap(&mut self.fingerprint_slot, &mut other.fingerprint_slot);
+        std::mem::swap(&mut self.doc_epoch, &mut other.doc_epoch);
+        std::mem::swap(&mut self.doc_fingerprint, &mut other.doc_fingerprint);
+        std::mem::swap(&mut self.eol, &mut other.eol);
+        std::mem::swap(&mut self.rel_offsets, &mut other.rel_offsets);
+        std::mem::swap(&mut self.rel_base, &mut other.rel_base);
+        std::mem::swap(&mut self.find_visible, &mut other.find_visible);
+        std::mem::swap(
+            &mut self.pending_high_surrogate,
+            &mut other.pending_high_surrogate,
+        );
+        std::mem::swap(&mut self.hex_nibble, &mut other.hex_nibble);
+        std::mem::swap(&mut self.index_slot, &mut other.index_slot);
+        std::mem::swap(&mut self.indexing, &mut other.indexing);
+        std::mem::swap(&mut self.doc_generation, &mut other.doc_generation);
+        std::mem::swap(&mut self.open_generation, &mut other.open_generation);
+        std::mem::swap(&mut self.last_edit, &mut other.last_edit);
+        std::mem::swap(&mut self.last_find_text, &mut other.last_find_text);
+        std::mem::swap(&mut self.pending_goto, &mut other.pending_goto);
+        std::mem::swap(&mut self.index_epoch, &mut other.index_epoch);
+        std::mem::swap(&mut self.status_note, &mut other.status_note);
+        std::mem::swap(&mut self.tail_pin_view, &mut other.tail_pin_view);
+        std::mem::swap(&mut self.filter, &mut other.filter);
+        std::mem::swap(&mut self.strings, &mut other.strings);
+        std::mem::swap(&mut self.entropy, &mut other.entropy);
+        std::mem::swap(&mut self.entropy_on, &mut other.entropy_on);
+        std::mem::swap(&mut self.grid_on, &mut other.grid_on);
+        std::mem::swap(&mut self.deltas_on, &mut other.deltas_on);
+        std::mem::swap(&mut self.dim_on, &mut other.dim_on);
+        std::mem::swap(&mut self.ansi_on, &mut other.ansi_on);
+        std::mem::swap(&mut self.ctl_on, &mut other.ctl_on);
+        std::mem::swap(&mut self.jump_history, &mut other.jump_history);
+        std::mem::swap(&mut self.filter_slot, &mut other.filter_slot);
+        std::mem::swap(&mut self.filter_gen, &mut other.filter_gen);
+        std::mem::swap(&mut self.doc_read_only_file, &mut other.doc_read_only_file);
+        std::mem::swap(&mut self.save_eol, &mut other.save_eol);
+        std::mem::swap(&mut self.save_bom, &mut other.save_bom);
     }
 }
 
@@ -2317,12 +2584,16 @@ fn ensure_caret_segment_visible(app: &mut App) {
 /// Position every child window for the current client size / DPI /
 /// find-bar visibility.
 fn layout_children(app: &mut App) {
+    // The tab strip's scroll offset is valid only for the current
+    // width; keep it clamped whenever the chrome is laid out
+    // (resize, tab switch, open/close).
+    clamp_tab_scroll(app);
     let mut client: RECT = unsafe { std::mem::zeroed() };
     // SAFETY: our window plus a writable RECT.
     unsafe { GetClientRect(app.hwnd, &mut client) };
     let (cw, ch) = (client.right - client.left, client.bottom - client.top);
     let toolbar_h = app.px(TOOLBAR_H);
-    let row_y = app.px(STRIP_H + 3.0);
+    let row_y = app.px(STRIP_H + TABBAR_H + 3.0);
     // Toolbar buttons: fixed DIP widths in creation order. The first
     // six flow from the left; the last two (the Text / Hex mode
     // toggles) are anchored to the right end of the row.
@@ -2365,7 +2636,7 @@ fn layout_children(app: &mut App) {
     // External-change bar (roadmap item 34): directly under the
     // toolbar when showing — the label, then Reload / Ignore.
     if app.change_visible {
-        let y = app.px(STRIP_H) + toolbar_h + app.px(3.0);
+        let y = app.px(STRIP_H) + app.px(TABBAR_H) + toolbar_h + app.px(3.0);
         let h = app.px(CHANGEBAR_H) - app.px(6.0);
         let mut cx = app.px(4.0);
         let label = app.change_label;
@@ -2384,6 +2655,7 @@ fn layout_children(app: &mut App) {
     // Find bar (second row when visible).
     if app.find_visible {
         let y = app.px(STRIP_H)
+            + app.px(TABBAR_H)
             + toolbar_h
             + if app.change_visible {
                 app.px(CHANGEBAR_H)
@@ -2439,11 +2711,7 @@ fn layout_children(app: &mut App) {
     // polish pass. The strip also keeps 8 DIPs of clear space at
     // both ends of the window now (polish pass padding).
     let status_h = app.px(STATUS_H);
-    let armed = !save_armed_suffix(
-        app.settings.save_eol_choice(),
-        app.settings.save_bom_choice(),
-    )
-    .is_empty();
+    let armed = !save_armed_suffix(app.save_eol, app.save_bom).is_empty();
     let right_w = app.px(if armed { 528.0 } else { 392.0 }).min(cw);
     let pad = app.px(8.0);
     // SAFETY: our child windows.
@@ -2647,10 +2915,7 @@ fn refresh_status_right(app: &App, st: &crate::editor::StatusInfo) {
     }
     // Armed save conversions (roadmap items 31/32) are visible
     // here before anything is saved.
-    right.push_str(save_armed_suffix(
-        app.settings.save_eol_choice(),
-        app.settings.save_bom_choice(),
-    ));
+    right.push_str(save_armed_suffix(app.save_eol, app.save_bom));
     let wide = wstr(&right);
     // SAFETY: our status control plus a NUL-terminated string.
     unsafe { SetWindowTextW(app.status_right, wide.as_ptr()) };
@@ -3154,6 +3419,175 @@ fn render(app: &mut App) {
         },
         brushes.accent,
     );
+
+    // The tab strip (roadmap item 39): a panel band holding one
+    // tab per open document. The active tab is filled with the
+    // editor background and outlined; a hovered tab takes the
+    // halfway band colour; a filled accent square marks unsaved
+    // changes and a hollow square a read-only file; the close ×
+    // shows on the active and hovered tabs. When the tabs
+    // overflow, they shrink to a minimum width and then the
+    // strip scrolls (the wheel over the strip scrolls it).
+    {
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: 0.0,
+                top: STRIP_H,
+                right: width,
+                bottom: STRIP_H + TABBAR_H,
+            },
+            brushes.panel,
+        );
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: 0.0,
+                top: STRIP_H + TABBAR_H - 1.0,
+                right: width,
+                bottom: STRIP_H + TABBAR_H,
+            },
+            brushes.line,
+        );
+        let (geoms, plus) = tab_strip_layout(app);
+        let tab_top = STRIP_H + 3.0;
+        let tab_bottom = STRIP_H + TABBAR_H;
+        let text_y = tab_top + ((tab_bottom - tab_top - app.line_h) / 2.0).max(0.0);
+        let mid_y = (tab_top + tab_bottom) / 2.0;
+        for geom in &geoms {
+            if geom.x + geom.w < 0.0 || geom.x > width {
+                continue;
+            }
+            let active = geom.index == app.tabs.active();
+            let hovered = app.tab_hover == Some(geom.index);
+            let rect = D2dRectF {
+                left: geom.x,
+                top: tab_top,
+                right: geom.x + geom.w,
+                bottom: tab_bottom,
+            };
+            if active {
+                fill_rect(fill, target, rect, brushes.bg);
+                outline_rect(draw_rect, target, rect, brushes.line);
+            } else if hovered {
+                fill_rect(fill, target, rect, brushes.band);
+            }
+            let name = tab_display_name(app, geom.index);
+            let mut tx = geom.x + 8.0;
+            if tab_is_dirty(app, geom.index) {
+                fill_rect(
+                    fill,
+                    target,
+                    D2dRectF {
+                        left: tx,
+                        top: mid_y - 3.0,
+                        right: tx + 6.0,
+                        bottom: mid_y + 3.0,
+                    },
+                    brushes.accent,
+                );
+                tx += 10.0;
+            }
+            if tab_is_read_only_file(app, geom.index) {
+                outline_rect(
+                    draw_rect,
+                    target,
+                    D2dRectF {
+                        left: tx,
+                        top: mid_y - 3.0,
+                        right: tx + 6.0,
+                        bottom: mid_y + 3.0,
+                    },
+                    brushes.muted,
+                );
+                tx += 10.0;
+            }
+            let close_x = geom.x + geom.w - TAB_CLOSE_W - 2.0;
+            draw_text(
+                draw,
+                target,
+                format,
+                &name,
+                D2dRectF {
+                    left: tx,
+                    top: text_y,
+                    right: close_x - 2.0,
+                    bottom: text_y + app.line_h,
+                },
+                if active || hovered {
+                    brushes.text
+                } else {
+                    brushes.muted
+                },
+            );
+            if active || hovered {
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    "\u{2715}",
+                    D2dRectF {
+                        left: close_x,
+                        top: text_y,
+                        right: geom.x + geom.w - 2.0,
+                        bottom: text_y + app.line_h,
+                    },
+                    brushes.muted,
+                );
+            }
+        }
+        // The "+" new-tab button at the end of the strip (pinned
+        // to the right edge while the tabs overflow).
+        if app.tab_plus_hover {
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: plus.0,
+                    top: tab_top,
+                    right: plus.1,
+                    bottom: tab_bottom,
+                },
+                brushes.band,
+            );
+        }
+        draw_text(
+            draw,
+            target,
+            format,
+            "+",
+            D2dRectF {
+                left: plus.0 + 8.0,
+                top: text_y,
+                right: plus.1,
+                bottom: text_y + app.line_h,
+            },
+            if app.tab_plus_hover {
+                brushes.text
+            } else {
+                brushes.muted
+            },
+        );
+        // A drag in progress paints its insertion marker.
+        if let Some(drag) = &app.tab_drag {
+            if drag.moved {
+                let (_, marker_x) = tab_drop_at(app, drag.index, drag.x);
+                fill_rect(
+                    fill,
+                    target,
+                    D2dRectF {
+                        left: marker_x - 1.0,
+                        top: tab_top,
+                        right: marker_x + 1.0,
+                        bottom: tab_bottom,
+                    },
+                    brushes.accent,
+                );
+            }
+        }
+    }
     // Gutter background for the rows strip.
     fill_rect(
         fill,
@@ -5400,7 +5834,13 @@ fn open_document(app: &mut App, path: &Path) {
     app.hex_nibble = None;
     app.doc_mmap = Some(mmap.clone());
     spawn_index_thread(app, mmap);
-    delete_recovery_files();
+    // The crash-recovery record belongs to the document it was
+    // written for; opening during a session restore (roadmap
+    // item 39) must not discard the startup document's accepted
+    // recovery.
+    if !app.suppress_recovery_delete {
+        delete_recovery_files();
+    }
     begin_document_tracking(app);
     let path_string = path.to_string_lossy().into_owned();
     app.settings.add_recent(&path_string);
@@ -5433,6 +5873,835 @@ fn prompt_save_if_dirty(app: &mut App) -> bool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tabs (roadmap item 39, slice R5b): several documents in one
+// window. The active document's state lives in the App fields
+// (see DocState); inactive documents are parked in `app.parked`.
+// Every operation below is built from two primitives — parking
+// the live state and swapping a parked state in — so the tab
+// order bookkeeping in `crate::tabs` and the parked list can be
+// reasoned about (and tested) separately from the window.
+// ---------------------------------------------------------------------------
+
+/// A fresh empty document's state: what a new tab starts with —
+/// an untitled editor under the owner's undo limits, the
+/// persisted save options as its armed choices, and every worker
+/// slot new. Mirrors the initial document's defaults in
+/// `run_gui`.
+fn fresh_doc_state(app: &mut App) -> DocState {
+    app.next_doc_id += 1;
+    let mut editor = Editor::new_empty();
+    editor.set_undo_limits(
+        app.settings.undo_limit,
+        app.settings.undo_byte_budget_mb * 1024 * 1024,
+    );
+    DocState {
+        id: app.next_doc_id,
+        editor,
+        find_in_selection: false,
+        find_scope_range: None,
+        last_scope_range: None,
+        last_find_kind: FindKind::Plain,
+        doc_mmap: None,
+        find_slot: Arc::new(Mutex::new(None)),
+        find_gen: 0,
+        bg_active: false,
+        bg_matches: Vec::new(),
+        bg_done: false,
+        bg_current: None,
+        bg_needle_len: 0,
+        find_sync_once: false,
+        bookmarks: crate::bookmarks::BookmarkList::new(),
+        doc_stamp: None,
+        file_stamp: None,
+        change_visible: false,
+        change_shown_for: None,
+        change_ignored_for: None,
+        fingerprint_slot: Arc::new(Mutex::new(None)),
+        doc_epoch: 0,
+        doc_fingerprint: None,
+        eol: "LF",
+        rel_offsets: false,
+        rel_base: 0,
+        find_visible: false,
+        pending_high_surrogate: None,
+        hex_nibble: None,
+        index_slot: Arc::new(Mutex::new(None)),
+        indexing: None,
+        doc_generation: 0,
+        open_generation: 0,
+        last_edit: None,
+        last_find_text: String::new(),
+        pending_goto: None,
+        index_epoch: 0,
+        status_note: None,
+        tail_pin_view: false,
+        filter: None,
+        strings: StringsState {
+            slot: Arc::new(Mutex::new(None)),
+            gen: 0,
+            results: Vec::new(),
+            first: 0,
+            selected: None,
+            searching: false,
+            scanned_gen: 0,
+            scanned_min_len: 0,
+        },
+        entropy: EntropyState {
+            slot: Arc::new(Mutex::new(None)),
+            gen: 0,
+            values: Vec::new(),
+            computing: false,
+            scanned_gen: 0,
+        },
+        entropy_on: false,
+        grid_on: false,
+        deltas_on: false,
+        dim_on: false,
+        ansi_on: false,
+        ctl_on: false,
+        jump_history: JumpHistory::new(),
+        filter_slot: Arc::new(Mutex::new(None)),
+        filter_gen: 0,
+        doc_read_only_file: false,
+        save_eol: app.settings.save_eol_choice(),
+        save_bom: app.settings.save_bom_choice(),
+        find_box: String::new(),
+        replace_box: String::new(),
+        find_count: String::new(),
+    }
+}
+
+/// Set a child control's text (null-safe).
+fn set_control_text(hwnd: HWND, text: &str) {
+    if hwnd.is_null() {
+        return;
+    }
+    let wide = wstr(text);
+    // SAFETY: our child window plus a NUL-terminated string.
+    unsafe { SetWindowTextW(hwnd, wide.as_ptr()) };
+}
+
+/// Park the live document: swap its state into its tab slot,
+/// leaving a fresh placeholder document live. Afterwards
+/// `app.parked` holds EVERY document in conceptual order (the
+/// arrangement `crate::tabs` documents), ready for one to be
+/// swapped back in or removed.
+fn park_live(app: &mut App) {
+    // The find bar's texts live in the child windows, not in the
+    // state: capture them for the outgoing document first.
+    // SAFETY: reading our own child windows' text.
+    let find_box = unsafe { window_text(app.find_edit) };
+    // SAFETY: as above.
+    let replace_box = unsafe { window_text(app.replace_edit) };
+    // SAFETY: as above.
+    let find_count = unsafe { window_text(app.find_count) };
+    let mut fresh = fresh_doc_state(app);
+    app.swap_state(&mut fresh);
+    // `fresh` now holds the document that was live; give it its
+    // find-bar texts before it joins the parked list.
+    fresh.find_box = find_box;
+    fresh.replace_box = replace_box;
+    fresh.find_count = find_count;
+    let pos = app.tabs.park_position();
+    app.parked.insert(pos, fresh);
+}
+
+/// Swap a parked document in as the live one (its previous
+/// contents — a fresh placeholder — are dropped by the caller).
+/// The document's parked find-bar texts go back into the
+/// controls; everything else arrives with the state swap itself.
+fn swap_in(app: &mut App, state: &mut DocState) {
+    let find_box = state.find_box.clone();
+    let replace_box = state.replace_box.clone();
+    let find_count = state.find_count.clone();
+    app.swap_state(state);
+    set_control_text(app.find_edit, &find_box);
+    set_control_text(app.replace_edit, &replace_box);
+    set_control_text(app.find_count, &find_count);
+}
+
+/// Clear the find bar's control texts (a brand-new document has
+/// no find state of its own yet).
+fn clear_find_bar_texts(app: &mut App) {
+    set_control_text(app.find_edit, "");
+    set_control_text(app.replace_edit, "");
+    set_control_text(app.find_count, "");
+}
+
+/// Reconnect the window chrome to the document that just became
+/// active: the find bar and the change bar take the document's
+/// own visibility, the title / status / menu checks refresh, the
+/// hex layout re-syncs, interaction transients reset, and the
+/// strip scrolls the active tab into view.
+fn after_tab_switch(app: &mut App) {
+    let find_show = if app.find_visible { SW_SHOW } else { SW_HIDE };
+    for hwnd in app
+        .find_controls
+        .iter()
+        .chain([&app.find_label, &app.replace_label])
+    {
+        if !hwnd.is_null() {
+            // SAFETY: our child windows.
+            unsafe { ShowWindow(*hwnd, find_show) };
+        }
+    }
+    // The find scope toggle's label follows the document's state
+    // (the draw pass adds the accent state while it is on).
+    set_control_text(
+        app.find_scope_check,
+        if app.find_in_selection {
+            "\u{2713} In selection"
+        } else {
+            "In selection"
+        },
+    );
+    let change_show = if app.change_visible { SW_SHOW } else { SW_HIDE };
+    for hwnd in [
+        app.change_label,
+        app.change_reload_btn,
+        app.change_ignore_btn,
+    ] {
+        if !hwnd.is_null() {
+            // SAFETY: our child windows.
+            unsafe { ShowWindow(hwnd, change_show) };
+        }
+    }
+    // If the incoming document has no find bar but the keyboard
+    // focus is sitting in one of its (now hidden) controls, hand
+    // the focus back to the window so keystrokes keep working.
+    if !app.find_visible {
+        // SAFETY: a plain focus query.
+        let focus = unsafe { GetFocus() };
+        if focus == app.find_edit || focus == app.replace_edit {
+            // SAFETY: our window.
+            unsafe { SetFocus(app.hwnd) };
+        }
+    }
+    app.scroll_drag = None;
+    app.dragging = false;
+    app.hover_cand = None;
+    hide_hover(app);
+    app.tab_hover = None;
+    app.tab_plus_hover = false;
+    sync_hex_layout(app);
+    refresh_title(app);
+    refresh_status(app);
+    refresh_menu_checks(app);
+    ensure_active_tab_visible(app);
+    layout_children(app);
+    invalidate(app);
+}
+
+/// Make conceptual tab `index` the active document. Switching
+/// preserves everything about both documents: each keeps its own
+/// caret, scroll, mode, filter (and any in-flight filter or find
+/// or index build, which keeps running against its own state),
+/// undo history, and armed save options.
+fn switch_tab(app: &mut App, index: usize) {
+    if index >= app.tabs.count() || index == app.tabs.active() {
+        return;
+    }
+    park_live(app);
+    let mut state = app.parked.remove(index);
+    swap_in(app, &mut state);
+    drop(state);
+    app.tabs.activate(index);
+    after_tab_switch(app);
+}
+
+/// Open a fresh empty document in a new tab and switch to it.
+fn new_tab(app: &mut App) {
+    park_live(app);
+    app.tabs.opened_appended();
+    // The live fields already hold the fresh state park_live
+    // swapped in — that IS the new document.
+    clear_find_bar_texts(app);
+    after_tab_switch(app);
+}
+
+/// Open `path` in a new tab and switch to it.
+fn open_path_in_new_tab(app: &mut App, path: &Path) {
+    park_live(app);
+    app.tabs.opened_appended();
+    clear_find_bar_texts(app);
+    open_document(app, path);
+    after_tab_switch(app);
+}
+
+/// The File ▸ Open rule with tabs: an untouched empty tab (no
+/// file, no unsaved changes) is replaced in place; anything else
+/// opens in a new tab, so opening a file never disturbs the
+/// document in front of the user or asks about its changes.
+fn open_path_from_ui(app: &mut App, path: &Path) {
+    if app.editor.path().is_none() && !app.editor.is_dirty() {
+        open_document(app, path);
+    } else {
+        open_path_in_new_tab(app, path);
+    }
+}
+
+/// Close the active tab (its unsaved changes already dealt
+/// with). When it is the only tab, a fresh empty document takes
+/// its place in the same tab — the window never has zero
+/// documents.
+fn close_active_tab(app: &mut App) {
+    if app.tabs.count() == 1 {
+        let mut fresh = fresh_doc_state(app);
+        app.swap_state(&mut fresh);
+        drop(fresh);
+        app.tabs.reset_single();
+        clear_find_bar_texts(app);
+        after_tab_switch(app);
+        return;
+    }
+    let closing = app.tabs.active();
+    // The replacement: the tab that slides into the closed tab's
+    // place, or the previous tab when closing the last one.
+    let replacement = if closing + 1 < app.tabs.count() {
+        closing + 1
+    } else {
+        closing - 1
+    };
+    let pi = app
+        .tabs
+        .parked_index(replacement)
+        .expect("the replacement tab is parked");
+    let mut state = app.parked.remove(pi);
+    swap_in(app, &mut state);
+    drop(state); // the closed document's state
+    app.tabs.closed(closing);
+    after_tab_switch(app);
+}
+
+/// Close conceptual tab `index`, asking about unsaved changes
+/// first (the existing prompt). A dirty parked tab is brought to
+/// the front to ask about it. Returns false when the user
+/// cancelled.
+fn request_close_tab(app: &mut App, index: usize) -> bool {
+    if index >= app.tabs.count() {
+        return false;
+    }
+    if index != app.tabs.active() {
+        if !tab_is_dirty(app, index) {
+            let pi = app
+                .tabs
+                .parked_index(index)
+                .expect("a parked tab has a parked index");
+            app.parked.remove(pi);
+            app.tabs.closed(index);
+            invalidate(app);
+            return true;
+        }
+        switch_tab(app, index);
+    }
+    if !prompt_save_if_dirty(app) {
+        return false;
+    }
+    close_active_tab(app);
+    true
+}
+
+/// Close every tab except the one identified by `keep_id`,
+/// asking about each dirty one; a Cancel stops the sweep where
+/// it stands. Ends on the kept tab.
+fn close_other_tabs(app: &mut App, keep_id: u64) {
+    while let Some(index) = (0..app.tabs.count()).find(|&i| tab_doc_id(app, i) != keep_id) {
+        if !request_close_tab(app, index) {
+            break;
+        }
+    }
+    if let Some(keep) = tab_index_of_id(app, keep_id) {
+        switch_tab(app, keep);
+    }
+}
+
+/// Close all tabs (asking about each dirty one); the last one
+/// leaves a fresh empty document behind, per the close rule.
+fn close_all_tabs(app: &mut App) {
+    loop {
+        if app.tabs.count() == 1 {
+            if app.editor.path().is_none() && !app.editor.is_dirty() {
+                break; // already the fresh empty document
+            }
+            request_close_tab(app, app.tabs.active());
+            break;
+        }
+        if !request_close_tab(app, 0) {
+            break;
+        }
+    }
+}
+
+/// The window-close sweep: every dirty document in turn is
+/// brought to the front and asked about (the existing prompt).
+/// Cancel anywhere aborts the close. A document answered with
+/// "Don't Save" stays dirty, so answered identities are
+/// remembered and nobody is asked twice.
+fn prompt_all_dirty(app: &mut App) -> bool {
+    // The tab the user was on when they asked to close: the
+    // sweep returns to it, so the session snapshot taken after
+    // the sweep names the tab they actually left active.
+    let start_id = app.doc_id;
+    let mut answered: Vec<u64> = Vec::new();
+    loop {
+        let Some(index) = (0..app.tabs.count())
+            .find(|&i| tab_is_dirty(app, i) && !answered.contains(&tab_doc_id(app, i)))
+        else {
+            if let Some(start) = tab_index_of_id(app, start_id) {
+                switch_tab(app, start);
+            }
+            return true;
+        };
+        switch_tab(app, index);
+        if !prompt_save_if_dirty(app) {
+            return false;
+        }
+        answered.push(app.doc_id);
+    }
+}
+
+/// The path of conceptual tab `index`'s document, if it has one.
+fn tab_path(app: &App, index: usize) -> Option<PathBuf> {
+    if index == app.tabs.active() {
+        return app.editor.path().map(|p| p.to_path_buf());
+    }
+    let pi = app.tabs.parked_index(index)?;
+    app.parked[pi].editor.path().map(|p| p.to_path_buf())
+}
+
+/// Whether conceptual tab `index`'s document has unsaved changes.
+fn tab_is_dirty(app: &App, index: usize) -> bool {
+    if index == app.tabs.active() {
+        return app.editor.is_dirty();
+    }
+    match app.tabs.parked_index(index) {
+        Some(pi) => app.parked[pi].editor.is_dirty(),
+        None => false,
+    }
+}
+
+/// Whether conceptual tab `index`'s file carries the read-only
+/// attribute (the tab strip's hollow marker).
+fn tab_is_read_only_file(app: &App, index: usize) -> bool {
+    if index == app.tabs.active() {
+        return app.doc_read_only_file;
+    }
+    match app.tabs.parked_index(index) {
+        Some(pi) => app.parked[pi].doc_read_only_file,
+        None => false,
+    }
+}
+
+/// The stable identity of conceptual tab `index`'s document.
+fn tab_doc_id(app: &App, index: usize) -> u64 {
+    if index == app.tabs.active() {
+        return app.doc_id;
+    }
+    match app.tabs.parked_index(index) {
+        Some(pi) => app.parked[pi].id,
+        None => 0,
+    }
+}
+
+/// The conceptual index of the document with identity `id`.
+fn tab_index_of_id(app: &App, id: u64) -> Option<usize> {
+    (0..app.tabs.count()).find(|&i| tab_doc_id(app, i) == id)
+}
+
+/// The conceptual index of the tab showing `path` (compared as
+/// the lossy string the session list stores), if any.
+fn tab_index_with_path(app: &App, path: &str) -> Option<usize> {
+    (0..app.tabs.count()).find(|&i| {
+        tab_path(app, i).map(|p| p.to_string_lossy().into_owned()) == Some(path.to_string())
+    })
+}
+
+/// A tab's display name: the file's name, or "Untitled".
+fn tab_display_name(app: &App, index: usize) -> String {
+    match tab_path(app, index) {
+        Some(path) => path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string()),
+        None => "Untitled".to_string(),
+    }
+}
+
+/// The tab's hover tooltip text: the full path (or "Untitled"),
+/// with its state named.
+fn tab_tooltip_text(app: &App, index: usize) -> String {
+    let mut text = match tab_path(app, index) {
+        Some(path) => path.display().to_string(),
+        None => "Untitled".to_string(),
+    };
+    if tab_is_dirty(app, index) {
+        text.push_str(" \u{00B7} unsaved changes");
+    }
+    if tab_is_read_only_file(app, index) {
+        text.push_str(" \u{00B7} read-only");
+    }
+    text
+}
+
+/// Snapshot the session (the open tabs' paths and the active
+/// index within them) into the settings, ready for the
+/// close-time save. Documents without a path are not persisted.
+fn snapshot_session(app: &mut App) {
+    let docs: Vec<Option<String>> = (0..app.tabs.count())
+        .map(|i| tab_path(app, i).map(|p| p.to_string_lossy().into_owned()))
+        .collect();
+    let (paths, active) = crate::tabs::session_from_docs(&docs, app.tabs.active());
+    app.settings.session_tabs = paths;
+    app.settings.session_active = active;
+}
+
+/// Reopen the tabs the last clean exit left behind: the saved
+/// paths that still open, in order, with the saved active tab
+/// restored. A document the startup already produced (an
+/// accepted crash recovery) covers its own path and is not
+/// opened twice; when the startup document is an untouched
+/// empty tab, the first restored file takes its place. Missing
+/// or unreadable files are skipped silently (the restore plan
+/// probes each path by opening its mapping, which is also what
+/// the open itself does first).
+fn restore_session(app: &mut App) {
+    let saved = app.settings.session_tabs.clone();
+    if saved.is_empty() {
+        return;
+    }
+    let (paths, want_active) =
+        crate::tabs::plan_restore(&saved, app.settings.session_active, |p| {
+            MmapFile::open(Path::new(p)).is_ok()
+        });
+    if paths.is_empty() {
+        return;
+    }
+    let startup_path = app.editor.path().map(|p| p.to_string_lossy().into_owned());
+    let startup_untouched = startup_path.is_none() && !app.editor.is_dirty();
+    app.suppress_recovery_delete = true;
+    let mut rest = paths.iter().filter(|p| Some(*p) != startup_path.as_ref());
+    if startup_untouched {
+        if let Some(first) = rest.next() {
+            open_document(app, Path::new(first));
+        }
+    }
+    for path in rest {
+        open_path_in_new_tab(app, Path::new(path));
+    }
+    app.suppress_recovery_delete = false;
+    if let Some(index) = tab_index_with_path(app, &paths[want_active]) {
+        switch_tab(app, index);
+    }
+}
+
+/// Start a separate VeloEdit process — File ▸ New Window, or
+/// Open in New Window with a file. There is no single-instance
+/// design in the program (no mutex, no forwarding): every launch
+/// is its own process, so a new window is simply our own exe
+/// started again, with the file as its argument when one is
+/// given. The Explorer "Open in VeloEdit" entry and command-line
+/// file arguments take the same route they always have — a fresh
+/// process per invocation.
+fn spawn_new_window(app: &mut App, path: Option<&Path>) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let verb = wstr("open");
+    let file = wstr(&exe.to_string_lossy());
+    let params = path.map(|p| wstr(&format!("\"{}\"", p.display())));
+    // SAFETY: the strings are NUL-terminated and outlive the
+    // call; a null parent and directory are permitted. A return
+    // value of 32 or less is the documented failure signal.
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params
+                .as_ref()
+                .map(|p| p.as_ptr())
+                .unwrap_or(std::ptr::null()),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if (result as usize) <= 32 {
+        message_box(
+            app.hwnd,
+            "Windows did not open the new window.",
+            "New Window",
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The tab strip: geometry, painting, and pointer handling. The
+// strip is drawn on the canvas with the rest of the chrome (the
+// toolbar family), between the accent strip and the toolbar.
+// Paint and hit-testing share `tab_strip_layout`, so they can
+// never disagree about where a tab is.
+// ---------------------------------------------------------------------------
+
+/// One tab's strip geometry (DIPs, client coordinates; `x` may be
+/// negative while the strip is scrolled).
+struct TabGeom {
+    index: usize,
+    x: f32,
+    w: f32,
+}
+
+/// The "+" (new tab) button's width in the strip.
+const TAB_PLUS_W: f32 = 26.0;
+/// Horizontal gap between tabs, and the strip's edge padding.
+const TAB_GAP: f32 = 4.0;
+
+/// The strip's layout: every tab's position (in tab order, after
+/// the scroll offset) and the "+" button's span. Tab widths come
+/// from the tab names at the editor's character width, fitted by
+/// `crate::tabs::fit_widths`; the "+" button is pinned at the
+/// right edge when the tabs overflow.
+fn tab_strip_layout(app: &App) -> (Vec<TabGeom>, (f32, f32)) {
+    let mut client: RECT = unsafe { std::mem::zeroed() };
+    // SAFETY: our window plus a writable RECT.
+    unsafe { GetClientRect(app.hwnd, &mut client) };
+    let width = app.dip(client.right - client.left);
+    let count = app.tabs.count();
+    let avail = (width - TAB_GAP * 2.0 - TAB_PLUS_W).max(TAB_MIN_W);
+    let naturals: Vec<f32> = (0..count)
+        .map(|i| {
+            let name = tab_display_name(app, i);
+            let text_w = name.chars().count() as f32 * app.char_w;
+            // Text + left padding + marker slot + close box.
+            (text_w + 8.0 + 12.0 + TAB_CLOSE_W).clamp(TAB_MIN_W, TAB_MAX_W)
+        })
+        .collect();
+    let widths = crate::tabs::fit_widths(&naturals, TAB_MIN_W, avail);
+    let mut geoms = Vec::with_capacity(count);
+    let mut x = TAB_GAP - app.tab_scroll_x;
+    for (i, w) in widths.iter().enumerate() {
+        geoms.push(TabGeom { index: i, x, w: *w });
+        x += w + TAB_GAP;
+    }
+    let content_right = x - TAB_GAP + app.tab_scroll_x;
+    let plus_x = if content_right + TAB_GAP + TAB_PLUS_W <= width - TAB_GAP {
+        content_right + TAB_GAP
+    } else {
+        (width - TAB_GAP - TAB_PLUS_W).max(TAB_GAP)
+    };
+    (geoms, (plus_x, plus_x + TAB_PLUS_W))
+}
+
+/// The strip content's right edge in unscrolled coordinates
+/// (the last tab's right edge) — the scroll range derives from
+/// it.
+fn tab_content_width(app: &App) -> f32 {
+    let (geoms, _) = tab_strip_layout(app);
+    match geoms.last() {
+        Some(last) => last.x + last.w + app.tab_scroll_x,
+        None => 0.0,
+    }
+}
+
+/// Clamp the strip's scroll offset to the content.
+fn clamp_tab_scroll(app: &mut App) {
+    let mut client: RECT = unsafe { std::mem::zeroed() };
+    // SAFETY: our window plus a writable RECT.
+    unsafe { GetClientRect(app.hwnd, &mut client) };
+    let width = app.dip(client.right - client.left);
+    let max_scroll = (tab_content_width(app) + TAB_GAP * 2.0 + TAB_PLUS_W - width).max(0.0);
+    app.tab_scroll_x = app.tab_scroll_x.clamp(0.0, max_scroll);
+}
+
+/// Scroll the strip just enough that the active tab is fully
+/// visible (called on every switch).
+fn ensure_active_tab_visible(app: &mut App) {
+    let (geoms, _) = tab_strip_layout(app);
+    let Some(geom) = geoms.iter().find(|g| g.index == app.tabs.active()) else {
+        return;
+    };
+    let mut client: RECT = unsafe { std::mem::zeroed() };
+    // SAFETY: our window plus a writable RECT.
+    unsafe { GetClientRect(app.hwnd, &mut client) };
+    let width = app.dip(client.right - client.left);
+    let view_right = width - TAB_PLUS_W - TAB_GAP * 2.0;
+    if geom.x < TAB_GAP {
+        app.tab_scroll_x -= TAB_GAP - geom.x;
+    } else if geom.x + geom.w > view_right {
+        app.tab_scroll_x += geom.x + geom.w - view_right;
+    }
+    clamp_tab_scroll(app);
+}
+
+/// What a point in the tab strip hits.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TabHit {
+    Tab(usize),
+    Close(usize),
+    New,
+    None,
+}
+
+/// Hit-test a point (DIPs) against the strip. The close × is
+/// live only on the active or hovered tab — exactly the tabs it
+/// is painted on.
+fn tab_hit(app: &App, x: f32, y: f32) -> TabHit {
+    if y < STRIP_H || y >= STRIP_H + TABBAR_H {
+        return TabHit::None;
+    }
+    let (geoms, plus) = tab_strip_layout(app);
+    if x >= plus.0 && x < plus.1 {
+        return TabHit::New;
+    }
+    for geom in &geoms {
+        if x >= geom.x && x < geom.x + geom.w {
+            let close_shown = geom.index == app.tabs.active() || app.tab_hover == Some(geom.index);
+            if close_shown && x >= geom.x + geom.w - TAB_CLOSE_W - 2.0 {
+                return TabHit::Close(geom.index);
+            }
+            return TabHit::Tab(geom.index);
+        }
+    }
+    TabHit::None
+}
+
+/// The drop position for a tab drag: the final index the dragged
+/// tab would take if released at DIP x, and the x to paint the
+/// insertion marker at. Computed over the OTHER tabs closing
+/// ranks, so dropping a tab in its own neighbourhood is a no-op.
+fn tab_drop_at(app: &App, drag_index: usize, x: f32) -> (usize, f32) {
+    let (geoms, _) = tab_strip_layout(app);
+    let mut cx = TAB_GAP - app.tab_scroll_x;
+    let mut slot = 0;
+    for geom in &geoms {
+        if geom.index == drag_index {
+            continue;
+        }
+        if x < cx + geom.w / 2.0 {
+            return (slot, cx - TAB_GAP / 2.0);
+        }
+        cx += geom.w + TAB_GAP;
+        slot += 1;
+    }
+    (slot, cx - TAB_GAP / 2.0)
+}
+
+/// Move a tab by drag: reorder the parked list and the order
+/// bookkeeping together, keeping the same document active (the
+/// active marker follows its document).
+fn move_tab(app: &mut App, from: usize, to: usize) {
+    if from >= app.tabs.count() || to >= app.tabs.count() || from == to {
+        return;
+    }
+    park_live(app);
+    // The parked list is now the full conceptual list.
+    let state = app.parked.remove(from);
+    app.parked.insert(to, state);
+    app.tabs.moved(from, to);
+    let active = app.tabs.active();
+    let mut state = app.parked.remove(active);
+    swap_in(app, &mut state);
+    drop(state);
+    after_tab_switch(app);
+}
+
+/// Left button down in the strip: switch (and arm a drag), close
+/// on the ×, or open a new tab on "+". Returns true when the
+/// point was the strip's to handle.
+fn tab_mouse_down(app: &mut App, lparam: LPARAM) -> bool {
+    let (x_px, y_px) = mouse_xy(lparam);
+    let (x, y) = (app.dip(x_px), app.dip(y_px));
+    if y < STRIP_H || y >= STRIP_H + TABBAR_H {
+        return false;
+    }
+    // The hover state must reflect this exact point before the
+    // close-box test (the × is live only where it is painted).
+    app.tab_hover = match tab_hit(app, x, y) {
+        TabHit::Tab(i) | TabHit::Close(i) => Some(i),
+        _ => None,
+    };
+    match tab_hit(app, x, y) {
+        TabHit::Close(i) => {
+            request_close_tab(app, i);
+            true
+        }
+        TabHit::New => {
+            new_tab(app);
+            true
+        }
+        TabHit::Tab(i) => {
+            switch_tab(app, i);
+            app.tab_drag = Some(TabDrag {
+                index: i,
+                start_x: x,
+                x,
+                moved: false,
+            });
+            // SAFETY: capture the pointer for the drag.
+            unsafe { SetCapture(app.hwnd) };
+            true
+        }
+        TabHit::None => false,
+    }
+}
+
+/// Middle button down in the strip closes the tab under the
+/// pointer (the browser habit).
+fn tab_middle_down(app: &mut App, lparam: LPARAM) -> bool {
+    let (x_px, y_px) = mouse_xy(lparam);
+    let (x, y) = (app.dip(x_px), app.dip(y_px));
+    match tab_hit(app, x, y) {
+        TabHit::Tab(i) | TabHit::Close(i) => {
+            request_close_tab(app, i);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Right button up in the strip: the tab's context menu (Close,
+/// Close Others, Close All, Copy Path, Open in New Window). The
+/// commands arrive through WM_COMMAND; `app.tab_context` names
+/// the tab they act on.
+fn tab_context_menu(app: &mut App, lparam: LPARAM) -> bool {
+    let (x_px, y_px) = mouse_xy(lparam);
+    let (x, y) = (app.dip(x_px), app.dip(y_px));
+    let index = match tab_hit(app, x, y) {
+        TabHit::Tab(i) | TabHit::Close(i) => i,
+        _ => return false,
+    };
+    app.tab_context = Some(index);
+    // SAFETY: building and showing a popup menu of our own; it is
+    // destroyed after the call.
+    unsafe {
+        let menu = CreatePopupMenu();
+        menu_item(menu, CMD_TAB_CLOSE, "Close");
+        menu_item(menu, CMD_TAB_CLOSE_OTHERS, "Close Others");
+        menu_item(menu, CMD_TAB_CLOSE_ALL, "Close All");
+        menu_sep(menu);
+        menu_item(menu, CMD_TAB_COPY_PATH, "Copy Path");
+        menu_item(menu, CMD_TAB_NEW_WINDOW, "Open in New Window");
+        if tab_path(app, index).is_none() {
+            EnableMenuItem(menu, CMD_TAB_COPY_PATH as u32, MF_BYCOMMAND | MF_GRAYED);
+            EnableMenuItem(menu, CMD_TAB_NEW_WINDOW as u32, MF_BYCOMMAND | MF_GRAYED);
+        }
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        TrackPopupMenu(
+            menu,
+            TPM_RIGHTBUTTON,
+            pt.x,
+            pt.y,
+            0,
+            app.hwnd,
+            std::ptr::null(),
+        );
+        DestroyMenu(menu);
+    }
+    true
+}
+
 /// Save over the current file (or Save As when there is none).
 /// Returns success.
 /// The save options the window currently has chosen (roadmap
@@ -5452,8 +6721,8 @@ fn gui_save_options(app: &App) -> SaveOptions {
             Some(_) => encoding::TextEncoding::Ansi,
             None => app.editor.encoding(),
         },
-        eol: app.settings.save_eol_choice(),
-        bom: app.settings.save_bom_choice(),
+        eol: app.save_eol,
+        bom: app.save_bom,
         fast_clone: app.settings.fast_save_clone,
         ..SaveOptions::default()
     }
@@ -8814,48 +10083,66 @@ fn tick_candidate_at(app: &mut App, x_dip: f32, y_dip: f32) -> Option<(u64, bool
 
 /// The hover preview's per-tick service: a candidate that has
 /// settled (350 ms) shows its tooltip; anything else hides it.
+/// Two kinds of candidate share the one tracking tooltip:
+/// scrollbar ticks (a line preview) and tabs (the document's
+/// full path and state, roadmap item 39).
 fn service_hover(app: &mut App) {
     if !app.hover_tool_ready || app.tooltip.is_null() {
         return;
     }
     // A shown preview survives only while the pointer still rests
-    // on the same tick (the pointer may have left the window
+    // on the same thing (the pointer may have left the window
     // entirely, which sends no mouse-move).
-    if app.hover_shown.is_some() {
+    if let Some(shown) = app.hover_shown {
         // SAFETY: POINT is a plain C struct; both calls are plain
         // coordinate queries/conversions.
         let mut pt: POINT = unsafe { std::mem::zeroed() };
         let still = unsafe {
             GetCursorPos(&mut pt);
             ScreenToClient(app.hwnd, &mut pt);
-            tick_candidate_at(app, app.dip(pt.x), app.dip(pt.y)) == app.hover_shown
+            match shown {
+                HoverKind::Tick(..) => {
+                    tick_candidate_at(app, app.dip(pt.x), app.dip(pt.y))
+                        .map(|(o, b)| HoverKind::Tick(o, b))
+                        == Some(shown)
+                }
+                HoverKind::Tab(index) => matches!(
+                    tab_hit(app, app.dip(pt.x), app.dip(pt.y)),
+                    TabHit::Tab(i) | TabHit::Close(i) if i == index
+                ),
+            }
         };
         if !still {
             hide_hover(app);
         }
     }
     match app.hover_cand {
-        Some((offset, is_bookmark, since)) => {
-            if app.hover_shown == Some((offset, is_bookmark)) {
+        Some((kind, since)) => {
+            if app.hover_shown == Some(kind) {
                 return;
             }
             if since.elapsed() < std::time::Duration::from_millis(350) {
                 return;
             }
-            let (line, _) = app.editor.line_col_of(offset);
-            let preview: String = app
-                .editor
-                .line_text(line)
-                .map(|text| text.chars().take(60).collect())
-                .unwrap_or_default();
-            let text = if is_bookmark {
-                format!("Bookmark \u{00B7} Line {}: {}", line + 1, preview)
-            } else {
-                format!("Line {}: {}", line + 1, preview)
+            let text = match kind {
+                HoverKind::Tick(offset, is_bookmark) => {
+                    let (line, _) = app.editor.line_col_of(offset);
+                    let preview: String = app
+                        .editor
+                        .line_text(line)
+                        .map(|text| text.chars().take(60).collect())
+                        .unwrap_or_default();
+                    if is_bookmark {
+                        format!("Bookmark \u{00B7} Line {}: {}", line + 1, preview)
+                    } else {
+                        format!("Line {}: {}", line + 1, preview)
+                    }
+                }
+                HoverKind::Tab(index) => tab_tooltip_text(app, index),
             };
             set_hover_text(&text);
             show_hover_tooltip(app);
-            app.hover_shown = Some((offset, is_bookmark));
+            app.hover_shown = Some(kind);
         }
         None => hide_hover(app),
     }
@@ -9253,8 +10540,10 @@ unsafe extern "system" fn edit_proc(
     let main = unsafe { GetPropW(hwnd, name_main.as_ptr()) } as HWND;
     if msg == WM_KEYDOWN {
         let vk = wparam as u32;
-        // SAFETY: GetKeyState(0x11 = VK_CONTROL) is a plain state read.
+        // SAFETY: GetKeyState(0x11 = VK_CONTROL, 0x10 = VK_SHIFT)
+        // is a plain state read.
         let ctrl = unsafe { GetKeyState(0x11) } as u16 & 0x8000 != 0;
+        let shift = unsafe { GetKeyState(0x10) } as u16 & 0x8000 != 0;
         let cmd = match vk {
             0x0D => Some(CMD_FIND_NEXT),       // Enter: find next
             0x1B => Some(CMD_FIND_CLOSE),      // Esc: close the bar
@@ -9262,6 +10551,13 @@ unsafe extern "system" fn edit_proc(
             0x53 if ctrl => Some(CMD_SAVE),    // Ctrl+S
             0x46 if ctrl => Some(CMD_FIND),    // Ctrl+F
             0x48 if ctrl => Some(CMD_REPLACE), // Ctrl+H
+            // Tab commands work from the find bar too (roadmap
+            // item 39): the find bar belongs to its document, so
+            // switching tabs from here is ordinary.
+            0x54 if ctrl => Some(CMD_NEW_TAB),           // Ctrl+T
+            0x57 if ctrl => Some(CMD_CLOSE_TAB),         // Ctrl+W
+            0x09 if ctrl && shift => Some(CMD_PREV_TAB), // Ctrl+Shift+Tab
+            0x09 if ctrl => Some(CMD_NEXT_TAB),          // Ctrl+Tab
             _ => None,
         };
         if let Some(cmd) = cmd {
@@ -9503,7 +10799,14 @@ fn build_menus(app: &mut App) {
 
         let file = CreatePopupMenu();
         app.file_menu = file;
+        // Tabs (roadmap item 39): New Tab opens a fresh empty
+        // document tab; New Window starts a separate process;
+        // Open in New Window does the same with the current file.
+        menu_item(file, CMD_NEW_TAB, &menu_label(app, "New Tab", "new_tab"));
+        menu_item(file, CMD_NEW_WINDOW, "New Window");
         menu_item(file, CMD_OPEN, &menu_label(app, "Open", "open"));
+        menu_item(file, CMD_OPEN_IN_NEW_WINDOW, "Open in New Window");
+        menu_sep(file);
         menu_item(file, CMD_SAVE, &menu_label(app, "Save", "save"));
         menu_item(file, CMD_SAVE_AS, "Save As\u{2026}");
         menu_item(file, CMD_SAVE_SELECTION, "Save Selection to File\u{2026}");
@@ -9561,6 +10864,11 @@ fn build_menus(app: &mut App) {
         // WM_INITMENUPOPUP).
         menu_item(file, CMD_OPEN_ADMIN, "Open as Administrator");
         menu_sep(file);
+        menu_item(
+            file,
+            CMD_CLOSE_TAB,
+            &menu_label(app, "Close Tab", "close_tab"),
+        );
         menu_item(file, CMD_EXIT, "Exit");
 
         let edit = CreatePopupMenu();
@@ -9962,7 +11270,7 @@ fn refresh_menu_checks(app: &App) {
         }
         // Save Options radios (roadmap items 31/32).
         if !app.save_options_menu.is_null() {
-            let eol_idx = match app.settings.save_eol_choice() {
+            let eol_idx = match app.save_eol {
                 crate::save::EolChoice::Lf => 1,
                 crate::save::EolChoice::Crlf => 2,
                 crate::save::EolChoice::Keep => 0,
@@ -9974,7 +11282,7 @@ fn refresh_menu_checks(app: &App) {
                 (CMD_SAVE_EOL_BASE + eol_idx) as u32,
                 MF_BYCOMMAND,
             );
-            let bom_idx = match app.settings.save_bom_choice() {
+            let bom_idx = match app.save_bom {
                 crate::save::BomChoice::Add => 1,
                 crate::save::BomChoice::Remove => 2,
                 crate::save::BomChoice::Keep => 0,
@@ -10263,9 +11571,58 @@ fn on_command(app: &mut App, id: usize) {
     }
     match id {
         CMD_OPEN => {
-            if prompt_save_if_dirty(app) {
-                if let Some(path) = file_dialog(app, false, None) {
-                    open_document(app, &path);
+            // Tabs (roadmap item 39): opening never asks about
+            // the current document — an untouched empty tab is
+            // replaced in place, everything else opens in a new
+            // tab (see open_path_from_ui and the Guide).
+            if let Some(path) = file_dialog(app, false, None) {
+                open_path_from_ui(app, &path);
+            }
+        }
+        CMD_NEW_TAB => new_tab(app),
+        CMD_CLOSE_TAB => {
+            request_close_tab(app, app.tabs.active());
+        }
+        CMD_NEXT_TAB => {
+            let next = app.tabs.next();
+            switch_tab(app, next);
+        }
+        CMD_PREV_TAB => {
+            let prev = app.tabs.prev();
+            switch_tab(app, prev);
+        }
+        CMD_NEW_WINDOW => spawn_new_window(app, None),
+        CMD_OPEN_IN_NEW_WINDOW => {
+            if let Some(path) = app.editor.path().map(|p| p.to_path_buf()) {
+                spawn_new_window(app, Some(&path));
+            }
+        }
+        CMD_TAB_CLOSE => {
+            if let Some(index) = app.tab_context.take() {
+                request_close_tab(app, index);
+            }
+        }
+        CMD_TAB_CLOSE_OTHERS => {
+            if let Some(index) = app.tab_context.take() {
+                let keep = tab_doc_id(app, index);
+                close_other_tabs(app, keep);
+            }
+        }
+        CMD_TAB_CLOSE_ALL => {
+            app.tab_context = None;
+            close_all_tabs(app);
+        }
+        CMD_TAB_COPY_PATH => {
+            if let Some(index) = app.tab_context.take() {
+                if let Some(path) = tab_path(app, index) {
+                    clipboard_set_text(app.hwnd, &path.display().to_string());
+                }
+            }
+        }
+        CMD_TAB_NEW_WINDOW => {
+            if let Some(index) = app.tab_context.take() {
+                if let Some(path) = tab_path(app, index) {
+                    spawn_new_window(app, Some(&path));
                 }
             }
         }
@@ -10689,23 +12046,29 @@ fn on_command(app: &mut App, id: usize) {
         _ if (CMD_SAVE_EOL_BASE..CMD_SAVE_EOL_BASE + 3).contains(&id) => {
             // Save Options ▸ Line Endings (roadmap item 31): the
             // status bar announces the armed conversion at once.
+            // The choice arms the ACTIVE document (roadmap item
+            // 39: save options are per-tab) and is remembered in
+            // the settings as the default for new documents.
             app.settings.save_eol = match id - CMD_SAVE_EOL_BASE {
                 1 => crate::settings::SAVE_EOL_LF.to_string(),
                 2 => crate::settings::SAVE_EOL_CRLF.to_string(),
                 _ => crate::settings::SAVE_EOL_KEEP.to_string(),
             };
+            app.save_eol = app.settings.save_eol_choice();
             save_settings(app);
             refresh_menu_checks(app);
             layout_children(app);
             refresh_status(app);
         }
         _ if (CMD_SAVE_BOM_BASE..CMD_SAVE_BOM_BASE + 3).contains(&id) => {
-            // Save Options ▸ Byte-Order Mark (roadmap item 32).
+            // Save Options ▸ Byte-Order Mark (roadmap item 32):
+            // per-document arming, as with line endings above.
             app.settings.save_bom = match id - CMD_SAVE_BOM_BASE {
                 1 => crate::settings::SAVE_BOM_ADD.to_string(),
                 2 => crate::settings::SAVE_BOM_REMOVE.to_string(),
                 _ => crate::settings::SAVE_BOM_KEEP.to_string(),
             };
+            app.save_bom = app.settings.save_bom_choice();
             save_settings(app);
             refresh_menu_checks(app);
             layout_children(app);
@@ -10764,10 +12127,10 @@ fn on_command(app: &mut App, id: usize) {
             }
         }
         _ if (CMD_RECENT_BASE..CMD_RECENT_BASE + 8).contains(&id) => {
+            // Recent files follow the same open-into-tab rule as
+            // File ▸ Open (roadmap item 39).
             if let Some(path) = app.settings.recent.get(id - CMD_RECENT_BASE).cloned() {
-                if prompt_save_if_dirty(app) {
-                    open_document(app, Path::new(&path));
-                }
+                open_path_from_ui(app, Path::new(&path));
             }
         }
         _ => {}
@@ -10910,8 +12273,9 @@ fn chord_from_vk(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<crate::k
         0x1B => Key::Named(NamedKey::Escape),
         0x0D => Key::Named(NamedKey::Enter),
         0x20 => Key::Named(NamedKey::Space),
-        0xBB => Key::Char('+'), // VK_OEM_PLUS
-        0xBD => Key::Char('-'), // VK_OEM_MINUS
+        0x09 => Key::Named(NamedKey::Tab), // VK_TAB: next/previous tab
+        0xBB => Key::Char('+'),            // VK_OEM_PLUS
+        0xBD => Key::Char('-'),            // VK_OEM_MINUS
         _ => return None,
     };
     Some(crate::keybindings::Chord {
@@ -10963,7 +12327,27 @@ fn dispatch_action(app: &mut App, action: &str) {
         "follow_tail" => on_command(app, CMD_FOLLOW_TAIL),
         "filter" => on_command(app, CMD_FILTER),
         "clear_filter" => on_command(app, CMD_CLEAR_FILTER),
-        _ => {}
+        // Tabs (roadmap item 39, slice R5b).
+        "new_tab" => on_command(app, CMD_NEW_TAB),
+        "close_tab" => on_command(app, CMD_CLOSE_TAB),
+        "next_tab" => on_command(app, CMD_NEXT_TAB),
+        "prev_tab" => on_command(app, CMD_PREV_TAB),
+        "tab_last" => {
+            let last = app.tabs.count() - 1;
+            switch_tab(app, last);
+        }
+        _ => {
+            // Ctrl+1..8 jump to tab N (tab_1 .. tab_8).
+            if let Some(n) = action
+                .strip_prefix("tab_")
+                .and_then(|rest| rest.parse::<usize>().ok())
+            {
+                if (1..=8).contains(&n) {
+                    let target = (n - 1).min(app.tabs.count() - 1);
+                    switch_tab(app, target);
+                }
+            }
+        }
     }
 }
 
@@ -11007,10 +12391,25 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
             return true;
         }
         if let Some(action) = action {
+            // Tab commands fall through too (roadmap item 39):
+            // switching away from a filtered tab is ordinary, and
+            // the filter stays with its own document.
             if matches!(
                 action,
-                "open" | "save" | "find" | "replace" | "find_next" | "find_prev" | "guide"
-            ) {
+                "open"
+                    | "save"
+                    | "find"
+                    | "replace"
+                    | "find_next"
+                    | "find_prev"
+                    | "guide"
+                    | "new_tab"
+                    | "close_tab"
+                    | "next_tab"
+                    | "prev_tab"
+                    | "tab_last"
+            ) || action.starts_with("tab_")
+            {
                 dispatch_action(app, action);
                 return true;
             }
@@ -11653,7 +13052,14 @@ unsafe extern "system" fn wnd_proc(
             // SAFETY: our window; converts the point in place.
             unsafe { ScreenToClient(hwnd, &mut pt) };
             let layout = compute_layout(app);
-            if layout.strings_h > 0.0
+            if app.dip(pt.y) >= STRIP_H && app.dip(pt.y) < STRIP_H + TABBAR_H {
+                // Over the tab strip the wheel scrolls the strip
+                // (roadmap item 39), never the document.
+                let delta = ((wparam >> 16) as i16) as f32 / 120.0;
+                app.tab_scroll_x = (app.tab_scroll_x - delta * 40.0).max(0.0);
+                clamp_tab_scroll(app);
+                invalidate(app);
+            } else if layout.strings_h > 0.0
                 && wparam & 0xFFFF & 0x0008 == 0
                 && app.dip(pt.y) >= layout.rows_bottom
                 && !app.strings.results.is_empty()
@@ -11665,49 +13071,113 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_LBUTTONDOWN => {
-            if !on_scrollbar_down(app, lparam) {
+            if !tab_mouse_down(app, lparam) && !on_scrollbar_down(app, lparam) {
                 on_mouse_down(app, lparam, false);
             }
             0
         }
         WM_LBUTTONDBLCLK => {
-            if !on_scrollbar_down(app, lparam) {
+            if !tab_mouse_down(app, lparam) && !on_scrollbar_down(app, lparam) {
                 on_mouse_down(app, lparam, true);
             }
             0
         }
+        WM_MBUTTONDOWN => {
+            // Middle-click closes the tab under the pointer
+            // (roadmap item 39).
+            tab_middle_down(app, lparam);
+            0
+        }
         WM_MOUSEMOVE => {
-            if !on_scrollbar_move(app, lparam) && app.dragging {
-                let (x, y) = mouse_xy(lparam);
-                let offset = pos_to_offset(app, x, y);
+            let (mx, my) = mouse_xy(lparam);
+            let (dx, dy) = (app.dip(mx), app.dip(my));
+            if app.tab_drag.is_some() {
+                // Tab drag (roadmap item 39): track the pointer;
+                // past a small threshold the drag is live and the
+                // insertion marker paints.
+                if let Some(drag) = &mut app.tab_drag {
+                    drag.x = dx;
+                    if (dx - drag.start_x).abs() > 6.0 {
+                        drag.moved = true;
+                    }
+                }
+                invalidate(app);
+            } else if !on_scrollbar_move(app, lparam) && app.dragging {
+                let offset = pos_to_offset(app, mx, my);
                 app.editor.move_caret_to(offset, true);
                 refresh_status(app);
                 invalidate(app);
             } else if app.scroll_drag.is_none() && !app.dragging {
-                // Tick hover preview (item 24 expansion): track the
-                // candidate under the pointer; the tick service
-                // shows it once it settles.
-                let (x, y) = mouse_xy(lparam);
-                match tick_candidate_at(app, app.dip(x), app.dip(y)) {
-                    Some((offset, is_bookmark)) => {
-                        let settled = matches!(
-                            app.hover_cand,
-                            Some((o, b, _)) if o == offset && b == is_bookmark
-                        );
-                        if !settled {
-                            app.hover_cand = Some((offset, is_bookmark, Instant::now()));
+                if (STRIP_H..STRIP_H + TABBAR_H).contains(&dy) {
+                    // Over the tab strip: the hover state feeds
+                    // the close ×, and the hover service shows
+                    // the tab's tooltip (its full path).
+                    let hit = tab_hit(app, dx, dy);
+                    let new_hover = match hit {
+                        TabHit::Tab(i) | TabHit::Close(i) => Some(i),
+                        _ => None,
+                    };
+                    let new_plus = hit == TabHit::New;
+                    if new_hover != app.tab_hover || new_plus != app.tab_plus_hover {
+                        app.tab_hover = new_hover;
+                        app.tab_plus_hover = new_plus;
+                        invalidate(app);
+                    }
+                    match new_hover {
+                        Some(i) => {
+                            let settled = matches!(
+                                app.hover_cand,
+                                Some((HoverKind::Tab(o), _)) if o == i
+                            );
+                            if !settled {
+                                app.hover_cand = Some((HoverKind::Tab(i), Instant::now()));
+                            }
+                        }
+                        None => {
+                            app.hover_cand = None;
+                            hide_hover(app);
                         }
                     }
-                    None => {
-                        app.hover_cand = None;
-                        hide_hover(app);
+                } else {
+                    if app.tab_hover.is_some() || app.tab_plus_hover {
+                        app.tab_hover = None;
+                        app.tab_plus_hover = false;
+                        invalidate(app);
+                    }
+                    // Tick hover preview (item 24 expansion):
+                    // track the candidate under the pointer; the
+                    // tick service shows it once it settles.
+                    match tick_candidate_at(app, dx, dy) {
+                        Some((offset, is_bookmark)) => {
+                            let settled = matches!(
+                                app.hover_cand,
+                                Some((HoverKind::Tick(o, b), _)) if o == offset && b == is_bookmark
+                            );
+                            if !settled {
+                                app.hover_cand =
+                                    Some((HoverKind::Tick(offset, is_bookmark), Instant::now()));
+                            }
+                        }
+                        None => {
+                            app.hover_cand = None;
+                            hide_hover(app);
+                        }
                     }
                 }
             }
             0
         }
         WM_LBUTTONUP => {
-            if app.scroll_drag.is_some() {
+            if let Some(drag) = app.tab_drag.take() {
+                if drag.moved {
+                    let (to, _) = tab_drop_at(app, drag.index, drag.x);
+                    if to != drag.index {
+                        move_tab(app, drag.index, to);
+                    }
+                }
+                // SAFETY: pairs with the SetCapture at tab grab.
+                unsafe { ReleaseCapture() };
+            } else if app.scroll_drag.is_some() {
                 app.scroll_drag = None;
                 // SAFETY: pairs with the SetCapture at thumb grab.
                 unsafe { ReleaseCapture() };
@@ -11719,10 +13189,12 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_RBUTTONUP => {
-            // Right-click on a gutter bookmark marker opens its
-            // annotation editor (slice R4c, item 5). Anywhere else
-            // the right button keeps its default behaviour.
-            if gutter_bookmark_click(app, lparam) {
+            // Right-click on a tab opens its context menu
+            // (roadmap item 39); right-click on a gutter bookmark
+            // marker opens its annotation editor (slice R4c,
+            // item 5). Anywhere else the right button keeps its
+            // default behaviour.
+            if tab_context_menu(app, lparam) || gutter_bookmark_click(app, lparam) {
                 0
             } else {
                 // SAFETY: unhandled clicks get default processing.
@@ -11788,6 +13260,13 @@ unsafe extern "system" fn wnd_proc(
                         app.editor.is_dirty() && app.editor.path().is_some(),
                     );
                     set(file_menu, CMD_OPEN_ADMIN, app.editor.path().is_some());
+                    // Open in New Window likewise needs a file
+                    // (roadmap item 39).
+                    set(
+                        file_menu,
+                        CMD_OPEN_IN_NEW_WINDOW,
+                        app.editor.path().is_some(),
+                    );
                     let search_menu = GetSubMenu(bar, 2);
                     // Clear Filter exists only while filtered
                     // (item 12); Edit Bookmark needs a bookmark.
@@ -12030,18 +13509,26 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_DROPFILES => {
+            // Every dropped file opens (roadmap item 39: the
+            // first takes an untouched empty tab if there is one,
+            // the rest open as new tabs — the open-into-tab rule).
             // SAFETY: wparam is the drop handle; it is finished here.
             let hdrop = wparam as HDROP;
-            let mut buf = vec![0u16; 1024];
-            // SAFETY: as above; index 0 is the first dropped file.
-            let n = unsafe { DragQueryFileW(hdrop, 0, buf.as_mut_ptr(), buf.len() as u32) };
+            // SAFETY: index 0xFFFF_FFFF asks for the file count.
+            let count = unsafe { DragQueryFileW(hdrop, 0xFFFF_FFFF, std::ptr::null_mut(), 0) };
+            let mut paths: Vec<String> = Vec::new();
+            for i in 0..count {
+                let mut buf = vec![0u16; 1024];
+                // SAFETY: as above; index i is the i-th dropped file.
+                let n = unsafe { DragQueryFileW(hdrop, i, buf.as_mut_ptr(), buf.len() as u32) };
+                if n > 0 {
+                    paths.push(string_from_wide(&buf));
+                }
+            }
             // SAFETY: as above.
             unsafe { DragFinish(hdrop) };
-            if n > 0 {
-                let path = string_from_wide(&buf);
-                if prompt_save_if_dirty(app) {
-                    open_document(app, Path::new(&path));
-                }
+            for path in &paths {
+                open_path_from_ui(app, Path::new(path));
             }
             0
         }
@@ -12260,9 +13747,15 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_CLOSE => {
-            if !prompt_save_if_dirty(app) {
+            // Tabs (roadmap item 39): every dirty document gets
+            // its prompt in turn; Cancel anywhere aborts the
+            // close and nothing is saved or discarded.
+            if !prompt_all_dirty(app) {
                 return 0;
             }
+            // The session (open tabs + active tab) rides along
+            // with the settings save below (roadmap item 39).
+            snapshot_session(app);
             // Persist settings (always, even on a clean close).
             // SAFETY: geometry reads on our window.
             if unsafe { IsZoomed(hwnd) } == 0 {
@@ -12430,6 +13923,11 @@ pub fn run_gui(options: &CliOptions) -> i32 {
     let keybindings_problem = !keybindings.problems().is_empty();
 
     let theme = Theme::resolve(&settings.theme, settings.accent_override.as_deref());
+    // The startup document's armed save options (roadmap item 39:
+    // per-tab from here on; the settings are the default for new
+    // documents).
+    let startup_save_eol = settings.save_eol_choice();
+    let startup_save_bom = settings.save_bom_choice();
     // SAFETY: plain GDI factory calls; the app owns the brushes.
     let panel_brush = unsafe { CreateSolidBrush(colorref(theme.panel)) };
     let edit_brush = unsafe { CreateSolidBrush(colorref(theme.bg)) };
@@ -12568,6 +14066,18 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         doc_read_only_file: false,
         encoding_menu: std::ptr::null_mut(),
         codepage_menu: std::ptr::null_mut(),
+        doc_id: 1,
+        save_eol: startup_save_eol,
+        save_bom: startup_save_bom,
+        tabs: crate::tabs::TabOrder::new(),
+        parked: Vec::new(),
+        next_doc_id: 1,
+        tab_scroll_x: 0.0,
+        tab_hover: None,
+        tab_plus_hover: false,
+        tab_drag: None,
+        tab_context: None,
+        suppress_recovery_delete: false,
     };
     // Per-document tracking for the startup document (bookmarks,
     // external-change baseline, recovery fingerprint): the same
@@ -12647,6 +14157,14 @@ pub fn run_gui(options: &CliOptions) -> i32 {
     if app.keybindings_problem {
         app.status_note = Some("keybindings.json had problems; defaults used".to_string());
         refresh_status(app);
+    }
+
+    // Session restore (roadmap item 39): reopen the tabs the
+    // last clean exit left behind — unless this launch was given
+    // a file to open (or is the read-only snapshot view), which
+    // takes precedence exactly like the recovery prompts do.
+    if options.file.is_none() && !options.read_only {
+        restore_session(app);
     }
 
     // The message loop.
