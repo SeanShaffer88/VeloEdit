@@ -3,6 +3,22 @@
 All notable changes to VeloEdit are recorded here. Versions follow the
 release asset naming in the specification.
 
+## [Unreleased]
+
+### Fixed
+
+- Tab labels lost their last character ("Untitled" painted as
+  "Untitle"): the strip sized each tab from an estimated label
+  width and a chrome allowance smaller than what the painter
+  spends, and the painter clips the label to the tab's rect.
+  Tab widths now come from the label's measured width plus the
+  painter's exact chrome.
+- Status bar text was shaved at the bottom: the two status
+  readouts kept the window class's default font with no
+  vertical centring in a strip sized for the app's own font.
+  They now carry an app-sized font, centre vertically, and
+  the strip is taller.
+
 ## [1.1.0] — 2026-11-01
 
 ### Added
