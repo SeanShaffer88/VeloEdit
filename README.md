@@ -15,15 +15,18 @@ tenth of a second while using less than 35 MB of memory. It is one portable
 program file for Windows 11: no installer needed, no internet, no accounts,
 nothing sent anywhere.
 
-**Current status: 1.1.0, released 2026-11-01.** Everything in the
+**Current status: 1.1.1, released 2026-11-01.** Everything in the
 1.0.0 release (2026-10-31) plus the full feature roadmap: tabs, split
 view, side-by-side compare, regular-expression find, more encodings,
 log-viewing tools, binary templates, external tools, multi-caret
-editing, and more — see "New in 1.1.0" below. The core and tools are
-covered by the automated test gate (436 tests); the window has been
-run and verified on a real Windows 11 machine for startup, opening a
-10 GB file instantly, find over that file, themes, and tabs — see
-"Known limitations" for what is still being exercised there.
+editing, and more — see "New in 1.1.0" below. Release 1.1.1 fixes
+four field-reported glitches (tab labels, the status bar, mode
+switching, and leaving the split view) — see "New in 1.1.1" below.
+The core and tools are covered by the automated test gate (438
+tests); the window has been run and verified on a real Windows 11
+machine for startup, opening a 10 GB file instantly, find over that
+file, themes, and tabs — see "Known limitations" for what is still
+being exercised there.
 
 ## Features
 
@@ -151,6 +154,18 @@ New in 1.1.0:
   `data/tools.json`, feeding them the selection, the caret's line,
   or the file, and bringing their output back into the document.
 
+New in 1.1.1 (fixes):
+
+- Tab labels show in full — they no longer lose their last
+  character.
+- The status bar's text sits centred in its strip instead of
+  being shaved at the bottom.
+- Switching between text and hex mode keeps your place in the
+  document instead of jumping to the end.
+- In the split view, the Text and Hex commands now leave the
+  split for that single view (focus still moves with F6 or by
+  clicking a pane).
+
 ## Requirements
 
 - Windows 11, 64-bit (the released program).
@@ -180,7 +195,7 @@ tag is published, and each release ships exactly these assets:
 - `SHA256SUMS.txt` — SHA-256 checksums for verifying the downloads.
 
 The four assets are published with each release on the Releases
-page; the 1.0.0 and 1.1.0 assets were downloaded after publishing
+page; the 1.0.0, 1.1.0, and 1.1.1 assets were downloaded after publishing
 and their SHA-256 hashes verified against `SHA256SUMS.txt`.
 
 ## How to use it
@@ -532,7 +547,7 @@ the editor core (open → type → undo → redo → save round trips, caret
 and selection behaviour, hex row formatting, find navigation and
 read-only refusals, exact line positions after mid-document edits), the
 20 themes (token validity and text contrast), and settings (round
-trips, corruption handling, recent-file rules). The full suite is 436
+trips, corruption handling, recent-file rules). The full suite is 438
 tests, including the regex engine checked against an independent
 reference matcher, the hash implementations against published vectors,
 the template language applied to crafted PE/PNG headers, the x86-64
@@ -576,7 +591,7 @@ Real captures from a run of the editor on Windows 11, showing a
 
 ![The editor in hex mode: offset column, hex bytes, ASCII column](docs/screenshots/editor-hex-mode.png)
 
-Still to capture: fresh captures of the current (1.1.0) window with
+Still to capture: fresh captures of the current (1.1.1) window with
 its tab bar, the find bar with matches highlighted, the split view, a
 light theme, and the installer. The two captures above predate the
 tab bar added in 1.1.0.
