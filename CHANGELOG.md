@@ -476,6 +476,15 @@ release asset naming in the specification.
   delete, and insert over a line range, also as single undo
   steps.
 
+### Fixed
+
+- The first rows of the document painted underneath the
+  toolbar buttons: the canvas top still used the pre-tab
+  chrome height after the tab bar was added, so the toolbar
+  covered the top of the text (visible in both the normal and
+  split views). The canvas now starts below the full chrome
+  stack.
+
 ## [1.0.1] — Unreleased
 
 ### Fixed
