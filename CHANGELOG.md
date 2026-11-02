@@ -391,6 +391,60 @@ release asset naming in the specification.
   marks the shading stale until Search ▸ Compare Differences
   recomputes it. Esc, the menu item again, or switching tabs
   closes the compare.
+- Regular expressions in the find bar: the new Regex toggle
+  searches the whole document with a regular expression —
+  Find Next and Previous, the match count, and the background
+  find on large files all use it, and matches highlight at
+  their true lengths. Replace and Replace All insert the
+  replacement literally, and Replace All is still one undo
+  step. Regex works on UTF-8 and ANSI files; on UTF-16 files
+  the bar says so instead of guessing, and a pattern that does
+  not parse shows its error in the bar and searches nothing.
+  The headless find gains the same engine via `--find
+  <pattern> --regex`.
+- Binary templates window: Tools ▸ Apply Template… picks a
+  template file from `data/templates/`, a structure in it, and
+  an offset (the caret by default), and lists the decoded
+  fields — dotted name, offset, size, value — in a docked
+  list; double-clicking a field jumps to it and selects its
+  bytes. Two example templates (PE and PNG headers) ship in
+  `examples/templates/` in the repository.
+- External tools: the Tools menu runs the programs declared
+  in `data/tools.json` — each tool is fed the selection, the
+  caret's line, the file, or nothing, and its output replaces
+  the selection, inserts at the caret, is written to a new
+  file, or is simply shown. Runs happen in the background
+  with a 30-second limit and a 16 MB output cap; Esc stops a
+  running tool, failures report the exit code and the tool's
+  own error output, and output is shown rather than applied
+  if the document changed while the tool ran. Tools ▸ Reload
+  Tools re-reads the file.
+- Multiple carets and rectangular selection (text mode):
+  Alt+click adds a caret (or removes one), Ctrl+Alt+Up and
+  Ctrl+Alt+Down (new rebindable actions `caret_up` and
+  `caret_down`) add a caret on the line above or below, and
+  typing, Backspace, Delete, Enter and Tab apply at every
+  caret as a single undo step; the status bar counts the
+  carets. Alt+drag selects a rectangle of columns: Copy and
+  Cut take its text line by line, Delete and typing replace
+  it, again as one undo step.
+- Disassembly panel: View ▸ Disassembly (hex mode) lists the
+  machine instructions decoded from the caret — offset, bytes,
+  instruction — following the caret as it moves; its heading
+  names the offset it decoded from, it re-decodes after edits,
+  and double-clicking a row moves the caret to that
+  instruction.
+- Taskbar jump list: right-clicking the taskbar button shows
+  the recent files (opening one works like opening it in the
+  program) and a New Window entry.
+- Screen-reader exposure (scoped): assistive tools querying
+  the window are told the file name, the caret's line and
+  column, and the current line's text.
+- Wide characters line up: on lines containing wide or
+  otherwise non-fixed-width glyphs (such as CJK text), the
+  caret, selection and match highlighting, and clicking now
+  use the line's own measured widths instead of assuming
+  every character takes one cell.
 
 ### Changed
 
@@ -450,31 +504,31 @@ release asset naming in the specification.
 - File Hashes dialog: the CRC32 and xxHash64 checksums join
   MD5, SHA-1 and SHA-256 in the same worker pass, and the
   compare box checks pasted text against all five.
-- Regular-expression search core (not yet wired into the
-  window): a streaming, backtracking-free regex engine —
+- Regular-expression search core (wired into the find bar
+  above): a streaming, backtracking-free regex engine —
   classes, alternation, greedy and lazy quantifiers, counted
   repeats, and line anchors — that finds matches in files of
   any size in bounded memory, with no pattern able to make
   the search blow up.
-- Binary templates core (not yet wired into the window): a
-  plain-text struct definition language for describing file
+- Binary templates core (wired into the Tools menu above):
+  a plain-text struct definition language for describing file
   headers and packets, applied over a file to list every
   field's offset, size, and decoded value, including counted
   arrays whose length comes from an earlier field.
 - Line diff core (for the coming side-by-side compare):
   reports the regions where two files' lines differ,
   streaming both sides in bounded memory.
-- Disassembly length decoder core (for the coming hex-mode
-  gutter): exact x86-64 instruction lengths with a
+- Disassembly length decoder core (wired into the View menu
+  above): exact x86-64 instruction lengths with a
   best-effort text rendering.
-- External tools core (not yet wired into the window): the
-  `data/tools.json` format for running user programs on a
+- External tools core (wired into the Tools menu above):
+  the `data/tools.json` format for running user programs on a
   selection or range and bringing their output back — parsing,
   validation, and `{file}` / `{offset}` substitution.
-- Multi-cursor editing core: many range replacements applied
-  as a single undo step, plus rectangular (column) extract,
-  delete, and insert over a line range, also as single undo
-  steps.
+- Multi-cursor editing core (wired into the window above):
+  many range replacements applied as a single undo step, plus
+  rectangular (column) extract, delete, and insert over a
+  line range, also as single undo steps.
 
 ### Fixed
 
