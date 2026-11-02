@@ -74,6 +74,7 @@ pub mod settings;
 pub mod slicing;
 pub mod strings;
 pub mod structdiff;
+pub mod tabs;
 pub mod templates;
 pub mod theme;
 pub mod timedeltas;
