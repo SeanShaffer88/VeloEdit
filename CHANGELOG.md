@@ -368,6 +368,29 @@ release asset naming in the specification.
   documents are not remembered). The new tab shortcuts are
   ordinary rebindable actions (`new_tab`, `close_tab`,
   `next_tab`, `prev_tab`, `tab_1`…`tab_8`, `tab_last`).
+- Split view: View ▸ Split Text/Hex shows the document as text
+  on the left and as hex on the right at the same time, tied
+  together by the byte at the top of each pane — scroll one
+  and the other follows. Clicking a pane (or wheeling over it)
+  chooses where the keyboard works; the caret's byte is
+  marked in the pane not in use. The divider between the
+  panes drags, and its position is remembered. New rebindable
+  action `toggle_split` (default Ctrl+\). The filter view and
+  frozen lines each decline while split — and split declines
+  while they are up — with the reason in the status bar; the
+  delimiter grid waits while split.
+- Compare side by side: File ▸ Compare Side by Side… opens a
+  second file read-only in a pane on the right (its pane
+  takes no typing), scrolling in step with the document — by
+  line in text mode, by byte row in hex mode. In text mode
+  the line differences are worked out in the background and
+  shaded in both panes; the status bar counts them, and
+  Search ▸ Next Difference / Previous Difference (new
+  rebindable actions `diff_next`, default F7, and `diff_prev`,
+  default Shift+F7) jump between them. Editing the document
+  marks the shading stale until Search ▸ Compare Differences
+  recomputes it. Esc, the menu item again, or switching tabs
+  closes the compare.
 
 ### Changed
 
