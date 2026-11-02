@@ -3,7 +3,7 @@
 All notable changes to VeloEdit are recorded here. Versions follow the
 release asset naming in the specification.
 
-## [1.1.0] — Unreleased
+## [1.1.0] — 2026-11-01
 
 ### Added
 
