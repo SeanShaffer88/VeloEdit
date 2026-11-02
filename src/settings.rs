@@ -196,6 +196,16 @@ pub struct Settings {
     pub session_tabs: Vec<String>,
     /// The active tab's index within [`Settings::session_tabs`].
     pub session_active: usize,
+    /// Text/hex split view (roadmap item 28): both
+    /// representations of the active document side by side.
+    /// A program-wide view toggle like the hex mode —
+    /// persisted so a relaunched window comes back split.
+    pub split_view: bool,
+    /// Split-view divider position as thousandths of the
+    /// canvas width (500 = half). Stored as an integer — the
+    /// settings parser is integer-only — and clamped to the
+    /// shell's usable range on load.
+    pub split_ratio_permille: u16,
 }
 
 impl Default for Settings {
@@ -224,6 +234,8 @@ impl Default for Settings {
             recent: Vec::new(),
             session_tabs: Vec::new(),
             session_active: 0,
+            split_view: false,
+            split_ratio_permille: 500,
         }
     }
 }
@@ -337,6 +349,14 @@ impl Settings {
         }
         out.push_str("],\n");
         out.push_str(&format!("  \"session_active\": {}\n", self.session_active));
+        out.push_str(&format!(
+            "  \"split_view\": {},\n",
+            if self.split_view { "true" } else { "false" }
+        ));
+        out.push_str(&format!(
+            "  \"split_ratio\": {}\n",
+            self.split_ratio_permille.clamp(150, 850)
+        ));
         out.push_str("}\n");
         out
     }
@@ -506,6 +526,11 @@ impl Settings {
                 "session_active" => {
                     let n = parser.integer()?;
                     settings.session_active = if n < 0 { 0 } else { n as usize };
+                }
+                "split_view" => settings.split_view = parser.boolean()?,
+                "split_ratio" => {
+                    let n = parser.integer()?;
+                    settings.split_ratio_permille = n.clamp(150, 850) as u16;
                 }
                 _ => parser.skip_value()?,
             }
@@ -806,7 +831,26 @@ mod tests {
                 "D:\\data\\core.dmp".to_string(),
             ],
             session_active: 2,
+            split_view: true,
+            split_ratio_permille: 640,
         }
+    }
+
+    #[test]
+    fn split_view_round_trips_and_clamps() {
+        let s = sample();
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert!(back.split_view);
+        assert_eq!(back.split_ratio_permille, 640);
+        // Defaults: split off, divider centred.
+        let d = Settings::default();
+        assert!(!d.split_view);
+        assert_eq!(d.split_ratio_permille, 500);
+        // A hand-edited wild ratio clamps to the usable range.
+        let s = Settings::from_json(r#"{"split_ratio": 4000}"#).unwrap();
+        assert_eq!(s.split_ratio_permille, 850);
+        let s = Settings::from_json(r#"{"split_ratio": -5}"#).unwrap();
+        assert_eq!(s.split_ratio_permille, 150);
     }
 
     #[test]
