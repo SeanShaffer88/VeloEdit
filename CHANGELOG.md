@@ -445,6 +445,31 @@ release asset naming in the specification.
   caret, selection and match highlighting, and clicking now
   use the line's own measured widths instead of assuming
   every character takes one cell.
+- Program icon: the supplied artwork is embedded in the executable
+  (Explorer, taskbar, and window icon), and the same icon is used by
+  the installer, the uninstaller, and the MSI package.
+- `extract` command: `VeloEdit extract <file> --start <N>
+  --length <M> --out <file>` copies one byte range of a file to
+  another file, streamed in 4 MB chunks. Offsets are decimal or
+  0x-hex; the range is clamped to the file, and a start past the
+  end of the file is an error.
+- File ▸ Save Selection to File… writes the selected bytes
+  straight to a file, streamed in chunks — a selection of any size
+  can be exported, with no clipboard limits.
+- View ▸ Column Ruler cycles a vertical guideline at column 80 or
+  120 (or off), drawn in text mode; the choice is remembered.
+- Two more themes — "High Contrast" (black background, white text,
+  yellow accent) and "E-ink" (paper background, near-black text) —
+  for 20 built-in themes in total. The accent picker gains three
+  colour-blind-safe presets: Okabe Blue, Okabe Orange, Okabe Sky.
+- Saves and save-copy now check the free disk space before any
+  byte is written: when the target's disk has less free than the
+  document's size plus 5%, the save is refused up front with a
+  clear message instead of failing halfway through the write.
+- Undo depth is now configurable in settings: `undo_limit` (steps,
+  default 1024) and `undo_byte_budget_mb` (megabytes of stored
+  changes, default 256). The oldest changes are dropped first when
+  either limit is reached.
 
 ### Changed
 
@@ -529,37 +554,6 @@ release asset naming in the specification.
   many range replacements applied as a single undo step, plus
   rectangular (column) extract, delete, and insert over a
   line range, also as single undo steps.
-
-### Fixed
-
-- The first rows of the document painted underneath the
-  toolbar buttons: the canvas top still used the pre-tab
-  chrome height after the tab bar was added, so the toolbar
-  covered the top of the text (visible in both the normal and
-  split views). The canvas now starts below the full chrome
-  stack.
-
-## [1.0.1] — Unreleased
-
-### Fixed
-
-- The editor window failed to start (error 0x80004002): one byte of
-  the DirectWrite factory identifier was wrong, so DirectWrite
-  refused the startup request while Direct2D started normally. The
-  window now opens, paints, and resizes correctly.
-- Six internal Direct2D / DirectWrite call addresses (clear, begin
-  frame, end frame, set DPI, resize, text measuring) were corrected
-  to the values in the Windows SDK headers; they would have painted
-  wrongly even once startup succeeded.
-- A startup failure now reports the exact Direct2D and DirectWrite
-  error codes in its message and on the console, instead of a
-  generic note.
-- Launching the editor no longer opens a console window beside
-  it. The command-line tools are unchanged: started from a
-  terminal, they print in that terminal as before.
-
-### Changed
-
 - The editor window now follows the design mockup: a dark themed
   title bar showing the document's file name, an accent strip along
   the top of the window, and a Search menu between Edit and View.
@@ -587,34 +581,28 @@ release asset naming in the specification.
 - When the command-line tools run in a terminal, the console now
   uses UTF-8, so file names and reports print correctly.
 
-### Added
+### Fixed
 
-- Program icon: the supplied artwork is embedded in the executable
-  (Explorer, taskbar, and window icon), and the same icon is used by
-  the installer, the uninstaller, and the MSI package.
-- `extract` command: `VeloEdit extract <file> --start <N>
-  --length <M> --out <file>` copies one byte range of a file to
-  another file, streamed in 4 MB chunks. Offsets are decimal or
-  0x-hex; the range is clamped to the file, and a start past the
-  end of the file is an error.
-- File ▸ Save Selection to File… writes the selected bytes
-  straight to a file, streamed in chunks — a selection of any size
-  can be exported, with no clipboard limits.
-- View ▸ Column Ruler cycles a vertical guideline at column 80 or
-  120 (or off), drawn in text mode; the choice is remembered.
-- Two more themes — "High Contrast" (black background, white text,
-  yellow accent) and "E-ink" (paper background, near-black text) —
-  for 20 built-in themes in total. The accent picker gains three
-  colour-blind-safe presets: Okabe Blue, Okabe Orange, Okabe Sky.
-- Saves and save-copy now check the free disk space before any
-  byte is written: when the target's disk has less free than the
-  document's size plus 5%, the save is refused up front with a
-  clear message instead of failing halfway through the write.
-- Undo depth is now configurable in settings: `undo_limit` (steps,
-  default 1024) and `undo_byte_budget_mb` (megabytes of stored
-  changes, default 256). The oldest changes are dropped first when
-  either limit is reached.
-
+- The first rows of the document painted underneath the
+  toolbar buttons: the canvas top still used the pre-tab
+  chrome height after the tab bar was added, so the toolbar
+  covered the top of the text (visible in both the normal and
+  split views). The canvas now starts below the full chrome
+  stack.
+- The editor window failed to start (error 0x80004002): one byte of
+  the DirectWrite factory identifier was wrong, so DirectWrite
+  refused the startup request while Direct2D started normally. The
+  window now opens, paints, and resizes correctly.
+- Six internal Direct2D / DirectWrite call addresses (clear, begin
+  frame, end frame, set DPI, resize, text measuring) were corrected
+  to the values in the Windows SDK headers; they would have painted
+  wrongly even once startup succeeded.
+- A startup failure now reports the exact Direct2D and DirectWrite
+  error codes in its message and on the console, instead of a
+  generic note.
+- Launching the editor no longer opens a console window beside
+  it. The command-line tools are unchanged: started from a
+  terminal, they print in that terminal as before.
 ## [1.0.0] — 2026-10-31
 
 The 1.0.0 build: the editing core, the headless tools, the graphical
