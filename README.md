@@ -15,12 +15,15 @@ tenth of a second while using less than 35 MB of memory. It is one portable
 program file for Windows 11: no installer needed, no internet, no accounts,
 nothing sent anywhere.
 
-**Current status: 1.0.0, released 2026-10-31.** The editing core, the
-command-line tools, the graphical editor window, and the packaging
-(installer scripts and the release workflow) are built and shipped as
-the v1.0.0 release. The core and tools are covered by the automated
-test gate; the window is compile-verified and still needs its first run
-on a real Windows 11 machine — see "Known limitations".
+**Current status: 1.1.0, released 2026-11-01.** Everything in the
+1.0.0 release (2026-10-31) plus the full feature roadmap: tabs, split
+view, side-by-side compare, regular-expression find, more encodings,
+log-viewing tools, binary templates, external tools, multi-caret
+editing, and more — see "New in 1.1.0" below. The core and tools are
+covered by the automated test gate (436 tests); the window has been
+run and verified on a real Windows 11 machine for startup, opening a
+10 GB file instantly, find over that file, themes, and tabs — see
+"Known limitations" for what is still being exercised there.
 
 ## Features
 
@@ -98,6 +101,56 @@ Working in this build:
   draw as ticks in the scrollbar. If the open file changes on disk,
   a bar under the toolbar offers Reload or Ignore.
 
+New in 1.1.0:
+
+- **Tabs** — many documents in one window, each with its own caret,
+  undo history, encoding, bookmarks, and find state; a search or
+  index build on an inactive tab keeps running and lands in its own
+  tab. Open tabs are remembered across a clean exit.
+- **Instant open** — a huge file opens after indexing just its first
+  few megabytes; the rest of the line index finishes in the
+  background ("Indexing NN%" in the status bar) while you work.
+- **Split view and side-by-side compare** — text and hex panes side
+  by side, tied by byte offset; or a second file read-only beside
+  yours with the differing line regions shaded and F7 / Shift+F7
+  jumping between them.
+- **Regular expressions in find** — a streaming, backtracking-free
+  regex engine in the find bar (and `--find --regex` headless);
+  matches highlight at their true lengths, replace stays literal.
+- **More encodings** — an Encoding menu with code pages Shift-JIS
+  (932), GBK (936), EUC-KR (949), ISO-8859-1/-15, and Windows-1250 /
+  1251, on top of UTF-8, UTF-16, and ANSI; Save Options can convert
+  line endings (LF / CRLF) and add or remove the BOM while saving.
+- **Log-viewing tools** — a filter view showing only matching lines
+  (built in the background on big files), Follow Tail for growing
+  log files, a strings pane, an entropy strip, a time-delta gutter,
+  frozen top lines, inactive-paragraph dimming, ANSI colour
+  rendering, control-character tags, and a delimiter grid that
+  aligns CSV/TSV-style columns on screen (the bytes never change).
+- **Data Inspector and hex tools** — a docked panel reading the
+  bytes at the caret as integers, floats, dates, a GUID, and text,
+  with bit flipping in hex mode; hex rows of 8–64 bytes or fit to
+  window, byte grouping, big-endian group display, relative
+  offsets, pointer following (Ctrl+click) with jump history, and a
+  disassembly panel listing the instructions at the caret.
+- **File tools** — File Hashes shows MD5, SHA-1, SHA-256, CRC32,
+  and xxHash64 with a compare box; Extract Ranges copies chosen
+  byte/line ranges to a new file; delta patches export your edits
+  as a small file that can re-apply them elsewhere; Insert Zeroes
+  adds a run of zero bytes without storing them; Compare With lists
+  the regions where two files differ.
+- **Bookmarks with colours and notes**, **rebindable keyboard
+  shortcuts** (`data/keybindings.json`), **read-only file
+  protection** with Save a Copy and Open as Administrator, and a
+  **taskbar jump list** with your recent files.
+- **Binary templates** — Tools ▸ Apply Template… decodes a file
+  header or packet layout described in a plain-text struct file
+  from `data/templates/` and lists every field's offset, size, and
+  value (PE and PNG header examples ship in `examples/templates/`).
+- **External tools** — the Tools menu runs your own programs from
+  `data/tools.json`, feeding them the selection, the caret's line,
+  or the file, and bringing their output back into the document.
+
 ## Requirements
 
 - Windows 11, 64-bit (the released program).
@@ -126,9 +179,9 @@ tag is published, and each release ships exactly these assets:
   explaining it).
 - `SHA256SUMS.txt` — SHA-256 checksums for verifying the downloads.
 
-The installer script and the portable zip layout are proven locally;
-the MSI is built for the first time by the release workflow itself, and
-no asset has been published yet.
+The four assets are published with each release on the Releases
+page; the 1.0.0 and 1.1.0 assets were downloaded after publishing
+and their SHA-256 hashes verified against `SHA256SUMS.txt`.
 
 ## How to use it
 
@@ -179,6 +232,25 @@ Once the window is open:
 - **Save selection**: File ▸ Save Selection to File… writes just the
   selected bytes to a file, streamed — a selection of any size can be
   exported.
+- **Tabs**: Ctrl+T opens a new tab, Ctrl+W closes one, Ctrl+Tab
+  cycles; files opened while the current tab holds something start a
+  new tab. Open tabs reopen at the next launch after a clean exit.
+- **Regular expressions**: tick **Regex** on the find bar to search
+  by pattern; the count, Find Next / Previous, and the large-file
+  background find all use it, and a pattern that does not parse shows
+  its error in the bar. Regex works on UTF-8 and ANSI files (UTF-16
+  files are declined with a note).
+- **Filter and Follow Tail**: Search ▸ Filter… shows only the lines
+  containing a pattern (Enter on a row jumps back to the full file;
+  confirming with an empty pattern leaves the filter). View ▸ Follow
+  Tail keeps an unedited document growing with its file on disk.
+- **Split and compare**: View ▸ Split Text/Hex (Ctrl+\) shows text
+  and hex together; File ▸ Compare Side by Side… puts a second file
+  beside yours with differences shaded (F7 / Shift+F7 move between
+  them, Esc closes).
+- **Multi-caret**: Alt+click adds a caret, Alt+drag selects a
+  rectangle of columns; typing applies at every caret as one undo
+  step.
 - **Help**: press F1 for the built-in guide. It works offline.
 
 Everything is stored in the `data/` folder next to the program:
@@ -279,6 +351,22 @@ The headless tools run without opening a window:
    VeloEdit.exe --clean
    ```
 
+More headless forms, all streamed and working on files of any size:
+
+```bash
+VeloEdit.exe "big.log" --find "ERR[0-9]+" --regex --headless
+VeloEdit.exe "image.bin" --slice "0-1023; L10-L20" --out "part.bin"
+VeloEdit.exe "a.bin" --compare "b.bin"
+VeloEdit.exe "doc.bin" --export-patch "doc.velpatch"
+VeloEdit.exe "doc.bin" --apply-patch "doc.velpatch" --out "doc2.bin"
+VeloEdit.exe "doc.bin" --insert-zeroes 1M --at 4096
+```
+
+`--compare` lists the block regions that differ and exits 1 when the
+files differ; `--slice` mixes byte ranges and 1-based line ranges
+(`L10-L20`) separated by `;`; a patch holds only the edits against
+the file on disk and applying it never overwrites the base file.
+
 The program is a GUI-subsystem executable, so opening the window
 never flashes a console; started from a terminal, it borrows that
 terminal for the command-line tools, so the same `VeloEdit.exe`
@@ -298,6 +386,12 @@ serves both.
 | `--save-copy <DEST>` | Save a copy of the file to DEST through the atomic save pipeline (destination must differ from the source) |
 | `extract <file> --start <N> --length <M> --out <DEST>` | Copy one byte range of the file to DEST, streamed in 4 MB chunks; numbers are decimal or `0x`-hex, range clamped to the file |
 | `--split <FILE> --part-size <SIZE> [--out-dir <DIR>]` | Split FILE into `<name>.part001`, `.part002`, … parts of SIZE bytes (a number, or `K`/`M`/`G`-suffixed like `500M`); streamed, at most 10,000 parts |
+| `--regex` | With `--find`: treat the pattern as a regular expression (UTF-8/ANSI files) |
+| `--compare <OTHER>` | Structural compare of the file against OTHER in 1 MB hashed blocks; prints the differing regions (exit 1 when they differ) |
+| `--slice "<SPEC>" --out <DEST>` | Extract the byte ranges (`A-B`, hex allowed) and line ranges (`LA-LB`) named in SPEC, separated by `;`, to DEST |
+| `--export-patch <PATH>` | Write a VELOPAT1 delta patch holding the file's edits against its on-disk original |
+| `--apply-patch <PATCH> --out <DEST>` | Apply a delta patch to the file and write the result to DEST (the base is never overwritten) |
+| `--insert-zeroes <N> [--at <OFFSET>]` | Insert N zero bytes (number or `K`/`M`/`G`-suffixed) into the file in place through the atomic save |
 | `--install-shell`, `--uninstall-shell` | Add or remove the opt-in "Open in VeloEdit" Explorer menu item (current user only) |
 | `--output <PATH>` | Write the JSON report (diff or save-copy) to a file |
 | `--headless` | Run without opening a window |
@@ -329,7 +423,18 @@ edit a file-backed document, `data/recovery2.bin` holds the crash
 recovery record (the edit log and the original file's fingerprint);
 for a document with no backing file, `data/recovery.bin` /
 `data/recovery.json` hold a content snapshot instead, and
-`data/bookmarks.json` holds your per-file bookmarks.
+`data/bookmarks.json` holds your per-file bookmarks (with their
+colours and notes). Three more optional files live in `data/`:
+`keybindings.json` rebinds keyboard shortcuts (action name → chord;
+an empty string unbinds), `tools.json` declares the external tools
+on the Tools menu, and the `templates/` folder holds the binary
+template files offered by Tools ▸ Apply Template…. Settings also
+carry the hex layout choices, the split-view state, the open-session
+tabs, `map_window_mb` (0 = map the whole file, the default; 512 /
+1024 / 2048 / 4096 read the open-path samples through a moving
+mapped window), and `fast_save_clone` (off by default; an in-place
+save may reuse the file's unchanged extents where the drive supports
+it, silently falling back when it cannot).
 
 ## Building from source
 
@@ -367,12 +472,35 @@ src/editor.rs         Editor state machine the window is built on (caret,
 src/theme.rs          The 20 built-in themes and accent presets
 src/settings.rs       Portable settings (hand-rolled JSON, data/ folder)
 src/gui_win.rs        Win32 + Direct2D/DirectWrite window (Windows only)
-src/piece_table.rs    Memory-mapped piece table engine
+src/piece_table.rs    Memory-mapped piece table engine (Fenwick index)
 src/line_index.rs     Sparse 64 KB line checkpoint index
 src/hexview.rs        Hex row and 64-bit scrollbar arithmetic
-src/undo.rs           Undo/redo engine (inversion deltas)
-src/encoding.rs       Encoding detection, decode, and encode (UTF-8, UTF-16, ANSI)
+src/undo.rs           Undo/redo engine (inversion deltas, multi-caret edits)
+src/encoding.rs       Encoding detection, decode, and encode (UTF-8, UTF-16,
+                      ANSI, extended code pages)
 src/search.rs         Streaming find and single-undo replace over the piece table
+src/regex.rs          Streaming backtracking-free regular-expression engine
+src/hash.rs           Hand-written MD5, SHA-1, SHA-256, CRC32, xxHash64
+src/inspector.rs      Data-inspector value readings (ints, floats, GUID, dates)
+src/bookmarks.rs      Per-file bookmarks with colours and notes
+src/recovery.rs       Delta-log crash recovery records
+src/filter.rs         Log filter view model (background-built)
+src/slicing.rs        Multi-range slicing (byte and line ranges)
+src/patch.rs          VELOPAT1 delta patch build / parse / apply
+src/strings.rs        Printable-string scanning (ASCII and UTF-16LE)
+src/entropy.rs        Per-block Shannon entropy
+src/pointers.rs       Pointer readings and the jump-history stack
+src/timedeltas.rs     Log timestamp parsing and deltas
+src/delimited.rs      Delimiter detection and column splitting
+src/structdiff.rs     Block-hash structural compare
+src/templates.rs      Binary-template definition language
+src/linediff.rs       Streaming line-level diff for side-by-side compare
+src/disasm.rs         x86-64 instruction length decoder
+src/exttools.rs       External-tools file format and substitution
+src/keybindings.rs    Shortcut rebinding (data/keybindings.json)
+src/tabs.rs           Per-document tab state
+src/panes.rs          Split-view geometry and pane anchoring
+src/mapwindow.rs      Moving mapped-window maths (pure)
 src/mmap_win.rs       Windows read-only memory-mapped file backing (cfg(windows))
 src/save.rs           Atomic save pipeline (staging file, flush, swap, remap)
 src/diff.rs           Streaming binary diff and its JSON report
@@ -404,7 +532,12 @@ the editor core (open → type → undo → redo → save round trips, caret
 and selection behaviour, hex row formatting, find navigation and
 read-only refusals, exact line positions after mid-document edits), the
 20 themes (token validity and text contrast), and settings (round
-trips, corruption handling, recent-file rules).
+trips, corruption handling, recent-file rules). The full suite is 436
+tests, including the regex engine checked against an independent
+reference matcher, the hash implementations against published vectors,
+the template language applied to crafted PE/PNG headers, the x86-64
+length decoder, delta patch round trips, and multi-caret edits landing
+as single undo steps.
 
 ## Troubleshooting
 
@@ -443,28 +576,45 @@ Real captures from a run of the editor on Windows 11, showing a
 
 ![The editor in hex mode: offset column, hex bytes, ASCII column](docs/screenshots/editor-hex-mode.png)
 
-Still to capture: the find bar with matches highlighted, a light
-theme, and the installer.
+Still to capture: fresh captures of the current (1.1.0) window with
+its tab bar, the find bar with matches highlighted, the split view, a
+light theme, and the installer. The two captures above predate the
+tab bar added in 1.1.0.
 
 ## Known limitations
 
 - The graphical editor has been run on a real Windows 11 machine:
-  startup, painting, text and hex modes, the custom scrollbar, and
-  resizing are verified from real captures (see Screenshots).
-  Interactions still being exercised there include typing and saving
-  from the window, the find bar, theme switching, and the recovery
-  prompt; the installers have been built and hash-verified but not
-  yet run through a full install on a real machine.
+  startup, painting, text and hex modes, the custom scrollbar,
+  resizing, themes and accent live preview, Ctrl+mouse-wheel zoom,
+  tabs, and opening a 10 GB file instantly with a find counted over
+  the whole file are verified there. The surfaces added in 1.1.0
+  (split view, side-by-side compare, regex find, templates, external
+  tools, multi-caret editing, the disassembly panel) are
+  compile-verified and covered by the automated gate, and are still
+  being exercised on a real machine; the installers have been built
+  and hash-verified for both published releases but not yet run
+  through a full install on a real machine.
 - Crash recovery for a document with no backing file (a new,
   never-saved document) keeps a content snapshot and so covers
   documents up to 16 MB. File-backed documents of any size are
   covered by the delta record described above. One edge: a document
   restored from a delta record and then edited further without
   being saved keeps the original recovery record rather than
-  recapturing the new edits as a delta.
-- Long lines are shown clipped at the window edge (no horizontal
-  scrolling yet), and a line longer than 4096 characters is shown
-  truncated with a marker. There is no word wrap.
+  recapturing the new edits as a delta. With tabs, the on-disk
+  recovery record covers the active document; view toggles for word
+  wrap, Follow Tail, and frozen lines are program-wide rather than
+  per-tab.
+- Displayed lines are fetched with a cap (4096 characters), so a
+  longer line is shown truncated with a marker; word wrap folds the
+  fetched prefix. There is no horizontal scrolling.
+- Regular-expression find works on UTF-8 and ANSI documents; on
+  UTF-16 documents the find bar declines with a note instead of
+  guessing. The `map_window_mb` setting moves only the open-path
+  sampling onto a moving mapped window — the document backing still
+  maps the whole file.
+- Screen-reader support is scoped: assistive tools are told the
+  file name, the caret's line and column, and the current line's
+  text. It is not a full text-pattern implementation.
 - Direct2D/DirectWrite are called through hand-declared COM interfaces
   (windows-sys 0.61 ships no bindings for them and no other crate is
   allowed); the declarations follow the Windows SDK headers and are
@@ -474,22 +624,14 @@ theme, and the installer.
   file while VeloEdit has it mapped, reading the cut-off part can fault
   instead of returning an error. Saving from VeloEdit itself is atomic
   and unaffected.
-- Piece storage is a `Vec`; the weight-balanced B-tree from the
-  specification is a planned optimisation, so lookups are linear in the
-  number of pieces for now.
-- The line-index scan is a plain chunked scan; the SIMD-accelerated scan
-  from the specification is planned behind the same function.
-- The undo history size (1024 edits in this build) is a placeholder:
-  the final cap is to be confirmed. Saving a file also clears the undo
-  history: a save is a clean starting point.
+- Saving a file clears the undo history: a save is a clean starting
+  point.
 - Performance targets (cold start, memory caps, frame time) are
-  specification targets and are unverified until measured on Windows.
-  Host-side measurements of the core tools (200 MB diff/find/save
-  timings from this development machine) are recorded in
-  `docs/BENCHMARKS.md` — they are proxies, not the Windows numbers.
-- The packaging has not produced a published release yet: the MSI is
-  built for the first time by the release workflow on its Windows
-  runner, and the installers have not been run on a real machine.
+  specification targets and are unverified until measured on Windows;
+  one is field-verified — a 10 GB file opens instantly on a real
+  machine. Host-side measurements of the core tools (200 MB
+  diff/find/save timings from this development machine) are recorded
+  in `docs/BENCHMARKS.md` — they are proxies, not the Windows numbers.
 
 ## License
 
