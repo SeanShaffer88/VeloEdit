@@ -448,14 +448,24 @@ impl Editor {
 
     pub fn set_mode(&mut self, mode: EditorMode) {
         if mode != self.mode {
-            self.mode = mode;
-            // Keep the caret in view under the new mode's scroll unit.
+            // Keep the reader's place: translate the outgoing
+            // view's top into the incoming mode's scroll unit
+            // through the shared byte anchor. Anchoring to the
+            // caret instead jumped the view to wherever the caret
+            // happened to sit — after a paste that is the end of
+            // the file, so a Text→Hex→Text round trip "moved the
+            // document to the end" (field report). The caret
+            // itself does not move.
+            let width = self.hex_width();
             if mode == EditorMode::Hex {
-                self.first_row = hexview::row_for_offset_w(self.caret, self.hex_width());
+                let anchor = self.line_start_byte(self.first_line).unwrap_or(0);
+                self.first_row = hexview::row_for_offset_w(anchor, width);
             } else {
-                let (line, _) = self.line_col_of(self.caret);
+                let anchor = self.first_row.saturating_mul(width);
+                let (line, _) = self.line_col_of(anchor);
                 self.first_line = line;
             }
+            self.mode = mode;
         }
     }
 
@@ -2878,6 +2888,25 @@ mod tests {
         assert_eq!(rows[0].ascii, "MZ..hello world!");
         assert_eq!(rows[1].address, 16);
         assert_eq!(rows[1].ascii, "..AAAA");
+    }
+
+    #[test]
+    fn mode_switch_keeps_the_view_top_not_the_caret() {
+        // Field report: after pasting, the caret sits at the end
+        // of the file; a Text→Hex→Text round trip used to drag
+        // the view to the caret (the end). The switch must
+        // translate the view's top instead and leave the caret.
+        let data: Vec<u8> = b"aaa\n".repeat(30); // 30 lines × 4 bytes
+        let mut e = ed(&data);
+        e.move_caret_to(120, false);
+        e.set_first_line(10);
+        e.set_mode(EditorMode::Hex);
+        assert_eq!(e.first_row(), 2, "row holding line 10's first byte (40)");
+        assert_eq!(e.caret(), 120, "the caret does not move");
+        e.set_first_row(5); // byte 80 = line 20
+        e.set_mode(EditorMode::Text);
+        assert_eq!(e.first_line(), 20);
+        assert_eq!(e.caret(), 120);
     }
 
     #[test]
