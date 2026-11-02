@@ -173,6 +173,17 @@ const CMD_TAB_CLOSE_OTHERS: usize = 1071;
 const CMD_TAB_CLOSE_ALL: usize = 1072;
 const CMD_TAB_COPY_PATH: usize = 1073;
 const CMD_TAB_NEW_WINDOW: usize = 1074;
+// Split view and side-by-side diff (roadmap item 28 and the R5
+// line diff, slice R5c).
+const CMD_SPLIT_VIEW: usize = 1075;
+const CMD_COMPARE_SIDE: usize = 1076;
+const CMD_DIFF_NEXT: usize = 1077;
+const CMD_DIFF_PREV: usize = 1078;
+const CMD_DIFF_RECOMPUTE: usize = 1079;
+/// The split/compare divider's painted width, in DIPs.
+const DIVIDER_W: f32 = 5.0;
+/// The narrowest either pane of a split/compare may become.
+const MIN_PANE_W: f32 = 180.0;
 const CMD_THEME_BASE: usize = 3000; // + theme index (20 themes)
 const CMD_ACCENT_BASE: usize = 3100; // 0 = theme default, 1..=11 presets, then Custom…
 const CMD_ACCENT_CUSTOM: usize = CMD_ACCENT_BASE + 1 + ACCENT_PRESETS.len();
@@ -695,6 +706,47 @@ files that have gone missing are skipped without a fuss.\r\n\
 Untitled documents are not remembered this way — an unsaved\r\n\
 one still relies on the recovery record described above.\r\n\
 \r\n\
+SPLIT VIEW\r\n\
+View \u{25B8} Split Text/Hex (Ctrl+\\) shows the same document twice,\r\n\
+side by side: the text on the left, the bytes as hex on the\r\n\
+right. The two panes are tied together by the bytes they\r\n\
+show — scroll one and the other follows, because the byte at\r\n\
+the top of one pane is the byte at the top of the other. The\r\n\
+caret's byte is marked in the pane you are not using, so you\r\n\
+can always see where you are in both. Click a pane (or turn\r\n\
+the mouse wheel over it) to work in it; edits happen in\r\n\
+whichever pane you clicked, and both panes show the result.\r\n\
+The Text and Hex buttons both light up while split, and\r\n\
+clicking one moves the keyboard to that pane instead of\r\n\
+changing the view. Drag the divider between the panes to\r\n\
+make one wider; where you leave it is remembered. A few\r\n\
+things belong to the single view and step aside while split:\r\n\
+the filter view and frozen lines cannot start (the status\r\n\
+bar says why), and the delimiter grid waits until split is\r\n\
+off. Turning split off returns to whichever pane you were\r\n\
+using last.\r\n\
+\r\n\
+COMPARE SIDE BY SIDE\r\n\
+File \u{25B8} Compare Side by Side\u{2026} opens a second file in a\r\n\
+pane on the right, next to your document. The second file is\r\n\
+only ever read, never changed — its pane takes no typing at\r\n\
+all. The two panes scroll together, line by line in text\r\n\
+mode or row by row in hex mode, so the same place in both\r\n\
+files stays side by side. In text mode VeloEdit also works\r\n\
+out where the two files differ, in the background: differing\r\n\
+stretches are shaded in both panes, the status bar counts\r\n\
+them, and Search \u{25B8} Next Difference (F7) and Previous\r\n\
+Difference (Shift+F7) jump between them, moving both panes\r\n\
+together. If you edit your document after the differences\r\n\
+were worked out, the shading stays but the status bar marks\r\n\
+it stale; Search \u{25B8} Compare Differences works it out\r\n\
+again. In hex mode there is no shading — the panes simply\r\n\
+scroll together, and File \u{25B8} Compare With\u{2026} remains the\r\n\
+tool for byte-level differences. Press Esc (or choose the\r\n\
+menu item again) to close the compare; switching tabs closes\r\n\
+it too. The Data Inspector steps aside while a compare is\r\n\
+open and returns when it closes.\r\n\
+\r\n\
 FINDING MORE\r\n\
 Tick \"In selection\" on the find bar to search and replace only\r\n\
 inside the part of the document you selected first. In hex mode\r\n\
@@ -840,7 +892,8 @@ F2 \u{00B7} bookmark_prev Shift+F2 \u{00B7} jump_back Alt+Left \u{00B7}\r\n\
 jump_forward Alt+Right \u{00B7} pointer_follow Ctrl+Enter \u{00B7} new_tab\r\n\
 Ctrl+T \u{00B7} close_tab Ctrl+W \u{00B7} next_tab Ctrl+Tab \u{00B7} prev_tab\r\n\
 Ctrl+Shift+Tab \u{00B7} tab_1 to tab_8 Ctrl+1 to Ctrl+8 \u{00B7} tab_last\r\n\
-Ctrl+9. follow_tail, filter and clear_filter start unbound.\r\n\
+Ctrl+9 \u{00B7} toggle_split Ctrl+\\ \u{00B7} diff_next F7 \u{00B7} diff_prev\r\n\
+Shift+F7. follow_tail, filter and clear_filter start unbound.\r\n\
 Two settings live only in settings.json in the data folder:\r\n\
 \"map_window_mb\" (0, 512, 1024, 2048 or 4096; 0 maps the whole\r\n\
 file, a number reads very large files through a moving window\r\n\
@@ -1108,6 +1161,14 @@ struct Brushes {
     /// built from its fixed RGB values (theme-independent by
     /// design — the swatches are chosen to read on every theme).
     swatches: [*mut c_void; 6],
+    /// The side-by-side diff bands (slice R5c): a dedicated tint
+    /// derived from the theme accent — the background blended a
+    /// quarter of the way toward the accent, and halfway for the
+    /// region the user is currently parked on. Accent-derived so
+    /// the bands follow the (possibly overridden) accent like
+    /// everything else in the palette.
+    diff_bg: *mut c_void,
+    diff_bg_hot: *mut c_void,
 }
 
 /// The ANSI SGR foreground palette: the standard terminal colours,
@@ -1155,6 +1216,8 @@ impl Brushes {
                 let (_, (r, g, b)) = crate::bookmarks::BOOKMARK_SWATCHES[i];
                 make_brush(target, Rgba::rgb(r, g, b))
             }),
+            diff_bg: make_brush(target, blend_rgba(t.bg, t.accent, 0.25)),
+            diff_bg_hot: make_brush(target, blend_rgba(t.bg, t.accent, 0.5)),
         }
     }
 
@@ -1171,6 +1234,8 @@ impl Brushes {
             &mut self.selection,
             &mut self.match_bg,
             &mut self.accent,
+            &mut self.diff_bg,
+            &mut self.diff_bg_hot,
         ]
         .into_iter()
         .chain(self.ansi.iter_mut())
@@ -1341,6 +1406,9 @@ struct EntropyState {
 enum HoverKind {
     Tick(u64, bool),
     Tab(usize),
+    /// A fixed explanation (slice R5c): the split/compare
+    /// divider and the panes it separates.
+    Note(&'static str),
 }
 
 /// One document's complete shell state (tabs, roadmap item 39,
@@ -1439,6 +1507,74 @@ struct TabDrag {
     start_x: f32,
     x: f32,
     moved: bool,
+}
+
+/// A finished side-by-side diff computation (slice R5c),
+/// delivered by the background worker through the compare's
+/// slot. `diff_gen` and `doc_gen` are the generations the
+/// computation started from; a result whose generations no
+/// longer match is discarded, exactly like the find worker's.
+struct DiffProgress {
+    diff_gen: u64,
+    doc_gen: u64,
+    report: crate::linediff::LineDiffReport,
+    /// The run covered only the indexed prefix of one side
+    /// (its line index was still building): the regions are
+    /// honest for that prefix, and the compare re-runs once
+    /// both indexes complete.
+    prefix: bool,
+}
+
+/// The side-by-side compare session (slice R5c): a second file
+/// shown read-only in a right-hand pane next to the active
+/// document. Owned by the WINDOW, not by any tab — switching
+/// tabs closes it. Its editor is a full `Editor` over its own
+/// mapping (the same lightweight open path as a document,
+/// marked read-only), with its own staged line-index build —
+/// but no undo, no find, no recovery: the pane takes no text
+/// input at all, and nothing here is ever written back.
+struct CompareState {
+    editor: Editor,
+    path: std::path::PathBuf,
+    mmap: Option<std::sync::Arc<crate::mmap_win::MmapFile>>,
+    /// The staged index build's delivery slot (an
+    /// `(epoch, progress)` pair, the document index's shape).
+    index_slot: std::sync::Arc<std::sync::Mutex<Option<(u64, IndexProgress)>>>,
+    index_epoch: u64,
+    /// `(indexed_bytes, total)` while the right file's index is
+    /// still building; `None` once complete.
+    indexing: Option<(u64, u64)>,
+    /// The diff worker's delivery slot.
+    diff_slot: std::sync::Arc<std::sync::Mutex<Option<DiffProgress>>>,
+    diff_gen: u64,
+    /// The last completed difference report (text mode only).
+    diff: Option<crate::linediff::LineDiffReport>,
+    /// The held report covers only an indexed prefix.
+    diff_prefix: bool,
+    /// The left document changed after the report was computed:
+    /// the bands stay painted but the status bar says they are
+    /// stale and offers the recompute command.
+    diff_stale: bool,
+    /// A diff computation is running on the worker.
+    diff_computing: bool,
+    /// The region the user last jumped to.
+    current: Option<usize>,
+    /// The panes' scroll pairing: right first unit = left first
+    /// unit + delta (lines in text mode, hex rows in hex mode).
+    /// Zero until a difference jump pairs the panes.
+    delta: i64,
+}
+
+/// The compare pane's gathered rows (slice R5c): the right
+/// file's rows in the document's mode, painted plainly. The
+/// text variant carries its gutter width, computed during the
+/// gather (the editor's line count needs `&mut`).
+enum CmpRows {
+    Text {
+        rows: Vec<crate::editor::TextRow>,
+        gutter_w: f32,
+    },
+    Hex(Vec<crate::editor::HexRow>),
 }
 
 struct App {
@@ -1701,6 +1837,17 @@ struct App {
     /// sitting in the first tab, and its record is only replaced
     /// by the next edit's debounce, as before.
     suppress_recovery_delete: bool,
+    // -- Split view and side-by-side diff (slice R5c) ----------
+    /// The open compare session, if any. Window-owned: never
+    /// parked with a tab; switching tabs closes it.
+    compare: Option<CompareState>,
+    /// The pointer is over the split/compare divider (its band
+    /// paints in the accent while true).
+    split_div_hover: bool,
+    /// A divider drag in progress: the grab offset (pointer x
+    /// minus divider x) so the divider tracks the pointer
+    /// without jumping.
+    divider_drag: Option<f32>,
 }
 
 impl App {
@@ -1741,6 +1888,15 @@ impl App {
         // and bump the generation so the worker's late results are
         // never picked up.
         cancel_bg_find(self);
+        // An open compare's computed differences describe the
+        // pre-edit document: mark them stale (the bands stay,
+        // honestly labelled) and retire any in-flight run. The
+        // recompute is offered, never automatic per keystroke.
+        if let Some(cmp) = &mut self.compare {
+            cmp.diff_stale = true;
+            cmp.diff_gen += 1;
+            cmp.diff_computing = false;
+        }
     }
 
     /// Exchange every per-document field with `other` (tabs,
@@ -2054,11 +2210,29 @@ fn drop_format(app: &mut App) {
 // Layout (all in DIPs; converted to pixels only for child windows)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy)]
 struct Layout {
     editor_top: f32,
     editor_bottom: f32,
     width: f32,
     gutter_w: f32,
+    /// X of the content origin (slice R5c): 0 for the main
+    /// canvas; the hex pane of the split view starts its gutter
+    /// at `split_div + DIVIDER_W`, and its paint/hit-test copy of
+    /// the layout carries that here.
+    origin_x: f32,
+    /// The TEXT gutter's width (slice R5c), computed on every
+    /// layout whatever the mode: the split view's left pane
+    /// needs it while the editor's mode (the focus) is hex, and
+    /// `gutter_w` above follows the mode.
+    text_gutter: f32,
+    /// The split view's divider x while the split is active
+    /// (slice R5c); `None` when it is not.
+    split_div: Option<f32>,
+    /// The compare's divider x while a compare is open
+    /// (slice R5c); the left document's `editor_right` already
+    /// ends here in that case.
+    compare_div: Option<f32>,
     /// Right edge of the editor area: the client width minus the
     /// inspector panel while it is open (roadmap item 15). Mouse
     /// maths, the scrollbar, and the content columns all bound to
@@ -2089,12 +2263,16 @@ fn compute_layout(app: &mut App) -> Layout {
         + if app.change_visible { CHANGEBAR_H } else { 0.0 }
         + if app.find_visible { FINDBAR_H } else { 0.0 };
     // Time-delta gutter (R4b): an extra column inside the text
-    // gutter, wide enough for "+999.9s"-shaped deltas.
-    let delta_w = if app.deltas_on && app.editor.mode() == EditorMode::Text {
+    // gutter, wide enough for "+999.9s"-shaped deltas. In the
+    // split view the text pane carries it whatever the focus.
+    let delta_w = if app.deltas_on && (app.editor.mode() == EditorMode::Text || split_active(app)) {
         DELTA_GUTTER_CHARS * app.char_w
     } else {
         0.0
     };
+    // The text gutter's width at this layout (slice R5c).
+    let text_digits = app.editor.line_count().max(1).to_string().len() as f32;
+    let text_gutter = (text_digits + 2.0) * app.char_w + TEXT_PAD + delta_w;
     let gutter_w = match app.editor.mode() {
         EditorMode::Text => {
             let digits = app.editor.line_count().max(1).to_string().len() as f32;
@@ -2102,10 +2280,39 @@ fn compute_layout(app: &mut App) -> Layout {
         }
         EditorMode::Hex => 18.0 * app.char_w + TEXT_PAD,
     };
-    let editor_right = if app.settings.inspector_open {
+    // The compare (slice R5c) takes the right half of the
+    // canvas for its pane: the document's area ends at the
+    // compare divider, and the inspector steps aside for the
+    // duration (its open state is preserved, just not painted).
+    let compare_div = if app.compare.is_some() {
+        Some(crate::panes::divider_x(
+            0.0,
+            width,
+            app.settings.split_ratio_permille as f32 / 1000.0,
+            MIN_PANE_W,
+            MIN_PANE_W,
+        ))
+    } else {
+        None
+    };
+    let editor_right = if let Some(div) = compare_div {
+        div
+    } else if app.settings.inspector_open {
         (width - INSPECTOR_W).max(gutter_w + TEXT_PAD + SCROLLBAR_W + 40.0)
     } else {
         width
+    };
+    // The split view's divider spans the document's own area.
+    let split_div = if split_active(app) {
+        Some(crate::panes::divider_x(
+            0.0,
+            editor_right,
+            app.settings.split_ratio_permille as f32 / 1000.0,
+            MIN_PANE_W,
+            MIN_PANE_W,
+        ))
+    } else {
+        None
     };
     let bottom = (height - STATUS_H).max(top);
     let strings_h = if app.settings.strings_open {
@@ -2127,6 +2334,10 @@ fn compute_layout(app: &mut App) -> Layout {
         editor_bottom: bottom,
         width,
         gutter_w,
+        origin_x: 0.0,
+        text_gutter,
+        split_div,
+        compare_div,
         editor_right,
         rows_top,
         rows_bottom: (bottom - strings_h).max(rows_top),
@@ -2135,16 +2346,120 @@ fn compute_layout(app: &mut App) -> Layout {
     }
 }
 
+/// Whether the text/hex split view is actually in effect
+/// (roadmap item 28, slice R5c): the setting is on, no filter
+/// view is up (the two decline each other — see the commands),
+/// no compare is open (a compare owns the right side), and no
+/// lines are frozen (the frozen block belongs to the single
+/// canvas; freezing and splitting decline each other too).
+fn split_active(app: &App) -> bool {
+    app.settings.split_view
+        && app.filter.is_none()
+        && app.compare.is_none()
+        && app.settings.freeze_lines == 0
+}
+
+/// Re-tie the split's unfocused pane to the focused pane's top
+/// through the shared byte-offset anchor: the offset at the top
+/// of the focused pane maps to the line (text) or row (hex) at
+/// the top of the other. Called from `render` — the one funnel
+/// every scroll path passes through before painting — so the
+/// stored tops are never more than one paint apart.
+fn split_sync_from_focus(app: &mut App) {
+    if !split_active(app) {
+        return;
+    }
+    let width = app.editor.hex_layout().bytes_per_row.max(1);
+    match app.editor.mode() {
+        EditorMode::Text => {
+            let anchor = app
+                .editor
+                .line_start_byte(app.editor.first_line())
+                .unwrap_or(0);
+            let row = crate::panes::hex_row_for_offset(anchor, width);
+            app.editor.set_first_row(row);
+        }
+        EditorMode::Hex => {
+            let anchor = crate::panes::offset_for_hex_row(app.editor.first_row(), width);
+            let (line, _) = app.editor.line_col_of(anchor);
+            app.editor.set_first_line(line);
+        }
+    }
+}
+
+/// Move keyboard focus to one pane of the split (slice R5c):
+/// the mode becomes the pane's representation — the mode IS the
+/// focus while split — with both panes' tops preserved across
+/// the switch (a plain `set_mode` would re-derive the incoming
+/// pane's top from the caret) and the anchor re-tied. Outside
+/// the split this is exactly `set_mode`.
+/// A compare opened in hex mode has no differences yet
+/// (phase 2 is text-only): start its diff when text mode
+/// arrives (slice R5c).
+fn maybe_start_compare_diff(app: &mut App) {
+    if app.editor.mode() != EditorMode::Text {
+        return;
+    }
+    let needs = matches!(&app.compare, Some(cmp)
+        if cmp.diff.is_none() && !cmp.diff_computing && !cmp.diff_stale);
+    if needs {
+        start_diff(app);
+        refresh_status(app);
+    }
+}
+
+fn split_set_focus(app: &mut App, hex: bool) {
+    let target = if hex {
+        EditorMode::Hex
+    } else {
+        EditorMode::Text
+    };
+    if !split_active(app) {
+        set_mode(app, target);
+        maybe_start_compare_diff(app);
+        return;
+    }
+    if app.editor.mode() == target {
+        return;
+    }
+    let first_line = app.editor.first_line();
+    let first_row = app.editor.first_row();
+    set_mode(app, target);
+    // set_mode dropped the filter (never up while split) and
+    // re-derived the incoming top from the caret; put both
+    // tops back, then let the anchor tie them together.
+    app.editor.set_first_line(first_line);
+    app.editor.set_first_row(first_row);
+    split_sync_from_focus(app);
+    invalidate(app);
+    maybe_start_compare_diff(app);
+}
+
 /// The fit-to-window hex width for the current window (roadmap
 /// item 13): the character cells available to the hex area,
 /// counted in cells (the monospace grid makes this exact).
 fn fit_hex_width(app: &mut App) -> u64 {
     let layout = compute_layout(app);
-    let avail = ((layout.editor_right - SCROLLBAR_W - layout.gutter_w - TEXT_PAD)
-        / app.char_w.max(1.0))
-    .floor()
-    .max(0.0) as usize;
+    // While the split is active the hex pane is what must fit:
+    // its content runs from the divider (past its own gutter)
+    // to the editor's right edge.
+    let content_left = match layout.split_div {
+        Some(div) => div + DIVIDER_W + hex_gutter_w(app) + TEXT_PAD,
+        None => layout.gutter_w + TEXT_PAD,
+    };
+    let avail = ((layout.editor_right - SCROLLBAR_W - content_left) / app.char_w.max(1.0))
+        .floor()
+        .max(0.0) as usize;
     hexview::fit_bytes_per_row(avail, app.settings.hex_group as usize)
+}
+
+/// The hex gutter's width at the current font: the address
+/// column ("0000000000000000: " worth of cells) plus padding.
+/// `compute_layout` uses the same formula for the hex mode's
+/// gutter; the split view needs it for the right pane while the
+/// layout's own gutter describes the text pane.
+fn hex_gutter_w(app: &App) -> f32 {
+    18.0 * app.char_w + TEXT_PAD
 }
 
 /// Push the settings-described hex layout into the editor
@@ -2160,6 +2475,14 @@ fn sync_hex_layout(app: &mut App) {
     let layout = app.settings.hex_layout(fit);
     if layout != app.editor.hex_layout() {
         app.editor.set_hex_layout(layout);
+    }
+    // The compare's editor mirrors the document's layout
+    // (slice R5c): identical bytes-per-row keeps hex rows 1:1
+    // between the panes, which the sync-scroll pairing assumes.
+    if let Some(cmp) = &mut app.compare {
+        if cmp.editor.hex_layout() != layout {
+            cmp.editor.set_hex_layout(layout);
+        }
     }
 }
 
@@ -2258,14 +2581,24 @@ fn wrap_active(app: &App) -> bool {
 /// visible lines; a document with no consistent delimiter simply
 /// paints as plain text.)
 fn grid_active(app: &App) -> bool {
-    app.grid_on && app.filter.is_none() && app.editor.mode() == EditorMode::Text
+    // The grid is a single-canvas reading of the whole text
+    // width; the split's text pane is narrower than the grid's
+    // detection assumes, so the grid steps aside while split
+    // (slice R5c — the toggle stays on and returns with the
+    // split off; see PARITY).
+    app.grid_on
+        && app.filter.is_none()
+        && app.editor.mode() == EditorMode::Text
+        && !split_active(app)
 }
 
 /// Characters that fit across the text area at the current layout —
 /// the wrap column count.
 fn wrap_columns(app: &mut App) -> u64 {
     let layout = compute_layout(app);
-    let text_w = (layout.editor_right - SCROLLBAR_W - layout.gutter_w - TEXT_PAD).max(app.char_w);
+    // In the split view the text pane ends at the divider.
+    let right = layout.split_div.unwrap_or(layout.editor_right);
+    let text_w = (right - SCROLLBAR_W - layout.gutter_w - TEXT_PAD).max(app.char_w);
     ((text_w / app.char_w.max(1.0)).floor() as u64).max(4)
 }
 
@@ -2274,8 +2607,19 @@ fn wrap_columns(app: &mut App) -> u64 {
 /// region. In the filter view, rows are the filtered lines from the
 /// filter's scroll position.
 fn display_rows(app: &mut App, max_rows: usize) -> Vec<DisplayRow> {
+    if app.editor.mode() != EditorMode::Text {
+        return Vec::new();
+    }
+    display_rows_model(app, max_rows)
+}
+
+/// The text display-row model without the mode guard: the split
+/// view's text pane needs text rows while the editor's mode (the
+/// split's focus) is hex (slice R5c). Everything else about the
+/// rows — filter, wrap, freeze — is the ordinary model's.
+fn display_rows_model(app: &mut App, max_rows: usize) -> Vec<DisplayRow> {
     let mut out: Vec<DisplayRow> = Vec::new();
-    if app.editor.mode() != EditorMode::Text || max_rows == 0 {
+    if max_rows == 0 {
         return out;
     }
     if let Some(filter) = &app.filter {
@@ -2871,6 +3215,50 @@ fn refresh_status(app: &mut App) {
     if let Some(note) = &app.status_note {
         left.push_str(&format!(" \u{00B7} {note}"));
     }
+    // Side-by-side compare (slice R5c): what is being compared,
+    // and the state of the difference computation — running,
+    // stale (with the way to recompute), or the region count
+    // with the parked position.
+    if let Some(cmp) = &app.compare {
+        let name = cmp
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cmp.path.display().to_string());
+        left.push_str(&format!(" \u{00B7} Comparing with {name}"));
+        if cmp.diff_computing {
+            left.push_str(" \u{00B7} Comparing\u{2026}");
+        } else if cmp.diff_stale {
+            left.push_str(
+                " \u{00B7} Differences stale \u{2014} Search \u{25B8} Compare Differences recomputes",
+            );
+        } else if let Some(report) = &cmp.diff {
+            if report.regions.is_empty() {
+                left.push_str(" \u{00B7} No differences");
+            } else {
+                left.push_str(&format!(
+                    " \u{00B7} {} difference{}",
+                    report.regions.len(),
+                    if report.regions.len() == 1 { "" } else { "s" }
+                ));
+                if let Some(cur) = cmp.current {
+                    left.push_str(&format!(
+                        " \u{00B7} {} of {}",
+                        cur + 1,
+                        report.regions.len()
+                    ));
+                }
+            }
+            if cmp.diff_prefix {
+                left.push_str(" \u{00B7} indexing\u{2026} (indexed prefix so far)");
+            }
+        }
+        if let Some((indexed, total)) = cmp.indexing {
+            if let Some(suffix) = crate::line_index::indexing_status_suffix(indexed, total) {
+                left.push_str(&suffix);
+            }
+        }
+    }
     if let Some((indexed, total)) = app.indexing {
         // The staged line index is still building: report its
         // percentage. The status bar never presents the partial
@@ -3182,6 +3570,17 @@ struct RowPaint<'a> {
     dim_range: Option<(u64, u64)>,
     seg_mode: bool,
     in_filter: bool,
+    /// The compare's difference regions over the LEFT document
+    /// (slice R5c), while a compare report is held; rows inside
+    /// a region paint the diff band. `diff_current` is the
+    /// region the user last jumped to (painted hotter).
+    diff: Option<&'a [crate::linediff::LineDiffRegion]>,
+    diff_current: Option<usize>,
+    /// Whether the live text caret paints in these rows (slice
+    /// R5c): in the split view the text pane shows the caret
+    /// only while it has focus; the other pane's position is a
+    /// passive marker drawn by the split painter instead.
+    caret_live: bool,
 }
 
 /// Whether a line's content is blank for the paragraph model
@@ -3308,6 +3707,13 @@ fn render(app: &mut App) {
         return;
     }
     let layout = compute_layout(app);
+    // Split/compare scroll ties (slice R5c) run before any rows
+    // are gathered: the split re-ties the unfocused pane's top
+    // to the focused pane's through the shared byte anchor, and
+    // the compare re-ties the right pane's top to the left's
+    // through their pairing delta.
+    split_sync_from_focus(app);
+    compare_sync_scroll(app);
     let visible =
         (((layout.rows_bottom - layout.rows_top) / app.line_h.max(1.0)).ceil() as usize).max(1);
     let selection = app.editor.selection_range();
@@ -3343,28 +3749,67 @@ fn render(app: &mut App) {
             RowData::Hex(app.editor.visible_hex_rows(app.editor.first_row(), visible))
         }
     };
+    // Split view (slice R5c): both representations gathered —
+    // the focused pane's rows are `rows` above; these serve the
+    // other pane (and the text extras, which follow the text
+    // pane even while hex has focus).
+    let split_rows: Option<(Vec<DisplayRow>, Vec<crate::editor::HexRow>)> =
+        if layout.split_div.is_some() {
+            Some((
+                display_rows_model(app, visible),
+                app.editor.visible_hex_rows(app.editor.first_row(), visible),
+            ))
+        } else {
+            None
+        };
+    let cmp_mode = app.editor.mode();
+    let cmp_rows: Option<CmpRows> = match (&mut app.compare, cmp_mode) {
+        (Some(cmp), EditorMode::Text) => {
+            let digits = cmp.editor.line_count().max(1).to_string().len() as f32;
+            Some(CmpRows::Text {
+                rows: cmp
+                    .editor
+                    .visible_text_rows(cmp.editor.first_line(), visible),
+                gutter_w: (digits + 2.0) * app.char_w + TEXT_PAD,
+            })
+        }
+        (Some(cmp), EditorMode::Hex) => Some(CmpRows::Hex(
+            cmp.editor.visible_hex_rows(cmp.editor.first_row(), visible),
+        )),
+        _ => None,
+    };
     // Delimiter grid model over the visible lines (R4b).
     let grid = match &rows {
         RowData::Text(disp) if grid_active(app) => grid_model(app, disp),
         _ => None,
     };
-    // Time-delta gutter values per visible line (R4b).
-    let row_deltas: std::collections::HashMap<u64, i64> =
-        if app.deltas_on && matches!(rows, RowData::Text(_)) && !in_filter {
-            match &rows {
-                RowData::Text(disp) => row_deltas_map(app, disp),
-                _ => std::collections::HashMap::new(),
-            }
-        } else {
-            std::collections::HashMap::new()
-        };
+    // Time-delta gutter values per visible line (R4b). In the
+    // split view the values follow the TEXT pane's rows, which
+    // are the split gather while hex has focus.
+    let row_deltas: std::collections::HashMap<u64, i64> = if app.deltas_on && !in_filter {
+        match (&split_rows, &rows) {
+            (Some((trows, _)), _) => row_deltas_map(app, trows),
+            (None, RowData::Text(disp)) => row_deltas_map(app, disp),
+            _ => std::collections::HashMap::new(),
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
     // Focus dimming (R4b): the caret's paragraph.
     let dim_range: Option<(u64, u64)> =
-        if app.dim_on && matches!(rows, RowData::Text(_)) && !in_filter {
+        if app.dim_on && (matches!(rows, RowData::Text(_)) || split_rows.is_some()) && !in_filter {
             paragraph_range(app, caret_line)
         } else {
             None
         };
+    // The compare's difference bands over the left document
+    // (slice R5c), while a report is held.
+    let diff_regions: Option<&[crate::linediff::LineDiffRegion]> = app
+        .compare
+        .as_ref()
+        .and_then(|c| c.diff.as_ref())
+        .map(|r| r.regions.as_slice());
+    let diff_current = app.compare.as_ref().and_then(|c| c.current);
     let paint = RowPaint {
         caret_line,
         caret_col,
@@ -3378,6 +3823,9 @@ fn render(app: &mut App) {
         dim_range,
         seg_mode,
         in_filter,
+        diff: diff_regions,
+        diff_current,
+        caret_live: true,
     };
 
     let target = app.target;
@@ -3588,14 +4036,21 @@ fn render(app: &mut App) {
             }
         }
     }
-    // Gutter background for the rows strip.
+    // Gutter background for the rows strip. In the split view
+    // the strip is the TEXT pane's gutter, whatever the focus
+    // (the layout's own gutter follows the focused mode).
+    let gutter_fill_w = if layout.split_div.is_some() {
+        layout.text_gutter
+    } else {
+        layout.gutter_w
+    };
     fill_rect(
         fill,
         target,
         D2dRectF {
             left: 0.0,
             top,
-            right: layout.gutter_w,
+            right: gutter_fill_w,
             bottom: rbottom,
         },
         brushes.gutter,
@@ -3727,214 +4182,50 @@ fn render(app: &mut App) {
             }
         }
         RowData::Hex(hex_rows) => {
-            // Column geometry follows the current hex layout
-            // (roadmap items 13/14): the ASCII column starts after
-            // the formatted hex text plus a two-cell gap.
-            let hex_layout = app.editor.hex_layout();
-            let hex_x = layout.gutter_w + TEXT_PAD;
-            let ascii_x = hex_x
-                + (hexview::hex_text_len(hex_layout.bytes_per_row as usize, &hex_layout) + 2)
-                    as f32
-                    * app.char_w;
-            for (i, row) in hex_rows.iter().enumerate() {
-                let y = rtop + i as f32 * app.line_h;
-                if y >= rbottom {
-                    break;
-                }
-                if caret >= row.address && caret < row.address + row.len {
-                    // The same current-line band as text mode
-                    // (polish pass), text area only, drawn before
-                    // the selection cells and the row's text.
-                    fill_rect(
-                        fill,
-                        target,
-                        D2dRectF {
-                            left: layout.gutter_w,
-                            top: y,
-                            right: layout.editor_right,
-                            bottom: y + app.line_h,
-                        },
-                        brushes.band,
-                    );
-                }
-                // Selection: one background cell per selected byte.
-                if let Some((ss, se)) = selection {
-                    let from = ss.max(row.address);
-                    let to = se.min(row.address + row.len);
-                    let mut byte = from;
-                    while byte < to {
-                        let idx = (byte - row.address) as usize;
-                        // The byte's hex cell sits where its digits
-                        // are displayed (grouping and big-endian
-                        // order move it; the ASCII cell never moves).
-                        let cell =
-                            hexview::byte_char_col(idx, row.len as usize, &hex_layout) as f32;
-                        fill_rect(
-                            fill,
-                            target,
-                            D2dRectF {
-                                left: hex_x + cell * app.char_w,
-                                top: y,
-                                right: hex_x + (cell + 2.0) * app.char_w,
-                                bottom: y + app.line_h,
-                            },
-                            brushes.selection,
-                        );
-                        fill_rect(
-                            fill,
-                            target,
-                            D2dRectF {
-                                left: ascii_x + idx as f32 * app.char_w,
-                                top: y,
-                                right: ascii_x + (idx as f32 + 1.0) * app.char_w,
-                                bottom: y + app.line_h,
-                            },
-                            brushes.selection,
-                        );
-                        byte += 1;
-                    }
-                }
-                // Bookmark marker (roadmap item 20): the same
-                // square as text mode, at the gutter's right edge
-                // here — the address text starts at the left. Its
-                // colour is the bookmark's annotation colour, or
-                // the accent (slice R4c, item 5).
-                let bm_at = bookmark_entries.partition_point(|b| b.offset < row.address);
-                if matches!(bookmark_entries.get(bm_at), Some(b) if b.offset < row.address + row.len)
-                {
-                    let size = 6.0;
-                    let my = y + (app.line_h - size) / 2.0;
-                    fill_rect(
-                        fill,
-                        target,
-                        D2dRectF {
-                            left: layout.gutter_w - 2.0 - size,
-                            top: my,
-                            right: layout.gutter_w - 2.0,
-                            bottom: my + size,
-                        },
-                        bookmark_brush(brushes, &bookmark_entries[bm_at]),
-                    );
-                }
-                // The address column: absolute offsets, or — while
-                // relative offsets are on (roadmap item 16) — the
-                // signed distance from the base, in the same 16
-                // characters (a leading minus replaces one zero).
-                let address = if app.rel_offsets {
-                    let rel = row.address as i128 - app.rel_base as i128;
-                    if rel < 0 {
-                        format!("-{:015X}", -rel)
-                    } else {
-                        format!("{:016X}", rel)
-                    }
-                } else {
-                    format!("{:016X}", row.address)
-                };
-                // The caret row's address takes the accent colour,
-                // mirroring the current line number in text mode;
-                // other rows take the same brightened gutter tone
-                // as text-mode line numbers (polish pass).
-                let address_brush = if caret >= row.address && caret < row.address + row.len {
-                    brushes.accent
-                } else {
-                    brushes.gutter_num
-                };
-                draw_text(
-                    draw,
-                    target,
-                    format,
-                    &address,
-                    D2dRectF {
-                        left: TEXT_PAD,
-                        top: y,
-                        right: layout.gutter_w,
-                        bottom: y + app.line_h,
-                    },
-                    address_brush,
-                );
-                draw_text(
-                    draw,
-                    target,
-                    format,
-                    &row.hex,
-                    D2dRectF {
-                        left: hex_x,
-                        top: y,
-                        right: ascii_x,
-                        bottom: y + app.line_h,
-                    },
-                    brushes.text,
-                );
-                draw_text(
-                    draw,
-                    target,
-                    format,
-                    &row.ascii,
-                    D2dRectF {
-                        left: ascii_x,
-                        top: y,
-                        right: layout.editor_right,
-                        bottom: y + app.line_h,
-                    },
-                    brushes.text,
-                );
-                // Caret: an outline box around the current byte.
-                if app.has_focus
-                    && app.caret_on
-                    && caret >= row.address
-                    && caret <= row.address + row.len
-                {
-                    let idx =
-                        (caret.min(row.address + row.len.saturating_sub(1)) - row.address) as usize;
-                    if row.len > 0 {
-                        let cell =
-                            hexview::byte_char_col(idx, row.len as usize, &hex_layout) as f32;
-                        let x0 = hex_x + cell * app.char_w;
-                        let x1 = x0 + 2.0 * app.char_w;
-                        let t = 1.5f32;
-                        for r in [
-                            D2dRectF {
-                                left: x0,
-                                top: y,
-                                right: x1,
-                                bottom: y + t,
-                            },
-                            D2dRectF {
-                                left: x0,
-                                top: y + app.line_h - t,
-                                right: x1,
-                                bottom: y + app.line_h,
-                            },
-                            D2dRectF {
-                                left: x0,
-                                top: y,
-                                right: x0 + t,
-                                bottom: y + app.line_h,
-                            },
-                            D2dRectF {
-                                left: x1 - t,
-                                top: y,
-                                right: x1,
-                                bottom: y + app.line_h,
-                            },
-                        ] {
-                            fill_rect(fill, target, r, brushes.accent);
-                        }
-                    }
-                }
-            }
+            paint_hex_rows(
+                app,
+                hex_rows,
+                0.0,
+                layout.gutter_w,
+                layout.editor_right,
+                rtop,
+                rbottom,
+                &HexRowPaint {
+                    selection,
+                    bookmarks: &bookmark_entries,
+                    caret,
+                    mark: CaretMark::Active,
+                },
+            );
+        }
+    }
+
+    // Split view and compare panes (slice R5c): painted over
+    // the main pass — the split repaints both panes inside their
+    // own bounds (the main pass painted the focused pane across
+    // the full canvas), and the compare paints its right pane.
+    if layout.split_div.is_some() {
+        if let Some((trows, hrows)) = &split_rows {
+            paint_split(app, trows, hrows, &layout, &paint);
+        }
+    }
+    if layout.compare_div.is_some() {
+        if let Some(crows) = &cmp_rows {
+            paint_compare_pane(app, crows, &layout);
         }
     }
 
     // The column ruler (roadmap item 21): a quiet 1-DIP vertical
     // guideline at the configured character column, text mode only.
     // With wrap, the filter, or the grid up, character columns no
-    // longer map to one fixed x, so the ruler steps aside.
+    // longer map to one fixed x, so the ruler steps aside. In the
+    // split view `paint_split` draws it inside the text pane.
     if app.settings.ruler_column > 0
         && matches!(rows, RowData::Text(_))
         && !wrap_active(app)
         && !in_filter
         && grid.is_none()
+        && layout.split_div.is_none()
     {
         let x = layout.gutter_w + TEXT_PAD + app.settings.ruler_column as f32 * app.char_w;
         if x > layout.gutter_w && x < layout.editor_right - SCROLLBAR_W {
@@ -4031,7 +4322,10 @@ fn render(app: &mut App) {
     // and edits refresh it with no extra plumbing.
     app.bit_boxes.clear();
     app.bit_mirror = None;
-    if app.settings.inspector_open {
+    // The inspector steps aside while a compare is open (slice
+    // R5c): the compare pane owns the right side. Its open state
+    // is preserved and it returns when the compare closes.
+    if app.settings.inspector_open && app.compare.is_none() {
         let panel_left = layout.editor_right;
         fill_rect(
             fill,
@@ -4342,6 +4636,675 @@ fn render(app: &mut App) {
 /// the caller (the caret's line normally, the cursor row in the
 /// filter view).
 #[allow(clippy::too_many_arguments)]
+/// How the caret byte shows in a hex pane (slice R5c): the
+/// live caret (blinking, accent, focus-gated — the single-pane
+/// behaviour), or a passive marker (the same box, always drawn,
+/// in the muted tone: the caret's byte as seen from the split's
+/// other pane).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaretMark {
+    Active,
+    Passive,
+}
+
+/// The facts one hex pane's painting needs beyond its rows.
+struct HexRowPaint<'a> {
+    selection: Option<(u64, u64)>,
+    bookmarks: &'a [crate::bookmarks::Bookmark],
+    caret: u64,
+    mark: CaretMark,
+}
+
+/// Paint hex rows into the pane whose gutter starts at `x0`
+/// (DIPs), whose gutter is `gutter_w` wide and whose content
+/// ends at `right`, rows running from `rows_top` to
+/// `rows_bottom`. This is the single hex renderer: the
+/// single-pane view calls it over the whole canvas, the split
+/// view over the right pane (slice R5c) — the rows themselves
+/// come from whichever editor owns the pane.
+#[allow(clippy::too_many_arguments)]
+fn paint_hex_rows(
+    app: &App,
+    hex_rows: &[crate::editor::HexRow],
+    x0: f32,
+    gutter_w: f32,
+    right: f32,
+    rows_top: f32,
+    rows_bottom: f32,
+    paint: &HexRowPaint,
+) {
+    if app.target.is_null() || app.brushes.is_none() {
+        return;
+    }
+    let target = app.target;
+    let brushes = app.brushes.as_ref().expect("checked above");
+    let format = app.text_format;
+    let fill: RtFillRect = unsafe { vfn(target, SLOT_RT_FILL_RECTANGLE) };
+    let draw: RtDrawText = unsafe { vfn(target, SLOT_RT_DRAW_TEXT) };
+    let selection = paint.selection;
+    let bookmark_entries = paint.bookmarks;
+    let caret = paint.caret;
+    // Column geometry follows the current hex layout
+    // (roadmap items 13/14): the ASCII column starts after
+    // the formatted hex text plus a two-cell gap.
+    let hex_layout = app.editor.hex_layout();
+    let hex_x = x0 + gutter_w + TEXT_PAD;
+    let ascii_x = hex_x
+        + (hexview::hex_text_len(hex_layout.bytes_per_row as usize, &hex_layout) + 2) as f32
+            * app.char_w;
+    let mark_caret = match paint.mark {
+        CaretMark::Active => app.has_focus && app.caret_on,
+        CaretMark::Passive => true,
+    };
+    let mark_brush = if paint.mark == CaretMark::Passive {
+        brushes.muted
+    } else {
+        brushes.accent
+    };
+    for (i, row) in hex_rows.iter().enumerate() {
+        let y = rows_top + i as f32 * app.line_h;
+        if y >= rows_bottom {
+            break;
+        }
+        if caret >= row.address && caret < row.address + row.len {
+            // The same current-line band as text mode
+            // (polish pass), text area only, drawn before
+            // the selection cells and the row's text.
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: x0 + gutter_w,
+                    top: y,
+                    right,
+                    bottom: y + app.line_h,
+                },
+                brushes.band,
+            );
+        }
+        // Selection: one background cell per selected byte.
+        if let Some((ss, se)) = selection {
+            let from = ss.max(row.address);
+            let to = se.min(row.address + row.len);
+            let mut byte = from;
+            while byte < to {
+                let idx = (byte - row.address) as usize;
+                // The byte's hex cell sits where its digits
+                // are displayed (grouping and big-endian
+                // order move it; the ASCII cell never moves).
+                let cell = hexview::byte_char_col(idx, row.len as usize, &hex_layout) as f32;
+                fill_rect(
+                    fill,
+                    target,
+                    D2dRectF {
+                        left: hex_x + cell * app.char_w,
+                        top: y,
+                        right: hex_x + (cell + 2.0) * app.char_w,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.selection,
+                );
+                fill_rect(
+                    fill,
+                    target,
+                    D2dRectF {
+                        left: ascii_x + idx as f32 * app.char_w,
+                        top: y,
+                        right: ascii_x + (idx as f32 + 1.0) * app.char_w,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.selection,
+                );
+                byte += 1;
+            }
+        }
+        // Bookmark marker (roadmap item 20): the same
+        // square as text mode, at the gutter's right edge
+        // here — the address text starts at the left. Its
+        // colour is the bookmark's annotation colour, or
+        // the accent (slice R4c, item 5).
+        let bm_at = bookmark_entries.partition_point(|b| b.offset < row.address);
+        if matches!(bookmark_entries.get(bm_at), Some(b) if b.offset < row.address + row.len) {
+            let size = 6.0;
+            let my = y + (app.line_h - size) / 2.0;
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: x0 + gutter_w - 2.0 - size,
+                    top: my,
+                    right: x0 + gutter_w - 2.0,
+                    bottom: my + size,
+                },
+                bookmark_brush(brushes, &bookmark_entries[bm_at]),
+            );
+        }
+        // The address column: absolute offsets, or — while
+        // relative offsets are on (roadmap item 16) — the
+        // signed distance from the base, in the same 16
+        // characters (a leading minus replaces one zero).
+        let address = if app.rel_offsets {
+            let rel = row.address as i128 - app.rel_base as i128;
+            if rel < 0 {
+                format!("-{:015X}", -rel)
+            } else {
+                format!("{:016X}", rel)
+            }
+        } else {
+            format!("{:016X}", row.address)
+        };
+        // The caret row's address takes the accent colour,
+        // mirroring the current line number in text mode;
+        // other rows take the same brightened gutter tone
+        // as text-mode line numbers (polish pass).
+        let address_brush = if caret >= row.address && caret < row.address + row.len {
+            brushes.accent
+        } else {
+            brushes.gutter_num
+        };
+        draw_text(
+            draw,
+            target,
+            format,
+            &address,
+            D2dRectF {
+                left: x0 + TEXT_PAD,
+                top: y,
+                right: x0 + gutter_w,
+                bottom: y + app.line_h,
+            },
+            address_brush,
+        );
+        draw_text(
+            draw,
+            target,
+            format,
+            &row.hex,
+            D2dRectF {
+                left: hex_x,
+                top: y,
+                right: ascii_x,
+                bottom: y + app.line_h,
+            },
+            brushes.text,
+        );
+        draw_text(
+            draw,
+            target,
+            format,
+            &row.ascii,
+            D2dRectF {
+                left: ascii_x,
+                top: y,
+                right,
+                bottom: y + app.line_h,
+            },
+            brushes.text,
+        );
+        // Caret: an outline box around the current byte (the
+        // passive marker draws the same box, unconditionally
+        // and muted).
+        if mark_caret && caret >= row.address && caret <= row.address + row.len {
+            let idx = (caret.min(row.address + row.len.saturating_sub(1)) - row.address) as usize;
+            if row.len > 0 {
+                let cell = hexview::byte_char_col(idx, row.len as usize, &hex_layout) as f32;
+                let cx0 = hex_x + cell * app.char_w;
+                let cx1 = cx0 + 2.0 * app.char_w;
+                let t = 1.5f32;
+                for r in [
+                    D2dRectF {
+                        left: cx0,
+                        top: y,
+                        right: cx1,
+                        bottom: y + t,
+                    },
+                    D2dRectF {
+                        left: cx0,
+                        top: y + app.line_h - t,
+                        right: cx1,
+                        bottom: y + app.line_h,
+                    },
+                    D2dRectF {
+                        left: cx0,
+                        top: y,
+                        right: cx0 + t,
+                        bottom: y + app.line_h,
+                    },
+                    D2dRectF {
+                        left: cx1 - t,
+                        top: y,
+                        right: cx1,
+                        bottom: y + app.line_h,
+                    },
+                ] {
+                    fill_rect(fill, target, r, mark_brush);
+                }
+            }
+        }
+    }
+}
+
+/// Tie the compare pane's scroll to the document's (slice
+/// R5c): the right editor's first line (text) or row (hex) is
+/// the left's plus the pairing delta, clamped to the right
+/// document. Runs in `render`'s prologue, before rows gather.
+fn compare_sync_scroll(app: &mut App) {
+    let Some(cmp) = &mut app.compare else {
+        return;
+    };
+    match app.editor.mode() {
+        EditorMode::Text => {
+            let total = cmp.editor.line_count();
+            let first = crate::panes::follow_first(app.editor.first_line(), cmp.delta, total);
+            cmp.editor.set_first_line(first);
+        }
+        EditorMode::Hex => {
+            let total = hexview::row_count_w(
+                cmp.editor.total_len(),
+                cmp.editor.hex_layout().bytes_per_row,
+            );
+            let first = crate::panes::follow_first(app.editor.first_row(), cmp.delta, total);
+            cmp.editor.set_first_row(first);
+        }
+    }
+}
+
+/// Paint the split view's two panes (slice R5c): the text
+/// representation on the left of the divider, the hex on the
+/// right, both from the one editor. The main pass already
+/// painted the focused pane across the full canvas, so this
+/// first re-clears the rows strip, then repaints each pane
+/// inside its own bounds with the ordinary renderers — the
+/// text rows through `paint_text_row` with a pane layout, the
+/// hex rows through `paint_hex_rows`. The unfocused pane's
+/// caret position shows as a passive marker.
+fn paint_split(
+    app: &App,
+    trows: &[DisplayRow],
+    hrows: &[crate::editor::HexRow],
+    layout: &Layout,
+    paint: &RowPaint,
+) {
+    let Some(div) = layout.split_div else {
+        return;
+    };
+    if app.target.is_null() || app.brushes.is_none() {
+        return;
+    }
+    let target = app.target;
+    let brushes = app.brushes.as_ref().expect("checked above");
+    let fill: RtFillRect = unsafe { vfn(target, SLOT_RT_FILL_RECTANGLE) };
+    let hex_focused = app.editor.mode() == EditorMode::Hex;
+    let rtop = layout.rows_top;
+    let rbottom = layout.rows_bottom;
+    let tg = layout.text_gutter;
+    let hg = hex_gutter_w(app);
+    let hex_x0 = div + DIVIDER_W;
+    // Re-clear the rows strip, then the two gutter backgrounds.
+    fill_rect(
+        fill,
+        target,
+        D2dRectF {
+            left: 0.0,
+            top: rtop,
+            right: layout.editor_right,
+            bottom: rbottom,
+        },
+        brushes.bg,
+    );
+    fill_rect(
+        fill,
+        target,
+        D2dRectF {
+            left: 0.0,
+            top: rtop,
+            right: tg,
+            bottom: rbottom,
+        },
+        brushes.gutter,
+    );
+    fill_rect(
+        fill,
+        target,
+        D2dRectF {
+            left: hex_x0,
+            top: rtop,
+            right: hex_x0 + hg,
+            bottom: rbottom,
+        },
+        brushes.gutter,
+    );
+    // The text pane, through the ordinary text renderer with a
+    // pane-bounded layout.
+    let mut pane_layout = *layout;
+    pane_layout.gutter_w = tg;
+    pane_layout.editor_right = div;
+    let text_paint = RowPaint {
+        caret_live: !hex_focused,
+        ..*paint
+    };
+    for (i, row) in trows.iter().enumerate() {
+        let y = rtop + i as f32 * app.line_h;
+        if y >= rbottom {
+            break;
+        }
+        paint_text_row(
+            app,
+            row,
+            y,
+            &pane_layout,
+            row.line_no == paint.caret_line,
+            &text_paint,
+        );
+    }
+    // The passive caret marker in the text pane while hex has
+    // focus: a muted bar at the caret's cell.
+    if hex_focused {
+        for (i, row) in trows.iter().enumerate() {
+            if row.line_no != paint.caret_line {
+                continue;
+            }
+            let y = rtop + i as f32 * app.line_h;
+            if y >= rbottom {
+                break;
+            }
+            let row_chars = row.text.chars().count() as u64;
+            if paint.caret_col < row.char_start || paint.caret_col > row.char_start + row_chars {
+                continue;
+            }
+            let col = if paint.seg_mode {
+                seg_cell_of(
+                    &build_segments(&row.text, row.char_start, app.ansi_on, app.ctl_on),
+                    paint.caret_col,
+                )
+            } else {
+                paint.caret_col - row.char_start
+            };
+            let x = tg + TEXT_PAD + col as f32 * app.char_w;
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: x,
+                    top: y,
+                    right: x + 2.0,
+                    bottom: y + app.line_h,
+                },
+                brushes.muted,
+            );
+        }
+    }
+    // The column ruler inside the text pane, under the same
+    // conditions as the single-pane ruler.
+    if app.settings.ruler_column > 0 && !wrap_active(app) {
+        let x = tg + TEXT_PAD + app.settings.ruler_column as f32 * app.char_w;
+        if x > tg && x < div {
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: x,
+                    top: rtop,
+                    right: x + 1.0,
+                    bottom: rbottom,
+                },
+                brushes.line,
+            );
+        }
+    }
+    // The hex pane, through the shared hex renderer.
+    paint_hex_rows(
+        app,
+        hrows,
+        hex_x0,
+        hg,
+        layout.editor_right,
+        rtop,
+        rbottom,
+        &HexRowPaint {
+            selection: paint.selection,
+            bookmarks: paint.bookmarks,
+            caret: app.editor.caret(),
+            mark: if hex_focused {
+                CaretMark::Active
+            } else {
+                CaretMark::Passive
+            },
+        },
+    );
+    // The divider and the focus bar.
+    paint_divider(app, div, layout);
+    let (fx0, fx1) = if hex_focused {
+        (hex_x0, layout.editor_right)
+    } else {
+        (0.0, div)
+    };
+    fill_rect(
+        fill,
+        target,
+        D2dRectF {
+            left: fx0,
+            top: rtop,
+            right: fx1,
+            bottom: rtop + 2.0,
+        },
+        brushes.accent,
+    );
+}
+
+/// The split/compare divider: a panel band with a one-DIP
+/// centre line, in the accent while hovered or dragged.
+fn paint_divider(app: &App, div: f32, layout: &Layout) {
+    if app.target.is_null() || app.brushes.is_none() {
+        return;
+    }
+    let target = app.target;
+    let brushes = app.brushes.as_ref().expect("checked above");
+    let fill: RtFillRect = unsafe { vfn(target, SLOT_RT_FILL_RECTANGLE) };
+    fill_rect(
+        fill,
+        target,
+        D2dRectF {
+            left: div,
+            top: layout.editor_top,
+            right: div + DIVIDER_W,
+            bottom: layout.rows_bottom,
+        },
+        brushes.panel,
+    );
+    let line_brush = if app.split_div_hover || app.divider_drag.is_some() {
+        brushes.accent
+    } else {
+        brushes.line
+    };
+    fill_rect(
+        fill,
+        target,
+        D2dRectF {
+            left: div + 2.0,
+            top: layout.editor_top,
+            right: div + 3.0,
+            bottom: layout.rows_bottom,
+        },
+        line_brush,
+    );
+}
+
+/// Paint the compare's right pane (slice R5c): the second
+/// file's rows, plainly — line numbers or addresses in the
+/// gutter tone, text in the text colour, difference bands in
+/// text mode. No caret, no selection, no editing affordance of
+/// any kind: the pane is a reading surface.
+fn paint_compare_pane(app: &App, rows: &CmpRows, layout: &Layout) {
+    let Some(div) = layout.compare_div else {
+        return;
+    };
+    let Some(cmp) = &app.compare else {
+        return;
+    };
+    if app.target.is_null() || app.brushes.is_none() {
+        return;
+    }
+    let target = app.target;
+    let brushes = app.brushes.as_ref().expect("checked above");
+    let format = app.text_format;
+    let fill: RtFillRect = unsafe { vfn(target, SLOT_RT_FILL_RECTANGLE) };
+    let draw: RtDrawText = unsafe { vfn(target, SLOT_RT_DRAW_TEXT) };
+    let x0 = div + DIVIDER_W;
+    let rtop = layout.rows_top;
+    let rbottom = layout.rows_bottom;
+    let width = layout.width;
+    fill_rect(
+        fill,
+        target,
+        D2dRectF {
+            left: x0,
+            top: rtop,
+            right: width,
+            bottom: rbottom,
+        },
+        brushes.bg,
+    );
+    match rows {
+        CmpRows::Text {
+            rows: trows,
+            gutter_w: tg,
+        } => {
+            let tg = *tg;
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: x0,
+                    top: rtop,
+                    right: x0 + tg,
+                    bottom: rbottom,
+                },
+                brushes.gutter,
+            );
+            let regions = cmp.diff.as_ref().map(|r| r.regions.as_slice());
+            for (i, row) in trows.iter().enumerate() {
+                let y = rtop + i as f32 * app.line_h;
+                if y >= rbottom {
+                    break;
+                }
+                if let Some(regions) = regions {
+                    if let Some(idx) = crate::panes::region_index_at_right(regions, row.line_no) {
+                        let brush = if cmp.current == Some(idx) {
+                            brushes.diff_bg_hot
+                        } else {
+                            brushes.diff_bg
+                        };
+                        fill_rect(
+                            fill,
+                            target,
+                            D2dRectF {
+                                left: x0,
+                                top: y,
+                                right: width,
+                                bottom: y + app.line_h,
+                            },
+                            brush,
+                        );
+                    }
+                }
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &format!("{}", row.line_no + 1),
+                    D2dRectF {
+                        left: x0 + TEXT_PAD,
+                        top: y,
+                        right: x0 + tg - TEXT_PAD,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.gutter_num,
+                );
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &row.text,
+                    D2dRectF {
+                        left: x0 + tg + TEXT_PAD,
+                        top: y,
+                        right: width,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.text,
+                );
+            }
+        }
+        CmpRows::Hex(hrows) => {
+            let hg = hex_gutter_w(app);
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: x0,
+                    top: rtop,
+                    right: x0 + hg,
+                    bottom: rbottom,
+                },
+                brushes.gutter,
+            );
+            let hex_layout = cmp.editor.hex_layout();
+            let hex_x = x0 + hg + TEXT_PAD;
+            let ascii_x = hex_x
+                + (hexview::hex_text_len(hex_layout.bytes_per_row as usize, &hex_layout) + 2)
+                    as f32
+                    * app.char_w;
+            for (i, row) in hrows.iter().enumerate() {
+                let y = rtop + i as f32 * app.line_h;
+                if y >= rbottom {
+                    break;
+                }
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &format!("{:016X}", row.address),
+                    D2dRectF {
+                        left: x0 + TEXT_PAD,
+                        top: y,
+                        right: x0 + hg,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.gutter_num,
+                );
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &row.hex,
+                    D2dRectF {
+                        left: hex_x,
+                        top: y,
+                        right: ascii_x,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.text,
+                );
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &row.ascii,
+                    D2dRectF {
+                        left: ascii_x,
+                        top: y,
+                        right: width,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.text,
+                );
+            }
+        }
+    }
+    paint_divider(app, div, layout);
+}
+
 fn paint_text_row(
     app: &App,
     row: &DisplayRow,
@@ -4392,6 +5355,31 @@ fn paint_text_row(
             },
             brushes.band,
         );
+    }
+    // Difference band (slice R5c): while a compare report is
+    // held, a row inside a differing region of the left document
+    // takes the diff tint across the whole pane width, gutter
+    // included — the region reads as one block, paired with the
+    // band in the compare pane. The current region is hotter.
+    if let Some(regions) = paint.diff {
+        if let Some(idx) = crate::panes::region_index_at_left(regions, row.line_no) {
+            let brush = if paint.diff_current == Some(idx) {
+                brushes.diff_bg_hot
+            } else {
+                brushes.diff_bg
+            };
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: layout.origin_x,
+                    top: y,
+                    right: layout.editor_right,
+                    bottom: y + app.line_h,
+                },
+                brush,
+            );
+        }
     }
     // Find-match highlights (never in the filter view: the document
     // caret and its matches are frozen there and painting them
@@ -4598,7 +5586,12 @@ fn paint_text_row(
     }
     // Caret: a 2px accent bar at the caret's cell, on the segment
     // that holds it (the line-end caret belongs to the last one).
-    if app.has_focus && app.caret_on && !paint.in_filter && row.line_no == paint.caret_line {
+    if app.has_focus
+        && app.caret_on
+        && paint.caret_live
+        && !paint.in_filter
+        && row.line_no == paint.caret_line
+    {
         let in_segment = paint.caret_col >= row.char_start
             && (paint.caret_col < row.char_start + seg_chars
                 || (paint.caret_col == paint.caret_line_chars
@@ -4891,6 +5884,28 @@ fn pos_to_offset_grid(app: &mut App, x: f32, row_in_view: usize) -> u64 {
 fn pos_to_offset(app: &mut App, x_px: i32, y_px: i32) -> u64 {
     let layout = compute_layout(app);
     let x = app.dip(x_px);
+    // In the split view the pane under the pointer decides the
+    // representation the click resolves through (slice R5c):
+    // the same maths, run against the pane's own layout.
+    if let Some(div) = layout.split_div {
+        if x >= div + DIVIDER_W {
+            let mut pane = layout;
+            pane.origin_x = div + DIVIDER_W;
+            pane.gutter_w = hex_gutter_w(app);
+            return pos_to_offset_in(app, x_px, y_px, &pane, EditorMode::Hex);
+        }
+        let mut pane = layout;
+        pane.gutter_w = layout.text_gutter;
+        return pos_to_offset_in(app, x_px, y_px, &pane, EditorMode::Text);
+    }
+    pos_to_offset_in(app, x_px, y_px, &layout, app.editor.mode())
+}
+
+/// The click→offset maths against an explicit pane layout and
+/// representation (the single-pane path passes the canvas
+/// layout and the editor's mode).
+fn pos_to_offset_in(app: &mut App, x_px: i32, y_px: i32, layout: &Layout, mode: EditorMode) -> u64 {
+    let x = app.dip(x_px);
     let y = app.dip(y_px);
     let row_in_view = ((y - layout.rows_top) / app.line_h.max(1.0)).floor();
     if row_in_view < 0.0 {
@@ -4901,7 +5916,7 @@ fn pos_to_offset(app: &mut App, x_px: i32, y_px: i32) -> u64 {
         // an editor click: keep the caret where it is.
         return app.editor.caret();
     }
-    match app.editor.mode() {
+    match mode {
         EditorMode::Text => {
             // Text clicks resolve through the same display rows the
             // painter uses (R4b), so wrap segments, frozen lines and
@@ -4913,7 +5928,10 @@ fn pos_to_offset(app: &mut App, x_px: i32, y_px: i32) -> u64 {
                 return pos_to_offset_grid(app, x, row_in_view as usize);
             }
             let page = page_rows(app) as usize + 1;
-            let disp = display_rows(app, page);
+            // The model directly (not the mode-guarded
+            // `display_rows`): a split text-pane click resolves
+            // while the editor's mode is hex.
+            let disp = display_rows_model(app, page);
             if disp.is_empty() {
                 return 0;
             }
@@ -4922,7 +5940,7 @@ fn pos_to_offset(app: &mut App, x_px: i32, y_px: i32) -> u64 {
                 let row = &disp[idx];
                 (row.line_no, row.char_start, row.text.clone())
             };
-            let cell = ((x - layout.gutter_w - TEXT_PAD) / app.char_w.max(1.0))
+            let cell = ((x - layout.origin_x - layout.gutter_w - TEXT_PAD) / app.char_w.max(1.0))
                 .floor()
                 .max(0.0) as u64;
             let col = if app.ansi_on || app.ctl_on {
@@ -4945,7 +5963,7 @@ fn pos_to_offset(app: &mut App, x_px: i32, y_px: i32) -> u64 {
             let row = (app.editor.first_row() + row_in_view as u64).min(total_rows - 1);
             let row_start = hexview::row_offset_w(row, width);
             let row_len = width.min(app.editor.total_len() - row_start);
-            let hex_x = layout.gutter_w + TEXT_PAD;
+            let hex_x = layout.origin_x + layout.gutter_w + TEXT_PAD;
             let ascii_x = hex_x
                 + (hexview::hex_text_len(width as usize, &hex_layout) + 2) as f32 * app.char_w;
             let byte = if x >= ascii_x {
@@ -5758,6 +6776,10 @@ fn try_follow_growth(
 /// Open `path` in the window: memory-mapped, encoding detected, index
 /// building in the background. Errors are reported, never fatal.
 fn open_document(app: &mut App, path: &Path) {
+    // A fresh document replaces the compared one (slice R5c):
+    // the compare session closes rather than pairing against a
+    // document it never diffed.
+    close_compare(app);
     let mmap = match MmapFile::open(path) {
         Ok(mmap) => Arc::new(mmap),
         Err(err) => {
@@ -6035,6 +7057,9 @@ fn clear_find_bar_texts(app: &mut App) {
 /// hex layout re-syncs, interaction transients reset, and the
 /// strip scrolls the active tab into view.
 fn after_tab_switch(app: &mut App) {
+    // The compare belongs to the window, not the tab (slice
+    // R5c): switching tabs closes it.
+    close_compare(app);
     let find_show = if app.find_visible { SW_SHOW } else { SW_HIDE };
     for hwnd in app
         .find_controls
@@ -6759,6 +7784,24 @@ fn note_fast_clone_fallback(app: &mut App, report: &crate::save::SaveReport) {
     }
 }
 
+/// After a successful save (slice R5c): a save with an armed
+/// line-ending or byte-order-mark conversion rewrites the
+/// document's bytes, which stales an open compare's computed
+/// differences exactly like an edit does. (A plain save changes
+/// nothing in the document, so its regions stay valid.)
+fn note_saved(app: &mut App) {
+    if app.compare.is_some()
+        && (app.save_eol != crate::save::EolChoice::Keep
+            || app.save_bom != crate::save::BomChoice::Keep)
+    {
+        if let Some(cmp) = &mut app.compare {
+            cmp.diff_stale = true;
+            cmp.diff_gen += 1;
+            cmp.diff_computing = false;
+        }
+    }
+}
+
 fn do_save(app: &mut App) -> bool {
     if app.editor.path().is_none() {
         return do_save_as(app);
@@ -6789,6 +7832,7 @@ fn do_save(app: &mut App) -> bool {
             app.last_edit = None;
             after_save_tracking(app, false);
             note_fast_clone_fallback(app, &report);
+            note_saved(app);
             refresh_title(app);
             refresh_status(app);
             true
@@ -6824,6 +7868,7 @@ fn do_save_as(app: &mut App) -> bool {
             app.last_edit = None;
             after_save_tracking(app, true);
             note_fast_clone_fallback(app, &report);
+            note_saved(app);
             let path_string = path.to_string_lossy().into_owned();
             app.settings.add_recent(&path_string);
             save_settings(app);
@@ -8306,6 +9351,348 @@ fn show_compare_dialog(app: &mut App, slot: CompareSlot) -> Option<u64> {
 /// file; the structural-diff core compares block by block on a
 /// worker (1 MB blocks, hand-written SHA-256), and the results
 /// dialog's Go to jumps the caret to a differing region.
+/// Spawn the compare file's staged line-index build (slice
+/// R5c): the same resumable builder and slot discipline as the
+/// document's own index, against the compare's own slot/epoch.
+fn spawn_compare_index_thread(
+    slot: std::sync::Arc<std::sync::Mutex<Option<(u64, IndexProgress)>>>,
+    epoch: u64,
+    mmap: std::sync::Arc<MmapFile>,
+) {
+    std::thread::spawn(move || {
+        let total = mmap.len();
+        let mut builder = LineIndexBuilder::new(total);
+        loop {
+            let complete = builder.advance(
+                builder.indexed_bytes() + INDEX_PUBLISH_STEP,
+                |offset, out| {
+                    let bytes = mmap.as_slice();
+                    let start = offset as usize;
+                    if start >= bytes.len() {
+                        return 0;
+                    }
+                    let n = out.len().min(bytes.len() - start);
+                    out[..n].copy_from_slice(&bytes[start..start + n]);
+                    n
+                },
+            );
+            let mut superseded = false;
+            if let Ok(mut guard) = slot.lock() {
+                if let Some((held_epoch, _)) = guard.as_ref() {
+                    superseded = *held_epoch != epoch;
+                }
+                if !superseded {
+                    *guard = Some((
+                        epoch,
+                        IndexProgress {
+                            indexed_bytes: builder.indexed_bytes(),
+                            snapshot: builder.snapshot(),
+                        },
+                    ));
+                }
+            }
+            if complete || superseded {
+                break;
+            }
+        }
+    });
+}
+
+/// Open the side-by-side compare (slice R5c): the chosen file
+/// becomes a read-only pane on the right of the active
+/// document. Declined — with a status note, the shell's way —
+/// while the split view or a filter owns the canvas.
+fn open_compare(app: &mut App) {
+    if app.compare.is_some() {
+        close_compare(app);
+        return;
+    }
+    if app.settings.split_view {
+        app.status_note = Some(
+            "Turn off Split Text/Hex to compare side by side \u{2014} both need the right side."
+                .to_string(),
+        );
+        refresh_status(app);
+        invalidate(app);
+        return;
+    }
+    if app.filter.is_some() {
+        app.status_note = Some("Exit the filter view to compare side by side.".to_string());
+        refresh_status(app);
+        invalidate(app);
+        return;
+    }
+    let Some(path) = file_dialog(app, false, None) else {
+        return;
+    };
+    let mmap = match MmapFile::open(&path) {
+        Ok(mmap) => std::sync::Arc::new(mmap),
+        Err(err) => {
+            message_box(
+                app.hwnd,
+                &format!("Could not open {}:\n{err}", path.display()),
+                "VeloEdit",
+                MB_OK | MB_ICONERROR,
+            );
+            return;
+        }
+    };
+    let sample_len = (mmap.len() as usize).min(64 * 1024);
+    let detection = encoding::detect(&mmap.as_slice()[..sample_len]);
+    let table = if mmap.is_empty() {
+        PieceTable::new(0)
+    } else {
+        PieceTable::from_mapped(mmap.clone())
+    };
+    let mut editor = Editor::from_table(table, detection, Some(path.clone()), true);
+    editor.seed_line_index();
+    // Identical bytes-per-row from the start, so hex rows pair
+    // 1:1 between the panes.
+    editor.set_hex_layout(app.editor.hex_layout());
+    let index_slot: std::sync::Arc<std::sync::Mutex<Option<(u64, IndexProgress)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let indexing = if editor.has_complete_index() {
+        None
+    } else {
+        // The seeded head is in; the worker's publications keep
+        // this current from the first step on.
+        Some((0, mmap.len()))
+    };
+    spawn_compare_index_thread(index_slot.clone(), 1, mmap.clone());
+    app.compare = Some(CompareState {
+        editor,
+        path,
+        mmap: Some(mmap),
+        index_slot,
+        index_epoch: 1,
+        indexing,
+        diff_slot: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        diff_gen: 0,
+        diff: None,
+        diff_prefix: false,
+        diff_stale: false,
+        diff_computing: false,
+        current: None,
+        delta: 0,
+    });
+    if app.editor.mode() == EditorMode::Text {
+        start_diff(app);
+    }
+    refresh_menu_checks(app);
+    refresh_status(app);
+    invalidate(app);
+}
+
+/// Close the compare (slice R5c): the state drops; any worker
+/// still running publishes into the orphaned slots, which is
+/// harmless. The inspector, if open, takes its side back on the
+/// next paint.
+fn close_compare(app: &mut App) {
+    if app.compare.take().is_none() {
+        return;
+    }
+    refresh_menu_checks(app);
+    refresh_status(app);
+    invalidate(app);
+}
+
+/// Run the line diff over the two documents on a background
+/// worker (slice R5c): snapshots of both tables and whatever
+/// line indexes exist at launch go in; a side whose index is
+/// missing or dirty gets one built inside the worker from its
+/// snapshot, so the run is always over the documents as they
+/// stood when it started. A side whose index is still partial
+/// yields a prefix run, labelled as such.
+fn start_diff(app: &mut App) {
+    if app.compare.is_none() {
+        return;
+    }
+    let left_table = snapshot_table(app);
+    let left_index = app.editor.line_index_snapshot();
+    let doc_gen = app.doc_generation;
+    let (slot, right_table, right_index) = {
+        let cmp = app.compare.as_ref().expect("checked above");
+        let right_table = match &cmp.mmap {
+            Some(mmap) if !mmap.is_empty() => PieceTable::from_mapped(mmap.clone()),
+            _ => PieceTable::new(0),
+        };
+        (
+            cmp.diff_slot.clone(),
+            right_table,
+            cmp.editor.line_index_snapshot(),
+        )
+    };
+    let diff_gen = {
+        let cmp = app.compare.as_mut().expect("checked above");
+        cmp.diff_gen += 1;
+        cmp.diff_computing = true;
+        cmp.diff_stale = false;
+        cmp.diff_gen
+    };
+    if let Ok(mut guard) = slot.lock() {
+        *guard = None;
+    }
+    std::thread::spawn(move || {
+        let left = match left_index {
+            Some(index) => index,
+            None => {
+                let total = left_table.len();
+                LineIndex::build(total, |off, out| left_table.read_into(off, out))
+            }
+        };
+        let right = match right_index {
+            Some(index) => index,
+            None => {
+                let total = right_table.len();
+                LineIndex::build(total, |off, out| right_table.read_into(off, out))
+            }
+        };
+        let prefix = !left.is_complete() || !right.is_complete();
+        let (left_count, left_reader) =
+            crate::linediff::indexed_line_reader(&left, |off, out| left_table.read_into(off, out));
+        let (right_count, right_reader) =
+            crate::linediff::indexed_line_reader(&right, |off, out| {
+                right_table.read_into(off, out)
+            });
+        let report =
+            crate::linediff::compare_lines(left_count, left_reader, right_count, right_reader);
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(DiffProgress {
+                diff_gen,
+                doc_gen,
+                report,
+                prefix,
+            });
+        }
+    });
+}
+
+/// Service the compare on the tick (slice R5c): attach the
+/// right file's index publications, attach a finished diff
+/// whose generations still match, and — once, when a prefix
+/// run's indexes have both completed — rerun the diff over the
+/// whole documents.
+fn service_compare(app: &mut App) {
+    if app.compare.is_none() {
+        return;
+    }
+    let mut changed = false;
+    // Index publications for the compare file.
+    let publication = {
+        let cmp = app.compare.as_ref().expect("checked above");
+        match cmp.index_slot.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        }
+    };
+    if let Some((epoch, progress)) = publication {
+        let cmp = app.compare.as_mut().expect("checked above");
+        if epoch == cmp.index_epoch {
+            let total = cmp.editor.total_len();
+            cmp.editor.attach_line_index(progress.snapshot);
+            cmp.indexing = if cmp.editor.has_complete_index() {
+                None
+            } else {
+                Some((progress.indexed_bytes, total))
+            };
+            changed = true;
+        }
+    }
+    // A finished diff whose generations still match.
+    let result = {
+        let cmp = app.compare.as_ref().expect("checked above");
+        match cmp.diff_slot.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(_) => None,
+        }
+    };
+    let doc_gen = app.doc_generation;
+    if let Some(done) = result {
+        let cmp = app.compare.as_mut().expect("checked above");
+        if done.diff_gen == cmp.diff_gen && done.doc_gen == doc_gen {
+            cmp.diff = Some(done.report);
+            cmp.diff_prefix = done.prefix;
+            cmp.diff_computing = false;
+            if let Some(cur) = cmp.current {
+                let len = cmp.diff.as_ref().map(|r| r.regions.len()).unwrap_or(0);
+                if cur >= len {
+                    cmp.current = None;
+                }
+            }
+            changed = true;
+        }
+    }
+    // The one automatic rerun: a prefix result whose indexes
+    // have since completed.
+    let rerun = {
+        let cmp = app.compare.as_ref().expect("checked above");
+        cmp.diff_prefix
+            && !cmp.diff_stale
+            && !cmp.diff_computing
+            && app.editor.mode() == EditorMode::Text
+            && app.editor.has_complete_index()
+            && cmp.editor.has_complete_index()
+    };
+    if rerun {
+        start_diff(app);
+        changed = true;
+    }
+    if changed {
+        refresh_status(app);
+        invalidate(app);
+    }
+}
+
+/// Next/Previous Difference (slice R5c): jump the caret to the
+/// region's first line and pair the panes on it, so both scroll
+/// there together. Text mode only — hex compare is sync-scroll
+/// plus the structural dialog.
+fn diff_jump(app: &mut App, next: bool) {
+    if app.editor.mode() != EditorMode::Text {
+        app.status_note =
+            Some("Differences are computed in text mode; hex compare scrolls in step.".to_string());
+        refresh_status(app);
+        invalidate(app);
+        return;
+    }
+    let Some(cmp) = &app.compare else {
+        return;
+    };
+    let Some(report) = &cmp.diff else {
+        return;
+    };
+    if report.regions.is_empty() {
+        app.status_note = Some("No differences.".to_string());
+        refresh_status(app);
+        invalidate(app);
+        return;
+    }
+    let caret_line = app.editor.line_col_of(app.editor.caret()).0;
+    let current = cmp.current;
+    let regions = &report.regions;
+    let idx = if next {
+        crate::panes::next_region(regions, caret_line, current)
+    } else {
+        crate::panes::prev_region(regions, caret_line, current)
+    };
+    let Some(idx) = idx else {
+        return;
+    };
+    let region = regions[idx];
+    let offset = app.editor.line_start_byte(region.left_start).unwrap_or(0);
+    let from = app.editor.caret();
+    record_jump(app, from, offset);
+    app.editor.move_caret_to(offset, false);
+    app.editor.set_first_line(region.left_start);
+    app.caret_on = true;
+    if let Some(cmp) = &mut app.compare {
+        cmp.delta = crate::panes::jump_delta(region.left_start, region.right_start);
+        cmp.current = Some(idx);
+    }
+    refresh_status(app);
+    invalidate(app);
+}
+
 fn do_compare_with(app: &mut App) {
     let Some(other_path) = file_dialog(app, false, None) else {
         return;
@@ -10086,6 +11473,38 @@ fn tick_candidate_at(app: &mut App, x_dip: f32, y_dip: f32) -> Option<(u64, bool
 /// Two kinds of candidate share the one tracking tooltip:
 /// scrollbar ticks (a line preview) and tabs (the document's
 /// full path and state, roadmap item 39).
+/// The pane/divider explanation under the pointer (slice R5c),
+/// if any: the divider of the split view or the compare, the
+/// compare's read-only pane, and the split's two panes each
+/// carry a tooltip, like every other control.
+fn note_candidate_at(app: &mut App, x_dip: f32, y_dip: f32) -> Option<HoverKind> {
+    let layout = compute_layout(app);
+    if y_dip < layout.editor_top || y_dip > layout.rows_bottom {
+        return None;
+    }
+    if let Some(div) = layout.compare_div {
+        if (x_dip - div - DIVIDER_W / 2.0).abs() <= 4.0 {
+            return Some(HoverKind::Note("Drag to resize the panes"));
+        }
+        if x_dip >= div + DIVIDER_W {
+            return Some(HoverKind::Note(
+                "Compare pane \u{2014} read-only; it scrolls with the document",
+            ));
+        }
+        return None;
+    }
+    if let Some(div) = layout.split_div {
+        if (x_dip - div - DIVIDER_W / 2.0).abs() <= 4.0 {
+            return Some(HoverKind::Note("Drag to resize the panes"));
+        }
+        if x_dip < div {
+            return Some(HoverKind::Note("Text pane \u{2014} the document as text"));
+        }
+        return Some(HoverKind::Note("Hex pane \u{2014} the document as bytes"));
+    }
+    None
+}
+
 fn service_hover(app: &mut App) {
     if !app.hover_tool_ready || app.tooltip.is_null() {
         return;
@@ -10110,6 +11529,9 @@ fn service_hover(app: &mut App) {
                     tab_hit(app, app.dip(pt.x), app.dip(pt.y)),
                     TabHit::Tab(i) | TabHit::Close(i) if i == index
                 ),
+                HoverKind::Note(_) => {
+                    note_candidate_at(app, app.dip(pt.x), app.dip(pt.y)) == Some(shown)
+                }
             }
         };
         if !still {
@@ -10139,6 +11561,7 @@ fn service_hover(app: &mut App) {
                     }
                 }
                 HoverKind::Tab(index) => tab_tooltip_text(app, index),
+                HoverKind::Note(text) => text.to_string(),
             };
             set_hover_text(&text);
             show_hover_tooltip(app);
@@ -10818,6 +12241,9 @@ fn build_menus(app: &mut App) {
         menu_item(file, CMD_EXPORT_PATCH, "Export Delta Patch\u{2026}");
         menu_item(file, CMD_APPLY_PATCH, "Apply Patch\u{2026}");
         menu_item(file, CMD_COMPARE_WITH, "Compare With\u{2026}");
+        // Side-by-side visual diff (slice R5c): toggles the
+        // compare pane; checked while one is open.
+        menu_item(file, CMD_COMPARE_SIDE, "Compare Side by Side\u{2026}");
         // Save Options (roadmap items 31/32): two radio groups —
         // what happens to line endings and to the byte-order mark
         // on every save. The choices persist in settings.
@@ -10944,6 +12370,21 @@ fn build_menus(app: &mut App) {
             CMD_JUMP_FORWARD,
             &menu_label(app, "Forward", "jump_forward"),
         );
+        menu_sep(search);
+        // Side-by-side diff (slice R5c): recompute the regions,
+        // then walk them. All three grey unless a compare with
+        // computed differences is open (WM_INITMENUPOPUP).
+        menu_item(search, CMD_DIFF_RECOMPUTE, "Compare Differences");
+        menu_item(
+            search,
+            CMD_DIFF_NEXT,
+            &menu_label(app, "Next Difference", "diff_next"),
+        );
+        menu_item(
+            search,
+            CMD_DIFF_PREV,
+            &menu_label(app, "Previous Difference", "diff_prev"),
+        );
 
         let view = CreatePopupMenu();
         app.view_menu = view;
@@ -10952,6 +12393,11 @@ fn build_menus(app: &mut App) {
             view,
             CMD_MODE_HEX,
             &menu_label(app, "Hex Mode", "toggle_hex"),
+        );
+        menu_item(
+            view,
+            CMD_SPLIT_VIEW,
+            &menu_label(app, "Split Text/Hex", "toggle_split"),
         );
         menu_sep(view);
         menu_item(view, CMD_INSPECTOR, "Data Inspector");
@@ -11268,6 +12714,22 @@ fn refresh_menu_checks(app: &App) {
                 );
             }
         }
+        // Split view and compare checks (slice R5c): the split
+        // item is checked while the split is actually in effect
+        // (a filter or a compare suspends it, and the check
+        // tells that truth); the compare item while one is open.
+        CheckMenuItem(
+            app.view_menu,
+            CMD_SPLIT_VIEW as u32,
+            MF_BYCOMMAND | if split_active(app) { MF_CHECKED } else { 0 },
+        );
+        if !app.file_menu.is_null() {
+            CheckMenuItem(
+                app.file_menu,
+                CMD_COMPARE_SIDE as u32,
+                MF_BYCOMMAND | if app.compare.is_some() { MF_CHECKED } else { 0 },
+            );
+        }
         // Save Options radios (roadmap items 31/32).
         if !app.save_options_menu.is_null() {
             let eol_idx = match app.save_eol {
@@ -11533,6 +12995,14 @@ fn parse_hex(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Set the status bar's transient note and repaint: the
+/// shell's way of declining or explaining without a dialog.
+fn set_status_note(app: &mut App, text: &str) {
+    app.status_note = Some(text.to_string());
+    refresh_status(app);
+    invalidate(app);
+}
+
 fn on_command(app: &mut App, id: usize) {
     // The filter view is read-only: editing commands are refused
     // while it is up (typing itself is swallowed in on_char /
@@ -11790,14 +13260,62 @@ fn on_command(app: &mut App, id: usize) {
                 }
             }
         }
-        CMD_MODE_TEXT => set_mode(app, EditorMode::Text),
-        CMD_MODE_HEX => set_mode(app, EditorMode::Hex),
+        // Mode switches route through the split's focus switch
+        // (slice R5c): while split, Text/Hex choose which pane
+        // has the keyboard instead of replacing the view; with
+        // no split this is exactly `set_mode`.
+        CMD_MODE_TEXT => split_set_focus(app, false),
+        CMD_MODE_HEX => split_set_focus(app, true),
         CMD_MODE_TOGGLE => {
-            let next = match app.editor.mode() {
-                EditorMode::Text => EditorMode::Hex,
-                EditorMode::Hex => EditorMode::Text,
-            };
-            set_mode(app, next);
+            let hex = app.editor.mode() == EditorMode::Text;
+            split_set_focus(app, hex);
+        }
+        CMD_SPLIT_VIEW => {
+            // Text/hex split view (roadmap item 28, slice R5c).
+            // The split, a filter, frozen lines, and a compare
+            // each own the canvas in ways that do not compose;
+            // the declines are status notes, never half-states.
+            if app.compare.is_some() {
+                set_status_note(
+                    app,
+                    "Close the compare to split text and hex \u{2014} both need the right side.",
+                );
+            } else if !app.settings.split_view && app.filter.is_some() {
+                set_status_note(app, "Exit the filter view to split text and hex.");
+            } else if !app.settings.split_view && app.settings.freeze_lines > 0 {
+                set_status_note(
+                    app,
+                    "Unfreeze the top lines to split text and hex (Freeze Top Lines, 0 = off).",
+                );
+            } else {
+                app.settings.split_view = !app.settings.split_view;
+                save_settings(app);
+                if app.settings.split_view && app.grid_on {
+                    set_status_note(
+                        app,
+                        "The delimiter grid steps aside while split; it returns when split is off.",
+                    );
+                }
+                refresh_menu_checks(app);
+                sync_hex_layout(app);
+                refresh_status(app);
+                invalidate(app);
+            }
+        }
+        CMD_COMPARE_SIDE => open_compare(app),
+        CMD_DIFF_NEXT => diff_jump(app, true),
+        CMD_DIFF_PREV => diff_jump(app, false),
+        CMD_DIFF_RECOMPUTE => {
+            if app.compare.is_some() && app.editor.mode() == EditorMode::Text {
+                start_diff(app);
+                refresh_status(app);
+                invalidate(app);
+            } else if app.compare.is_some() {
+                set_status_note(
+                    app,
+                    "Differences are computed in text mode; hex compare scrolls in step.",
+                );
+            }
         }
         CMD_FONT_BIGGER | CMD_FONT_SMALLER => {
             let delta: i16 = if id == CMD_FONT_BIGGER { 2 } else { -2 };
@@ -11881,6 +13399,12 @@ fn on_command(app: &mut App, id: usize) {
         }
         CMD_GRID => {
             app.grid_on = !app.grid_on;
+            if app.grid_on && split_active(app) {
+                set_status_note(
+                    app,
+                    "The delimiter grid steps aside while split; it returns when split is off.",
+                );
+            }
             refresh_menu_checks(app);
             invalidate(app);
         }
@@ -11913,6 +13437,15 @@ fn on_command(app: &mut App, id: usize) {
         CMD_FREEZE => {
             // Freeze Top Lines (freeze pane): prompt for the count;
             // 0 clears. Persisted, so the choice survives restarts.
+            // The frozen block belongs to the single canvas: while
+            // split, freezing declines with a note (slice R5c).
+            if app.settings.split_view {
+                set_status_note(
+                    app,
+                    "Turn off Split Text/Hex to freeze lines \u{2014} the frozen block belongs to the single view.",
+                );
+                return;
+            }
             let current = app.settings.freeze_lines.to_string();
             if let Some(text) = show_prompt(
                 app,
@@ -11939,7 +13472,14 @@ fn on_command(app: &mut App, id: usize) {
             }
         }
         CMD_FILTER => {
-            open_filter_prompt(app);
+            // The filter view replaces the canvas; while split
+            // it declines with a note (slice R5c), the mirror of
+            // the split's own decline while a filter is up.
+            if app.settings.split_view {
+                set_status_note(app, "Turn off Split Text/Hex to use the filter view.");
+            } else {
+                open_filter_prompt(app);
+            }
         }
         CMD_CLEAR_FILTER => {
             exit_filter(app);
@@ -12276,6 +13816,7 @@ fn chord_from_vk(vk: u32, ctrl: bool, shift: bool, alt: bool) -> Option<crate::k
         0x09 => Key::Named(NamedKey::Tab), // VK_TAB: next/previous tab
         0xBB => Key::Char('+'),            // VK_OEM_PLUS
         0xBD => Key::Char('-'),            // VK_OEM_MINUS
+        0xDC => Key::Char('\\'),           // VK_OEM_5: Ctrl+\ toggles the split
         _ => return None,
     };
     Some(crate::keybindings::Chord {
@@ -12327,6 +13868,10 @@ fn dispatch_action(app: &mut App, action: &str) {
         "follow_tail" => on_command(app, CMD_FOLLOW_TAIL),
         "filter" => on_command(app, CMD_FILTER),
         "clear_filter" => on_command(app, CMD_CLEAR_FILTER),
+        // Split view and diff navigation (slice R5c).
+        "toggle_split" => on_command(app, CMD_SPLIT_VIEW),
+        "diff_next" => on_command(app, CMD_DIFF_NEXT),
+        "diff_prev" => on_command(app, CMD_DIFF_PREV),
         // Tabs (roadmap item 39, slice R5b).
         "new_tab" => on_command(app, CMD_NEW_TAB),
         "close_tab" => on_command(app, CMD_CLOSE_TAB),
@@ -12376,6 +13921,13 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
     }
     if action.is_none() && alt && (vk == 0x25 || vk == 0x27) {
         jump_history_move(app, vk == 0x27);
+        return true;
+    }
+    // Esc closes an open compare (slice R5c), whatever Esc is
+    // bound to — before the filter model, though a compare and
+    // a filter never coexist.
+    if vk == 0x1B && app.compare.is_some() {
+        close_compare(app);
         return true;
     }
     // The filter view has its own key model: Up/Down walk the row
@@ -12743,6 +14295,33 @@ fn on_mouse_down(app: &mut App, lparam: LPARAM, double: bool) {
         entropy_seek(app, xd);
         return;
     }
+    // Split/compare divider and panes (slice R5c): a press on
+    // the divider starts its drag; a press in the compare pane
+    // is swallowed whole (the pane takes no input at all); a
+    // press in the split's unfocused pane focuses that pane
+    // first, then lands as an ordinary press.
+    if yd >= layout.editor_top && yd <= layout.rows_bottom {
+        let active_div = layout.compare_div.or(layout.split_div);
+        if let Some(div) = active_div {
+            if (xd - div - DIVIDER_W / 2.0).abs() <= 4.0 {
+                app.divider_drag = Some(xd - div);
+                // SAFETY: capture the mouse for the drag; released on button up.
+                unsafe { SetCapture(app.hwnd) };
+                return;
+            }
+        }
+        if let Some(div) = layout.compare_div {
+            if xd >= div {
+                return;
+            }
+        } else if let Some(div) = layout.split_div {
+            let hex_side = xd >= div + DIVIDER_W;
+            let focused_hex = app.editor.mode() == EditorMode::Hex;
+            if hex_side != focused_hex {
+                split_set_focus(app, hex_side);
+            }
+        }
+    }
     // The filter banner and other chrome above the rows are not
     // editor clicks.
     if yd < layout.rows_top {
@@ -13066,6 +14645,15 @@ unsafe extern "system" fn wnd_proc(
             {
                 strings_wheel(app, wparam);
             } else {
+                // The wheel scrolls the split pane under the
+                // pointer (slice R5c): focus follows the pointer
+                // first, as a click would focus it.
+                if let Some(div) = layout.split_div {
+                    let hex_side = app.dip(pt.x) >= div + DIVIDER_W;
+                    if hex_side != (app.editor.mode() == EditorMode::Hex) {
+                        split_set_focus(app, hex_side);
+                    }
+                }
                 on_wheel(app, wparam);
             }
             0
@@ -13091,7 +14679,25 @@ unsafe extern "system" fn wnd_proc(
         WM_MOUSEMOVE => {
             let (mx, my) = mouse_xy(lparam);
             let (dx, dy) = (app.dip(mx), app.dip(my));
-            if app.tab_drag.is_some() {
+            if let Some(grab) = app.divider_drag {
+                // Divider drag (slice R5c): the divider tracks
+                // the pointer; the persisted ratio is clamped to
+                // the usable range, and a fit-to-window hex
+                // layout re-resolves against the new pane width.
+                let layout = compute_layout(app);
+                let right = if layout.compare_div.is_some() {
+                    layout.width
+                } else {
+                    layout.editor_right
+                };
+                let ratio = crate::panes::ratio_for_x(0.0, right, dx - grab);
+                let permille = (ratio * 1000.0).round().clamp(150.0, 850.0) as u16;
+                if permille != app.settings.split_ratio_permille {
+                    app.settings.split_ratio_permille = permille;
+                    sync_hex_layout(app);
+                }
+                invalidate(app);
+            } else if app.tab_drag.is_some() {
                 // Tab drag (roadmap item 39): track the pointer;
                 // past a small threshold the drag is live and the
                 // insertion marker paints.
@@ -13144,23 +14750,49 @@ unsafe extern "system" fn wnd_proc(
                         app.tab_plus_hover = false;
                         invalidate(app);
                     }
-                    // Tick hover preview (item 24 expansion):
-                    // track the candidate under the pointer; the
-                    // tick service shows it once it settles.
-                    match tick_candidate_at(app, dx, dy) {
-                        Some((offset, is_bookmark)) => {
-                            let settled = matches!(
-                                app.hover_cand,
-                                Some((HoverKind::Tick(o, b), _)) if o == offset && b == is_bookmark
-                            );
+                    // Divider hover (slice R5c): the band
+                    // lights up while the pointer rests on it.
+                    let hover_layout = compute_layout(app);
+                    let hover_div = hover_layout.compare_div.or(hover_layout.split_div);
+                    let over_div = matches!(hover_div, Some(d)
+                        if (dx - d - DIVIDER_W / 2.0).abs() <= 4.0
+                            && dy >= hover_layout.editor_top
+                            && dy <= hover_layout.rows_bottom);
+                    if over_div != app.split_div_hover {
+                        app.split_div_hover = over_div;
+                        invalidate(app);
+                    }
+                    // Pane/divider explanations (slice R5c) win
+                    // over the tick previews below.
+                    match note_candidate_at(app, dx, dy) {
+                        Some(kind) => {
+                            let settled = matches!(app.hover_cand, Some((k, _)) if k == kind);
                             if !settled {
-                                app.hover_cand =
-                                    Some((HoverKind::Tick(offset, is_bookmark), Instant::now()));
+                                app.hover_cand = Some((kind, Instant::now()));
                             }
                         }
                         None => {
-                            app.hover_cand = None;
-                            hide_hover(app);
+                            // Tick hover preview (item 24 expansion):
+                            // track the candidate under the pointer; the
+                            // tick service shows it once it settles.
+                            match tick_candidate_at(app, dx, dy) {
+                                Some((offset, is_bookmark)) => {
+                                    let settled = matches!(
+                                        app.hover_cand,
+                                        Some((HoverKind::Tick(o, b), _)) if o == offset && b == is_bookmark
+                                    );
+                                    if !settled {
+                                        app.hover_cand = Some((
+                                            HoverKind::Tick(offset, is_bookmark),
+                                            Instant::now(),
+                                        ));
+                                    }
+                                }
+                                None => {
+                                    app.hover_cand = None;
+                                    hide_hover(app);
+                                }
+                            }
                         }
                     }
                 }
@@ -13168,7 +14800,13 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_LBUTTONUP => {
-            if let Some(drag) = app.tab_drag.take() {
+            if app.divider_drag.take().is_some() {
+                // The divider's resting place persists (slice
+                // R5c), like the window's own geometry.
+                save_settings(app);
+                // SAFETY: pairs with the SetCapture at divider grab.
+                unsafe { ReleaseCapture() };
+            } else if let Some(drag) = app.tab_drag.take() {
                 if drag.moved {
                     let (to, _) = tab_drop_at(app, drag.index, drag.x);
                     if to != drag.index {
@@ -13272,6 +14910,27 @@ unsafe extern "system" fn wnd_proc(
                     // (item 12); Edit Bookmark needs a bookmark.
                     set(search_menu, CMD_CLEAR_FILTER, app.filter.is_some());
                     set(search_menu, CMD_BOOKMARK_EDIT, !app.bookmarks.is_empty());
+                    // Diff commands (slice R5c): recompute needs
+                    // an open compare in text mode; the jumps
+                    // need computed regions.
+                    let cmp_open = app.compare.is_some();
+                    let text_mode = app.editor.mode() == EditorMode::Text;
+                    let has_diff = app
+                        .compare
+                        .as_ref()
+                        .map(|c| c.diff.is_some())
+                        .unwrap_or(false);
+                    set(search_menu, CMD_DIFF_RECOMPUTE, cmp_open && text_mode);
+                    set(
+                        search_menu,
+                        CMD_DIFF_NEXT,
+                        cmp_open && text_mode && has_diff,
+                    );
+                    set(
+                        search_menu,
+                        CMD_DIFF_PREV,
+                        cmp_open && text_mode && has_diff,
+                    );
                     set(edit_menu, CMD_UNDO, app.editor.can_undo());
                     set(edit_menu, CMD_SORT_LINES, can_edit && has_selection);
                     set(edit_menu, CMD_DEDUP_LINES, can_edit && has_selection);
@@ -13430,6 +15089,10 @@ unsafe extern "system" fn wnd_proc(
                     // 13): attach the snapshots the worker has
                     // published since the last tick.
                     service_filter_build(app);
+                    // Side-by-side compare (slice R5c): attach
+                    // the right file's index publications and any
+                    // finished diff.
+                    service_compare(app);
                     // Strings pane + entropy strip: start owed
                     // scans and pick up finished ones (both workers
                     // are epoch-guarded on their own generations).
@@ -13596,8 +15259,13 @@ unsafe extern "system" fn wnd_proc(
             // other "on" toggle — the find bar's "In selection" —
             // keeps the accent text and border treatment the mode
             // pair used before, as in the mockup.
+            // While the split view is on, BOTH segments are
+            // active (slice R5c): both representations really
+            // are showing, and the pair now switches which pane
+            // has the keyboard rather than which view exists.
             let seg_active = (id == CMD_MODE_TEXT && app.editor.mode() == EditorMode::Text)
-                || (id == CMD_MODE_HEX && app.editor.mode() == EditorMode::Hex);
+                || (id == CMD_MODE_HEX && app.editor.mode() == EditorMode::Hex)
+                || (split_active(app) && (id == CMD_MODE_TEXT || id == CMD_MODE_HEX));
             let active = seg_active || (id == CMD_FIND_SCOPE && app.find_in_selection);
             let brush = if seg_active {
                 app.accent_brush
@@ -14078,6 +15746,9 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         tab_drag: None,
         tab_context: None,
         suppress_recovery_delete: false,
+        compare: None,
+        split_div_hover: false,
+        divider_drag: None,
     };
     // Per-document tracking for the startup document (bookmarks,
     // external-change baseline, recovery fingerprint): the same
