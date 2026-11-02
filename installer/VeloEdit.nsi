@@ -21,7 +21,7 @@
   !define OUT_DIR "."
 !endif
 
-!define VERSION "1.1.0"
+!define VERSION "1.1.1"
 !define APPNAME "VeloEdit"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\VeloEdit"
 
