@@ -46,6 +46,7 @@ pub enum NamedKey {
     Escape,
     Enter,
     Space,
+    Tab,
 }
 
 impl NamedKey {
@@ -65,6 +66,7 @@ impl NamedKey {
             NamedKey::Escape => "Escape",
             NamedKey::Enter => "Enter",
             NamedKey::Space => "Space",
+            NamedKey::Tab => "Tab",
         }
     }
 
@@ -86,6 +88,7 @@ impl NamedKey {
             "escape" | "esc" => NamedKey::Escape,
             "enter" | "return" => NamedKey::Enter,
             "space" => NamedKey::Space,
+            "tab" => NamedKey::Tab,
             _ => return None,
         })
     }
@@ -250,6 +253,22 @@ pub const ACTIONS: &[(&str, Option<&str>)] = &[
     ("follow_tail", None),
     ("filter", None),
     ("clear_filter", None),
+    // Tabs (roadmap item 39, slice R5b): the strip's commands.
+    // Ctrl+1..Ctrl+8 jump to that tab; tab_last (Ctrl+9) jumps
+    // to the final tab, however many there are.
+    ("new_tab", Some("Ctrl+T")),
+    ("close_tab", Some("Ctrl+W")),
+    ("next_tab", Some("Ctrl+Tab")),
+    ("prev_tab", Some("Ctrl+Shift+Tab")),
+    ("tab_1", Some("Ctrl+1")),
+    ("tab_2", Some("Ctrl+2")),
+    ("tab_3", Some("Ctrl+3")),
+    ("tab_4", Some("Ctrl+4")),
+    ("tab_5", Some("Ctrl+5")),
+    ("tab_6", Some("Ctrl+6")),
+    ("tab_7", Some("Ctrl+7")),
+    ("tab_8", Some("Ctrl+8")),
+    ("tab_last", Some("Ctrl+9")),
 ];
 
 /// Whether `name` is a known rebindable action.
@@ -508,6 +527,25 @@ mod tests {
                 assert_eq!(bindings.action_for(&chord), Some(*action), "{action}");
             }
         }
+    }
+
+    #[test]
+    fn tab_actions_have_their_documented_defaults() {
+        let bindings = KeyBindings::defaults();
+        assert_eq!(bindings.label_for("new_tab").as_deref(), Some("Ctrl+T"));
+        assert_eq!(bindings.label_for("close_tab").as_deref(), Some("Ctrl+W"));
+        assert_eq!(bindings.label_for("next_tab").as_deref(), Some("Ctrl+Tab"));
+        assert_eq!(
+            bindings.label_for("prev_tab").as_deref(),
+            Some("Ctrl+Shift+Tab")
+        );
+        assert_eq!(bindings.label_for("tab_1").as_deref(), Some("Ctrl+1"));
+        assert_eq!(bindings.label_for("tab_8").as_deref(), Some("Ctrl+8"));
+        assert_eq!(bindings.label_for("tab_last").as_deref(), Some("Ctrl+9"));
+        assert_eq!(
+            parse_chord("Ctrl+Tab").unwrap().key,
+            Key::Named(NamedKey::Tab)
+        );
     }
 
     #[test]
