@@ -188,6 +188,14 @@ pub struct Settings {
     /// Recently opened files, most recent first, at most
     /// [`MAX_RECENT`] entries, no duplicates.
     pub recent: Vec<String>,
+    /// The open tabs at the last clean exit (roadmap item 39):
+    /// the paths of the documents that had one, in tab order,
+    /// reopened on launch. Documents without a path are not
+    /// listed (unsaved work keeps the crash-recovery path); the
+    /// list is normalised by `crate::tabs::normalise_session`.
+    pub session_tabs: Vec<String>,
+    /// The active tab's index within [`Settings::session_tabs`].
+    pub session_active: usize,
 }
 
 impl Default for Settings {
@@ -214,6 +222,8 @@ impl Default for Settings {
             save_bom: SAVE_BOM_KEEP.to_string(),
             window: None,
             recent: Vec::new(),
+            session_tabs: Vec::new(),
+            session_active: 0,
         }
     }
 }
@@ -317,7 +327,17 @@ impl Settings {
             }
             out.push_str(&format!("\"{}\"", json_escape(path)));
         }
-        out.push_str("]\n}\n");
+        out.push_str("],\n");
+        out.push_str("  \"session_tabs\": [");
+        for (i, path) in self.session_tabs.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push_str(&format!("\"{}\"", json_escape(path)));
+        }
+        out.push_str("],\n");
+        out.push_str(&format!("  \"session_active\": {}\n", self.session_active));
+        out.push_str("}\n");
         out
     }
 
@@ -469,6 +489,24 @@ impl Settings {
                     }
                     settings.recent = paths;
                 }
+                "session_tabs" => {
+                    parser.expect('[')?;
+                    let mut paths = Vec::new();
+                    loop {
+                        parser.skip_ws();
+                        if parser.eat(']') {
+                            break;
+                        }
+                        paths.push(parser.string()?);
+                        parser.skip_ws();
+                        parser.eat(',');
+                    }
+                    settings.session_tabs = paths;
+                }
+                "session_active" => {
+                    let n = parser.integer()?;
+                    settings.session_active = if n < 0 { 0 } else { n as usize };
+                }
                 _ => parser.skip_value()?,
             }
             parser.skip_ws();
@@ -483,6 +521,13 @@ impl Settings {
         }
         deduped.truncate(MAX_RECENT);
         settings.recent = deduped;
+        // The session list keeps duplicates (the same file may
+        // legitimately be open in two tabs) but drops empties,
+        // caps its length, and clamps the active index.
+        let (tabs, active) =
+            crate::tabs::normalise_session(settings.session_tabs, settings.session_active);
+        settings.session_tabs = tabs;
+        settings.session_active = active;
         Ok(settings)
     }
 
@@ -755,6 +800,12 @@ mod tests {
                 "C:\\Logs\\server.log".to_string(),
                 "D:\\data\\core.dmp".to_string(),
             ],
+            session_tabs: vec![
+                "C:\\Logs\\server.log".to_string(),
+                "C:\\Logs\\server.log".to_string(),
+                "D:\\data\\core.dmp".to_string(),
+            ],
+            session_active: 2,
         }
     }
 
@@ -775,6 +826,30 @@ mod tests {
         assert_eq!(s.save_bom, SAVE_BOM_KEEP);
         assert_eq!(s.window, None);
         assert!(s.recent.is_empty());
+        assert!(s.session_tabs.is_empty());
+        assert_eq!(s.session_active, 0);
+    }
+
+    #[test]
+    fn session_list_round_trips_and_normalises() {
+        // The sample's session list (with a deliberate duplicate —
+        // the same file in two tabs) survives the round trip.
+        let s = sample();
+        let back = Settings::from_json(&s.to_json()).unwrap();
+        assert_eq!(back.session_tabs, s.session_tabs);
+        assert_eq!(back.session_active, 2);
+        // Empties drop out, a wild active index clamps, a negative
+        // one loads as 0.
+        let s = Settings::from_json(r#"{"session_tabs":["","a.txt","b.txt"],"session_active":9}"#)
+            .unwrap();
+        assert_eq!(
+            s.session_tabs,
+            vec!["a.txt".to_string(), "b.txt".to_string()]
+        );
+        assert_eq!(s.session_active, 1);
+        let s = Settings::from_json(r#"{"session_active":-3}"#).unwrap();
+        assert_eq!(s.session_active, 0);
+        assert!(s.session_tabs.is_empty());
     }
 
     #[test]
