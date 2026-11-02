@@ -176,6 +176,18 @@ impl TabOrder {
 /// and no tab ends below `min` or above its natural width. When
 /// even `min` for every tab overflows, every tab is `min` and the
 /// strip scrolls. Returns one width per input, same order.
+/// The natural width of one tab: the label's rendered width plus
+/// the exact chrome the painter spends around it — left padding
+/// (8), one slot per state marker (10 each), the gap before the
+/// close box (2), the close box (18), and the right padding (2).
+/// The painter advances exactly these amounts and clips the label
+/// to what remains, so a budget built from anything less (the
+/// field failure: an estimated label width and a smaller chrome
+/// allowance) clips the label's last character.
+pub fn natural_width(text_w: f32, markers: usize) -> f32 {
+    8.0 + markers as f32 * 10.0 + text_w + 2.0 + 18.0 + 2.0
+}
+
 pub fn fit_widths(natural: &[f32], min: f32, avail: f32) -> Vec<f32> {
     let total: f32 = natural.iter().sum();
     if total <= avail || natural.is_empty() {
@@ -297,6 +309,17 @@ mod tests {
         // marker to the wanted one.
         order.active = active;
         order
+    }
+
+    #[test]
+    fn natural_width_covers_the_painters_whole_chrome() {
+        // The painter spends 8 (left pad) + 10 per marker + the
+        // label + 2 (gap) + 18 (close box) + 2 (right pad); the
+        // natural width must cover all of it or the label clips.
+        assert_eq!(natural_width(60.0, 0), 90.0);
+        assert_eq!(natural_width(60.0, 1), 100.0);
+        assert_eq!(natural_width(60.0, 2), 110.0);
+        assert_eq!(natural_width(0.0, 0), 30.0);
     }
 
     #[test]
