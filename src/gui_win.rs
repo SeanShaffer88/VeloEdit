@@ -28,7 +28,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{
-    GlobalFree, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
+    CloseHandle, GlobalFree, SetHandleInformation, COLORREF, HANDLE, HINSTANCE, HWND, LPARAM,
+    LRESULT, POINT, RECT, SIZE, WPARAM,
 };
 use windows_sys::Win32::Globalization::{MultiByteToWideChar, WideCharToMultiByte};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
@@ -38,16 +39,26 @@ use windows_sys::Win32::Graphics::Gdi::{
     ScreenToClient, SelectObject, SetBkColor, SetBkMode, SetTextColor, UpdateWindow, HBRUSH, HDC,
     HGDIOBJ, HPEN, NULL_BRUSH, OPAQUE, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows_sys::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
     SetClipboardData,
 };
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegOpenKeyExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ,
+};
+use windows_sys::Win32::System::Threading::{
+    CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject, PROCESS_INFORMATION,
+    STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{
     ChooseColorW, GetOpenFileNameW, GetSaveFileNameW, CC_ANYCOLOR, CC_FULLOPEN, CC_RGBINIT,
@@ -180,6 +191,12 @@ const CMD_COMPARE_SIDE: usize = 1076;
 const CMD_DIFF_NEXT: usize = 1077;
 const CMD_DIFF_PREV: usize = 1078;
 const CMD_DIFF_RECOMPUTE: usize = 1079;
+// Slice R5d command ids.
+const CMD_FIND_REGEX: usize = 1080;
+const CMD_APPLY_TEMPLATE: usize = 1081;
+const CMD_DISASM: usize = 1082;
+const CMD_TOOLS_RELOAD: usize = 1083;
+const CMD_TOOL_BASE: usize = 3410; // + tool index (data/tools.json order)
 /// The split/compare divider's painted width, in DIPs.
 const DIVIDER_W: f32 = 5.0;
 /// The narrowest either pane of a split/compare may become.
@@ -874,6 +891,64 @@ save a copy under a different name instead of failing. File \u{25B8}\r\n\
 Open as Administrator opens a new window with full rights on\r\n\
 the same file, for the rare case a file truly needs it —\r\n\
 Windows asks you to approve the step first.\r\n\
+The Regex tick on the find bar searches with a regular\r\n\
+expression instead of plain text: the whole document is\r\n\
+searched, matches can be any length, and the count is exact.\r\n\
+Replace and Replace All put the replacement in literally (no\r\n\
+$1 tricks), and Replace All is still a single undo. Regex\r\n\
+works in UTF-8 and ANSI files; for UTF-16 and code-page files\r\n\
+the find bar says so instead of guessing. A pattern that does\r\n\
+not parse shows its error in the find bar and searches\r\n\
+nothing.\r\n\
+Tools \u{25B8} Apply Template\u{2026} reads a binary file's structure\r\n\
+through a template: plain-text descriptions of structures\r\n\
+(field names, types like u32le, arrays), kept as .txt files in\r\n\
+a templates folder inside the data folder next to the\r\n\
+program. Pick a file, pick a structure, say where to apply it\r\n\
+(the caret is the usual start) and the fields appear in a\r\n\
+list under the document: name, offset, size, value.\r\n\
+Double-click a row to jump to that field. Two ready-made\r\n\
+examples, for PE and PNG headers, ship in the examples folder\r\n\
+in the source repository — copy them into data/templates to\r\n\
+use them. If the folder or the files are missing, the dialog\r\n\
+says so and names the folder to create.\r\n\
+The Tools menu can also run your own programs. Put a\r\n\
+tools.json file in the data folder: a list of tools, each\r\n\
+with a name, a command and its arguments, what to feed it\r\n\
+(input: the selection, the caret's line, the file, or\r\n\
+nothing) and what to do with what it prints (output: replace\r\n\
+the selection, insert at the caret, write to a new file, or\r\n\
+just show it). {file} and {offset} in the arguments are\r\n\
+replaced with the document's path and the caret's offset. A\r\n\
+run never freezes the window: the tool works in the\r\n\
+background, the status bar shows its name, Esc stops it, and\r\n\
+a run is stopped after 30 seconds. A tool that prints more\r\n\
+than 16 MB, fails to start, or exits with an error says so\r\n\
+plainly. If the document changes while a tool runs, its\r\n\
+output is shown instead of applied, so nothing lands in the\r\n\
+wrong place. Tools \u{25B8} Reload Tools re-reads the file.\r\n\
+In text mode you can edit in several places at once.\r\n\
+Alt+click adds a caret (Alt+click one again to remove it);\r\n\
+Ctrl+Alt+Up and Ctrl+Alt+Down add a caret on the line above\r\n\
+or below. Typing, Backspace, Delete, Enter and Tab apply at\r\n\
+every caret as one undo. The status bar counts the carets\r\n\
+while there is more than one. A plain click, Esc, or any\r\n\
+movement key collapses back to one caret. Alt+drag selects a\r\n\
+rectangle of columns across lines: Copy and Cut take its\r\n\
+text (one line per row), and Delete or typing replaces it.\r\n\
+View \u{25B8} Disassembly opens a listing, in hex mode only, of\r\n\
+the machine instructions starting at the caret — offset,\r\n\
+bytes, instruction. It follows the caret, double-clicking a\r\n\
+row moves the caret there, and its heading always names the\r\n\
+offset it decoded from, so a stale listing never pretends to\r\n\
+be current. While it is open the Data Inspector steps aside\r\n\
+and returns when it closes.\r\n\
+Right-clicking VeloEdit's taskbar button shows the recent\r\n\
+files and a New Window entry. For screen readers, the window\r\n\
+reports the current line and caret position; that is a\r\n\
+scoped step, not full document reading. Lines containing\r\n\
+wide characters (such as CJK text) are measured exactly, so\r\n\
+the caret, selections and clicking line up with the glyphs.\r\n\
 \r\n\
 KEYBOARD SHORTCUTS\r\n\
 Every shortcut can be changed. Put a file named\r\n\
@@ -893,7 +968,8 @@ jump_forward Alt+Right \u{00B7} pointer_follow Ctrl+Enter \u{00B7} new_tab\r\n\
 Ctrl+T \u{00B7} close_tab Ctrl+W \u{00B7} next_tab Ctrl+Tab \u{00B7} prev_tab\r\n\
 Ctrl+Shift+Tab \u{00B7} tab_1 to tab_8 Ctrl+1 to Ctrl+8 \u{00B7} tab_last\r\n\
 Ctrl+9 \u{00B7} toggle_split Ctrl+\\ \u{00B7} diff_next F7 \u{00B7} diff_prev\r\n\
-Shift+F7. follow_tail, filter and clear_filter start unbound.\r\n\
+Shift+F7 \u{00B7} caret_up Ctrl+Alt+Up \u{00B7} caret_down Ctrl+Alt+Down.\r\n\
+follow_tail, filter and clear_filter start unbound.\r\n\
 Two settings live only in settings.json in the data folder:\r\n\
 \"map_window_mb\" (0, 512, 1024, 2048 or 4096; 0 maps the whole\r\n\
 file, a number reads very large files through a moving window\r\n\
@@ -961,6 +1037,8 @@ const SLOT_DW_CREATE_TEXT_FORMAT: usize = 15; // IDWriteFactory::CreateTextForma
 const SLOT_DW_CREATE_TEXT_LAYOUT: usize = 18; // IDWriteFactory::CreateTextLayout
 const SLOT_FC_FIND_FAMILY_NAME: usize = 5; // IDWriteFontCollection::FindFamilyName
 const SLOT_LAYOUT_GET_METRICS: usize = 60; // IDWriteTextLayout::GetMetrics
+const SLOT_LAYOUT_HIT_TEST_POINT: usize = 64; // IDWriteTextLayout::HitTestPoint
+const SLOT_LAYOUT_HIT_TEST_TEXT_POSITION: usize = 65; // IDWriteTextLayout::HitTestTextPosition
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -1030,6 +1108,23 @@ struct DWriteTextMetrics {
     layout_height: f32,
     max_bidi_depth: u32,
     line_count: u32,
+}
+
+/// DWRITE_HIT_TEST_METRICS (dwrite.h): where a hit-test against a
+/// text layout landed — the character position and the exact
+/// geometry of the glyph cluster there.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DwHitTestMetrics {
+    text_position: u32,
+    length: u32,
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    bidi_level: u32,
+    is_text: i32,
+    is_trimmed: i32,
 }
 
 #[link(name = "d2d1")]
@@ -1261,6 +1356,10 @@ enum FindKind {
     Plain,
     Scoped,
     Masked,
+    /// Regular-expression find (roadmap item 9, slice R5d): the
+    /// find bar's Regex toggle. Matches carry variable-length
+    /// spans from the regex engine.
+    Regex,
 }
 
 /// A live theme/accent menu preview in progress (see WM_MENUSELECT):
@@ -1291,6 +1390,11 @@ struct FindProgress {
     find_gen: u64,
     doc_gen: u64,
     matches: Vec<u64>,
+    /// Match END offsets, parallel to `matches` — populated only
+    /// by a background regex find (slice R5d), whose matches vary
+    /// in length; a plain find leaves it empty and every end is
+    /// the start plus the needle length, as before.
+    ends: Vec<u64>,
     done: bool,
 }
 
@@ -1434,6 +1538,9 @@ struct DocState {
     id: u64,
     editor: Editor,
     find_in_selection: bool,
+    /// The find bar's Regex toggle (slice R5d), parked per document
+    /// exactly like `find_in_selection`.
+    find_regex: bool,
     find_scope_range: Option<(u64, u64)>,
     last_scope_range: Option<(u64, u64)>,
     last_find_kind: FindKind,
@@ -1445,6 +1552,7 @@ struct DocState {
     bg_done: bool,
     bg_current: Option<usize>,
     bg_needle_len: u64,
+    bg_ends: Vec<u64>,
     find_sync_once: bool,
     bookmarks: crate::bookmarks::BookmarkList,
     doc_stamp: Option<crate::bookmarks::FileStamp>,
@@ -1608,6 +1716,13 @@ struct App {
     /// accent state in the draw pass and a ✓ prefix in its text,
     /// like the Text / Hex mode toggles).
     find_scope_check: HWND,
+    /// The find bar's "Regex" toggle (slice R5d), an owner-drawn
+    /// button in the same family as the scope toggle.
+    find_regex_check: HWND,
+    /// Whether the find bar searches with a regular expression
+    /// (roadmap item 9, slice R5d). Parked per document like
+    /// `find_in_selection`.
+    find_regex: bool,
     /// Whether the find bar is scoped to a selection (roadmap 11).
     find_in_selection: bool,
     /// The selection captured as the active find scope. Kept after a
@@ -1641,6 +1756,10 @@ struct App {
     /// Byte length of the background find's needle (the selected
     /// match's range and the highlight wash need it).
     bg_needle_len: u64,
+    /// Match END offsets while a background REGEX find owns the
+    /// display (slice R5d), parallel to `bg_matches`; empty for a
+    /// plain background find, whose ends are start + needle length.
+    bg_ends: Vec<u64>,
     /// One-shot: the next plain find runs synchronously even on a
     /// large document. Replace sets this — it needs the editor's
     /// complete match state, so it cancels the background find and
@@ -1848,6 +1967,111 @@ struct App {
     /// minus divider x) so the divider tracks the pointer
     /// without jumping.
     divider_drag: Option<f32>,
+    // -- Slice R5d ------------------------------------------------
+    /// Binary templates (roadmap item 17): the results pane's
+    /// state — the last applied struct, its header label, and the
+    /// list's scroll/selection. Window-owned like the compare:
+    /// switching tabs or opening a file clears it, since the
+    /// offsets name the document it was applied to.
+    tpl_open: bool,
+    tpl_result: Option<crate::templates::AppliedStruct>,
+    tpl_title: String,
+    tpl_first: usize,
+    tpl_selected: Option<usize>,
+    /// The pane header's close box from the last render (DIPs).
+    tpl_close_rect: (f32, f32, f32, f32),
+    /// The external tools (roadmap item 49): the set loaded from
+    /// `data/tools.json`, its menu, a load problem to show in the
+    /// menu when the file exists but does not parse, and the
+    /// in-flight run the tick services.
+    tools: crate::exttools::ToolSet,
+    tools_menu: HMENU,
+    tools_error: Option<String>,
+    tool_run: Option<ToolRun>,
+    tool_gen: u64,
+    /// The disassembly panel (hex mode): on/off, the base offset
+    /// the held rows were decoded from, the rows themselves, and
+    /// the stale flag an edit sets (the next paint recomputes).
+    disasm_on: bool,
+    disasm_base: u64,
+    disasm_rows: Vec<DisasmRow>,
+    disasm_stale: bool,
+    /// Extra carets (multi-cursor editing): byte offsets, sorted,
+    /// never containing the editor's own caret. Transient: a tab
+    /// switch, a file open, a plain click, Esc, or any navigation
+    /// collapses back to the one editor caret.
+    extra_carets: Vec<u64>,
+    /// The rectangular selection (byte columns over a line range),
+    /// while one is up.
+    rect_sel: Option<RectSel>,
+    /// A rectangular drag in progress: the anchor corner and the
+    /// current corner, in (line, byte column) pairs.
+    rect_drag: Option<((u64, u64), (u64, u64))>,
+    /// An Alt+press in the text area that has not yet become a
+    /// drag: (line, byte column, offset). On release without a
+    /// drag it toggles an extra caret; once the pointer moves to
+    /// another line or column it becomes `rect_drag`.
+    rect_press: Option<(u64, u64, u64)>,
+    /// The screen-reader provider object (roadmap item 47),
+    /// created lazily on the first WM_GETOBJECT and disconnected
+    /// at destroy. A raw COM pointer owned by the window.
+    uia_provider: *mut c_void,
+}
+
+/// One decoded instruction row in the disassembly panel.
+struct DisasmRow {
+    offset: u64,
+    /// The instruction's full length in bytes.
+    len: u64,
+    /// Up to 8 bytes, hex, space-separated.
+    bytes: String,
+    text: String,
+}
+
+/// A rectangular selection: byte columns `[col_start, col_end)`
+/// over lines `first_line..=last_line`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RectSel {
+    first_line: u64,
+    last_line: u64,
+    col_start: u64,
+    col_end: u64,
+}
+
+/// An in-flight external-tool run: the worker thread owns the
+/// child process and delivers its outcome through the shared
+/// slot; the tick applies it. Only one run at a time.
+struct ToolRun {
+    name: String,
+    gen: u64,
+    /// The document generation at launch. If the document changed
+    /// while the tool ran, output that would edit it is shown
+    /// instead of applied — the range it was computed against no
+    /// longer names the same bytes.
+    doc_gen: u64,
+    /// The range a replace-selection applies to (the selection at
+    /// launch, or the caret point), also the insert point.
+    apply_range: (u64, u64),
+    shared: Arc<ToolShared>,
+}
+
+/// What the UI thread and a tool worker share.
+struct ToolShared {
+    outcome: Mutex<Option<ToolOutcome>>,
+    /// The child process handle (as a usize) while it runs, so
+    /// Esc can stop it. The worker clears this before closing the
+    /// handle, so a cancel never touches a dead handle.
+    process: Mutex<Option<usize>>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+/// A finished tool run's outcome, carried from the worker to the
+/// tick: the captured stdout on success, or the plain failure
+/// text (spawn error, exit code with stderr, timeout, oversize).
+struct ToolOutcome {
+    name: String,
+    mode: crate::exttools::ToolOutput,
+    result: Result<Vec<u8>, String>,
 }
 
 impl App {
@@ -1897,6 +2121,14 @@ impl App {
             cmp.diff_gen += 1;
             cmp.diff_computing = false;
         }
+        // Slice R5d: the template results name byte offsets in
+        // the pre-edit document — close the pane rather than let
+        // stale offsets invite a wrong jump. The disassembly
+        // panel just goes stale; its next paint recomputes.
+        self.tpl_open = false;
+        self.tpl_result = None;
+        self.tpl_selected = None;
+        self.disasm_stale = true;
     }
 
     /// Exchange every per-document field with `other` (tabs,
@@ -1910,6 +2142,7 @@ impl App {
         std::mem::swap(&mut self.doc_id, &mut other.id);
         std::mem::swap(&mut self.editor, &mut other.editor);
         std::mem::swap(&mut self.find_in_selection, &mut other.find_in_selection);
+        std::mem::swap(&mut self.find_regex, &mut other.find_regex);
         std::mem::swap(&mut self.find_scope_range, &mut other.find_scope_range);
         std::mem::swap(&mut self.last_scope_range, &mut other.last_scope_range);
         std::mem::swap(&mut self.last_find_kind, &mut other.last_find_kind);
@@ -1921,6 +2154,7 @@ impl App {
         std::mem::swap(&mut self.bg_done, &mut other.bg_done);
         std::mem::swap(&mut self.bg_current, &mut other.bg_current);
         std::mem::swap(&mut self.bg_needle_len, &mut other.bg_needle_len);
+        std::mem::swap(&mut self.bg_ends, &mut other.bg_ends);
         std::mem::swap(&mut self.find_sync_once, &mut other.find_sync_once);
         std::mem::swap(&mut self.bookmarks, &mut other.bookmarks);
         std::mem::swap(&mut self.doc_stamp, &mut other.doc_stamp);
@@ -2250,6 +2484,12 @@ struct Layout {
     delta_w: f32,
     /// Height of the strings pane (0 while closed).
     strings_h: f32,
+    /// Height of the template results pane (0 while closed,
+    /// slice R5d). The template pane stacks ABOVE the strings
+    /// pane: rows end at `rows_bottom`, the template pane fills
+    /// `[rows_bottom, rows_bottom + tpl_h)`, and the strings pane
+    /// fills the rest down to the status bar.
+    tpl_h: f32,
 }
 
 /// The canvas top: the full chrome stack the rows must clear —
@@ -2311,10 +2551,19 @@ fn compute_layout(app: &mut App) -> Layout {
     };
     let editor_right = if let Some(div) = compare_div {
         div
-    } else if app.settings.inspector_open {
-        (width - INSPECTOR_W).max(gutter_w + TEXT_PAD + SCROLLBAR_W + 40.0)
     } else {
-        width
+        // The disassembly panel docks on the right in hex mode;
+        // while it shows, the Data Inspector steps aside (its
+        // open state is preserved), the same rule the compare
+        // pane uses. A compare owns the right side outright,
+        // above.
+        let mut right = width;
+        if disasm_showing(app) {
+            right = (right - DISASM_W).max(gutter_w + TEXT_PAD + SCROLLBAR_W + 40.0);
+        } else if app.settings.inspector_open {
+            right = (right - INSPECTOR_W).max(gutter_w + TEXT_PAD + SCROLLBAR_W + 40.0);
+        }
+        right
     };
     // The split view's divider spans the document's own area.
     let split_div = if split_active(app) {
@@ -2331,6 +2580,13 @@ fn compute_layout(app: &mut App) -> Layout {
     let bottom = (height - STATUS_H).max(top);
     let strings_h = if app.settings.strings_open {
         STRINGS_HEADER_H + STRINGS_ROWS as f32 * app.line_h
+    } else {
+        0.0
+    };
+    // The template results pane (slice R5d) stacks above the
+    // strings pane.
+    let tpl_h = if app.tpl_open && app.tpl_result.is_some() {
+        TPL_HEADER_H + TPL_ROWS as f32 * app.line_h
     } else {
         0.0
     };
@@ -2354,10 +2610,19 @@ fn compute_layout(app: &mut App) -> Layout {
         compare_div,
         editor_right,
         rows_top,
-        rows_bottom: (bottom - strings_h).max(rows_top),
+        rows_bottom: (bottom - strings_h - tpl_h).max(rows_top),
         delta_w,
         strings_h,
+        tpl_h,
     }
+}
+
+/// Whether the disassembly panel is actually painted (slice
+/// R5d): toggled on, hex mode (it decodes bytes; text mode has
+/// no use for it), and no compare open (a compare owns the
+/// right side, as it does over the inspector).
+fn disasm_showing(app: &App) -> bool {
+    app.disasm_on && app.editor.mode() == EditorMode::Hex && app.compare.is_none()
 }
 
 /// Whether the text/hex split view is actually in effect
@@ -2513,6 +2778,14 @@ const ENTROPY_H: f32 = 6.0;
 /// Strings pane: header height (DIPs) and result rows shown.
 const STRINGS_HEADER_H: f32 = 22.0;
 const STRINGS_ROWS: u64 = 7;
+/// Template results pane geometry (slice R5d): the strings
+/// pane's shape, one dock up.
+const TPL_HEADER_H: f32 = 22.0;
+const TPL_ROWS: u64 = 6;
+/// Disassembly panel width in DIPs (slice R5d).
+const DISASM_W: f32 = 350.0;
+/// Instructions decoded into the disassembly panel per fill.
+const DISASM_COUNT: usize = 48;
 
 /// One painted row of the text view (R4b): a whole line, or one
 /// wrapped segment of a line, or one filtered line. All text-mode
@@ -3058,6 +3331,11 @@ fn layout_children(app: &mut App) {
             let scope_btn = app.find_controls[8];
             place(app, scope_btn, &mut fx, 124.0);
         }
+        // The Regex toggle (slice R5d) follows the scope toggle.
+        if app.find_controls.len() > 9 {
+            let regex_btn = app.find_controls[9];
+            place(app, regex_btn, &mut fx, 74.0);
+        }
         let close_btn = app.find_controls[7];
         place(app, close_btn, &mut fx, 24.0);
     }
@@ -3228,6 +3506,16 @@ fn refresh_status(app: &mut App) {
     }
     if let Some(note) = &app.status_note {
         left.push_str(&format!(" \u{00B7} {note}"));
+    }
+    if let Some(run) = &app.tool_run {
+        // External tool running (item 49): the wait happens on a
+        // worker; the status bar says which tool and Esc stops it.
+        left.push_str(&format!(" \u{00B7} Running {}\u{2026}", run.name));
+    }
+    if !app.extra_carets.is_empty() {
+        // Multi-caret (slice R5d): the caret count while more
+        // than one caret is live.
+        left.push_str(&format!(" \u{00B7} {} carets", app.extra_carets.len() + 1));
     }
     // Side-by-side compare (slice R5c): what is being compared,
     // and the state of the difference computation — running,
@@ -3480,6 +3768,217 @@ fn draw_text(
     };
 }
 
+/// Create a single-line DirectWrite layout for `text` in the
+/// app's current format (the caller releases it with
+/// [`com_release`]). Null on any failure — measurement is an
+/// enhancement, never a requirement.
+fn create_line_layout(app: &App, text: &str) -> *mut c_void {
+    if app.dwrite.is_null() || app.text_format.is_null() || text.is_empty() {
+        return std::ptr::null_mut();
+    }
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    let mut layout: *mut c_void = std::ptr::null_mut();
+    // SAFETY: slot 18 is IDWriteFactory::CreateTextLayout per
+    // dwrite.h; the string and format are live, the out-slot
+    // writable. A generous max width keeps the text on one line.
+    let create: unsafe extern "system" fn(
+        *mut c_void,
+        *const u16,
+        u32,
+        *mut c_void,
+        f32,
+        f32,
+        *mut *mut c_void,
+    ) -> i32 = unsafe { vfn(app.dwrite, SLOT_DW_CREATE_TEXT_LAYOUT) };
+    // SAFETY: as above.
+    let hr = unsafe {
+        create(
+            app.dwrite,
+            wide.as_ptr(),
+            wide.len() as u32,
+            app.text_format,
+            1_000_000.0,
+            app.line_h.max(1.0),
+            &mut layout,
+        )
+    };
+    if hr < 0 {
+        return std::ptr::null_mut();
+    }
+    layout
+}
+
+/// The x (DIPs from the text origin) of the caret boundary before
+/// character `pos` of the laid-out text, measured by DirectWrite
+/// itself (IDWriteTextLayout::HitTestTextPosition). `None` when
+/// the call fails.
+fn layout_caret_x(layout: *mut c_void, pos: u32, text_len: u32) -> Option<f32> {
+    if layout.is_null() {
+        return None;
+    }
+    // The end boundary is the trailing edge of the last character.
+    let (at, trailing) = if pos >= text_len && text_len > 0 {
+        (text_len - 1, 1)
+    } else {
+        (pos, 0)
+    };
+    let mut px = 0.0f32;
+    let mut py = 0.0f32;
+    let mut metrics = DwHitTestMetrics::default();
+    // SAFETY: slot 65 is IDWriteTextLayout::HitTestTextPosition per
+    // dwrite.h; the out slots are writable locals.
+    let hit: unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        i32,
+        *mut f32,
+        *mut f32,
+        *mut DwHitTestMetrics,
+    ) -> i32 = unsafe { vfn(layout, SLOT_LAYOUT_HIT_TEST_TEXT_POSITION) };
+    // SAFETY: as above.
+    let hr = unsafe { hit(layout, at, trailing, &mut px, &mut py, &mut metrics) };
+    if hr < 0 {
+        return None;
+    }
+    Some(px)
+}
+
+/// The character position at x `x` (DIPs from the text origin) in
+/// the laid-out text (IDWriteTextLayout::HitTestPoint): the
+/// position of the glyph under the point, advanced past it when
+/// the point falls on its trailing half.
+fn layout_char_at(layout: *mut c_void, x: f32) -> Option<u32> {
+    if layout.is_null() {
+        return None;
+    }
+    let mut trailing = 0i32;
+    let mut inside = 0i32;
+    let mut metrics = DwHitTestMetrics::default();
+    // SAFETY: slot 64 is IDWriteTextLayout::HitTestPoint per
+    // dwrite.h; the out slots are writable locals.
+    let hit: unsafe extern "system" fn(
+        *mut c_void,
+        f32,
+        f32,
+        *mut i32,
+        *mut i32,
+        *mut DwHitTestMetrics,
+    ) -> i32 = unsafe { vfn(layout, SLOT_LAYOUT_HIT_TEST_POINT) };
+    // SAFETY: as above.
+    let hr = unsafe { hit(layout, x, 0.0, &mut trailing, &mut inside, &mut metrics) };
+    if hr < 0 {
+        return None;
+    }
+    Some(if trailing != 0 {
+        metrics.text_position + metrics.length
+    } else {
+        metrics.text_position
+    })
+}
+
+/// Per-row text measurement for the painters (roadmap item 25,
+/// slice R5d). The canvas draws each row's text with DirectWrite,
+/// which lays glyphs out by their real advances — for pure-ASCII
+/// text in the app's monospace fonts that advance is exactly one
+/// cell per character, so `column × char_w` is already exact and
+/// stays the fast path. A row containing anything else (wide CJK
+/// glyphs, combining marks, a proportional fallback font) is
+/// measured through a layout of that row instead, created lazily
+/// on first use and released with the helper. If layout creation
+/// fails, the cell maths remains as the fallback.
+struct RowMeasure<'a> {
+    app: &'a App,
+    text: &'a str,
+    layout: *mut c_void,
+    tried: bool,
+}
+
+impl<'a> RowMeasure<'a> {
+    fn new(app: &'a App, text: &'a str) -> Self {
+        RowMeasure {
+            app,
+            text,
+            layout: std::ptr::null_mut(),
+            tried: false,
+        }
+    }
+
+    /// Whether this row needs real measurement at all.
+    fn needs(&self) -> bool {
+        !self.text.is_ascii()
+    }
+
+    fn layout(&mut self) -> *mut c_void {
+        if !self.tried {
+            self.tried = true;
+            if self.needs() {
+                self.layout = create_line_layout(self.app, self.text);
+            }
+        }
+        self.layout
+    }
+
+    /// The x (DIPs from the text origin) of the boundary before
+    /// the character at segment-relative position `pos`.
+    fn x_of(&mut self, pos: u64) -> f32 {
+        if pos == 0 {
+            return 0.0;
+        }
+        let layout = self.layout();
+        if !layout.is_null() {
+            // HitTestTextPosition counts in UTF-16 code units, not
+            // chars: translate through the string when they differ.
+            let units = utf16_pos(self.text, pos);
+            if let Some(x) = layout_caret_x(layout, units, utf16_len(self.text)) {
+                return x;
+            }
+        }
+        pos as f32 * self.app.char_w
+    }
+}
+
+impl Drop for RowMeasure<'_> {
+    fn drop(&mut self) {
+        if !self.layout.is_null() {
+            // SAFETY: created by create_line_layout above, owned
+            // here, released exactly once.
+            unsafe { com_release(self.layout) };
+        }
+    }
+}
+
+/// UTF-16 code-unit count of `text`.
+fn utf16_len(text: &str) -> u32 {
+    text.encode_utf16().count() as u32
+}
+
+/// The char position of the boundary at UTF-16 code-unit
+/// position `units` in `text` (clamped to the end; a position
+/// inside a surrogate pair rounds up to the pair's end).
+fn char_pos_of_utf16(text: &str, units: u32) -> u64 {
+    let mut used = 0u32;
+    for (i, c) in text.chars().enumerate() {
+        if used >= units {
+            return i as u64;
+        }
+        used += c.len_utf16() as u32;
+    }
+    text.chars().count() as u64
+}
+
+/// The UTF-16 code-unit position of the boundary before char
+/// `char_pos` in `text` (clamped to the end).
+fn utf16_pos(text: &str, char_pos: u64) -> u32 {
+    let mut units = 0u32;
+    for (i, c) in text.chars().enumerate() {
+        if i as u64 >= char_pos {
+            break;
+        }
+        units += c.len_utf16() as u32;
+    }
+    units
+}
+
 /// Character column of `byte` within a row starting at `row_start`,
 /// decoding the prefix (rows are visited rarely and prefixes are short,
 /// except on very long lines, where the row-fetch cap applies).
@@ -3574,8 +4073,10 @@ struct RowPaint<'a> {
     caret_col: u64,
     caret_line_chars: u64,
     selection: Option<(u64, u64)>,
-    matches: &'a [u64],
-    match_len: u64,
+    /// Every displayed match as a byte span (slice R5d): regex
+    /// matches vary in length, so the painters work from spans,
+    /// never from starts plus a shared length.
+    match_spans: &'a [(u64, u64)],
     current_match: Option<(u64, u64)>,
     /// The document's bookmarks, annotations included: the gutter
     /// markers draw in each bookmark's colour (slice R4c, item 5).
@@ -3595,6 +4096,11 @@ struct RowPaint<'a> {
     /// only while it has focus; the other pane's position is a
     /// passive marker drawn by the split painter instead.
     caret_live: bool,
+    /// Extra multi-carets (slice R5d): byte offsets; each paints
+    /// as a thin accent bar on its row.
+    extra_carets: &'a [u64],
+    /// The byte-column rectangle (slice R5d), washed per line.
+    rect: Option<RectSel>,
 }
 
 /// Whether a line's content is blank for the paragraph model
@@ -3737,9 +4243,8 @@ fn render(app: &mut App) {
     // background find owns the display these come from its mirror,
     // not the editor's own list (see display_matches).
     let all_matches: Vec<u64> = display_matches(app).to_vec();
-    let match_len = current_match
-        .map(|(s, e)| e - s)
-        .unwrap_or(if app.bg_active { app.bg_needle_len } else { 0 });
+    // The same matches as spans for the row painters (slice R5d).
+    let all_spans: Vec<(u64, u64)> = display_spans(app);
     // Bookmark offsets (sorted) for the scrollbar ticks, and the
     // full entries for the gutter markers (which draw in each
     // bookmark's annotation colour, slice R4c item 5).
@@ -3829,8 +4334,7 @@ fn render(app: &mut App) {
         caret_col,
         caret_line_chars,
         selection,
-        matches: &all_matches,
-        match_len,
+        match_spans: &all_spans,
         current_match,
         bookmarks: &bookmark_entries,
         deltas: &row_deltas,
@@ -3840,6 +4344,8 @@ fn render(app: &mut App) {
         diff: diff_regions,
         diff_current,
         caret_live: true,
+        extra_carets: &app.extra_carets,
+        rect: app.rect_sel,
     };
 
     let target = app.target;
@@ -4339,7 +4845,7 @@ fn render(app: &mut App) {
     // The inspector steps aside while a compare is open (slice
     // R5c): the compare pane owns the right side. Its open state
     // is preserved and it returns when the compare closes.
-    if app.settings.inspector_open && app.compare.is_none() {
+    if app.settings.inspector_open && app.compare.is_none() && !disasm_showing(app) {
         let panel_left = layout.editor_right;
         fill_rect(
             fill,
@@ -4493,9 +4999,95 @@ fn render(app: &mut App) {
         }
     }
 
+    // The disassembly panel (slice R5d): hex mode only, decoded
+    // from the caret. refresh_disasm re-decodes whenever the
+    // caret left the decoded range or the document changed, so
+    // what is painted is never stale; the header names the base.
+    if disasm_showing(app) {
+        // Re-decode inline (field-wise, so the brushes borrow
+        // above is undisturbed) when the rows went stale.
+        if !disasm_rows_current(app) {
+            let rows = decode_disasm_rows(table, caret);
+            app.disasm_base = caret;
+            app.disasm_rows = rows;
+            app.disasm_stale = false;
+        }
+        let panel_left = layout.editor_right;
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: panel_left,
+                top,
+                right: width,
+                bottom: rbottom,
+            },
+            brushes.panel,
+        );
+        fill_rect(
+            fill,
+            target,
+            D2dRectF {
+                left: panel_left,
+                top,
+                right: panel_left + 1.0,
+                bottom: rbottom,
+            },
+            brushes.line,
+        );
+        draw_text(
+            draw,
+            target,
+            format,
+            &format!("Disassembly \u{2014} from 0x{:X}", app.disasm_base),
+            D2dRectF {
+                left: panel_left + TEXT_PAD,
+                top: top + 4.0,
+                right: width - TEXT_PAD,
+                bottom: top + 4.0 + app.line_h,
+            },
+            brushes.muted,
+        );
+        let mut y = top + 4.0 + app.line_h;
+        for row in &app.disasm_rows {
+            if y + app.line_h > rbottom {
+                break;
+            }
+            if caret >= row.offset && caret < row.offset + row.len {
+                fill_rect(
+                    fill,
+                    target,
+                    D2dRectF {
+                        left: panel_left + 1.0,
+                        top: y,
+                        right: width,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.band,
+                );
+            }
+            draw_text(
+                draw,
+                target,
+                format,
+                &format!("{:08X}  {:<23}  {}", row.offset, row.bytes, row.text),
+                D2dRectF {
+                    left: panel_left + TEXT_PAD,
+                    top: y,
+                    right: width - TEXT_PAD,
+                    bottom: y + app.line_h,
+                },
+                brushes.text,
+            );
+            y += app.line_h;
+        }
+    }
+
     // The strings pane (R4b): docked along the bottom while open.
+    // The template pane (slice R5d) stacks above it, so its top is
+    // the rows' bottom plus the template pane's height.
     if layout.strings_h > 0.0 {
-        let pane_top = rbottom;
+        let pane_top = rbottom + layout.tpl_h;
         fill_rect(
             fill,
             target,
@@ -4630,6 +5222,113 @@ fn render(app: &mut App) {
                 },
                 brushes.text,
             );
+        }
+    }
+
+    // The template results pane (slice R5d): docked directly
+    // below the rows, above the strings pane.
+    if layout.tpl_h > 0.0 {
+        // The close box is recorded before the results borrow.
+        app.tpl_close_rect = (
+            width - TEXT_PAD - 16.0,
+            rbottom + 2.0,
+            width - TEXT_PAD,
+            rbottom + TPL_HEADER_H - 2.0,
+        );
+        if let Some(result) = &app.tpl_result {
+            let pane_top = rbottom;
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: 0.0,
+                    top: pane_top,
+                    right: width,
+                    bottom: pane_top + layout.tpl_h,
+                },
+                brushes.panel,
+            );
+            fill_rect(
+                fill,
+                target,
+                D2dRectF {
+                    left: 0.0,
+                    top: pane_top,
+                    right: width,
+                    bottom: pane_top + 1.0,
+                },
+                brushes.line,
+            );
+            let header = if result.complete {
+                app.tpl_title.clone()
+            } else {
+                format!("{} \u{00B7} incomplete (ran past the data)", app.tpl_title)
+            };
+            draw_text(
+                draw,
+                target,
+                format,
+                &header,
+                D2dRectF {
+                    left: TEXT_PAD,
+                    top: pane_top + 3.0,
+                    right: width - TEXT_PAD - 24.0,
+                    bottom: pane_top + TPL_HEADER_H,
+                },
+                brushes.text,
+            );
+            // The close box at the header's right edge.
+            let close = app.tpl_close_rect;
+            draw_text(
+                draw,
+                target,
+                format,
+                "\u{2715}",
+                D2dRectF {
+                    left: close.0,
+                    top: pane_top + 3.0,
+                    right: close.2,
+                    bottom: pane_top + TPL_HEADER_H,
+                },
+                brushes.muted,
+            );
+            for i in 0..TPL_ROWS as usize {
+                let idx = app.tpl_first + i;
+                let Some(field) = result.fields.get(idx) else {
+                    break;
+                };
+                let y = pane_top + TPL_HEADER_H + i as f32 * app.line_h;
+                if app.tpl_selected == Some(idx) {
+                    fill_rect(
+                        fill,
+                        target,
+                        D2dRectF {
+                            left: 0.0,
+                            top: y,
+                            right: width,
+                            bottom: y + app.line_h,
+                        },
+                        brushes.selection,
+                    );
+                }
+                let line = format!(
+                    "{}  \u{00B7}  0x{:X}  \u{00B7}  {} B  \u{00B7}  {}",
+                    field.path, field.offset, field.size, field.display
+                );
+                draw_text(
+                    draw,
+                    target,
+                    format,
+                    &line,
+                    D2dRectF {
+                        left: TEXT_PAD,
+                        top: y,
+                        right: width - TEXT_PAD,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.text,
+                );
+            }
         }
     }
 
@@ -5353,6 +6052,20 @@ fn paint_text_row(
             col.saturating_sub(row.char_start) as f32
         }
     };
+    // Wide-glyph measurement (roadmap item 25, slice R5d): in the
+    // plain path, x positions come from the row's own DirectWrite
+    // layout whenever its glyphs are not one-cell ASCII; segment
+    // mode keeps its cell maths because its runs ARE cell-quantised
+    // by construction (control tags occupy two cells, ANSI runs
+    // are drawn cell by cell).
+    let mut measure = RowMeasure::new(app, &row.text);
+    let x_of = |measure: &mut RowMeasure, col: u64| -> f32 {
+        if paint.seg_mode {
+            cell_of(col) * app.char_w
+        } else {
+            measure.x_of(col.saturating_sub(row.char_start))
+        }
+    };
 
     // Current-line band (polish pass): background blended halfway
     // toward the panel colour, text area only. In the filter view
@@ -5397,16 +6110,17 @@ fn paint_text_row(
     }
     // Find-match highlights (never in the filter view: the document
     // caret and its matches are frozen there and painting them
-    // would mislead).
-    if paint.match_len > 0 && !paint.in_filter {
-        let lo = row.start.saturating_sub(paint.match_len);
-        let begin = paint.matches.partition_point(|&m| m < lo);
-        for &ms in &paint.matches[begin..] {
+    // would mislead). Matches are spans now (slice R5d): they are
+    // sorted and non-overlapping, so at most one span can straddle
+    // the row's start — the scan begins one span early to catch it.
+    if !paint.in_filter {
+        let begin = paint.match_spans.partition_point(|&(s, _)| s < row.start);
+        let scan_from = begin.saturating_sub(1);
+        for &(ms, me) in &paint.match_spans[scan_from..] {
             if ms >= row.end {
                 break;
             }
-            let me = ms + paint.match_len;
-            if me <= row.start {
+            if me <= row.start || me <= ms {
                 continue;
             }
             let c0 = col_of_byte(table, enc, row.line_start, ms) as u64;
@@ -5417,9 +6131,9 @@ fn paint_text_row(
                 continue;
             }
             let rect = D2dRectF {
-                left: text_x + cell_of(c0.max(seg_lo)) * app.char_w,
+                left: text_x + x_of(&mut measure, c0.max(seg_lo)),
                 top: y,
-                right: text_x + cell_of(c1.min(seg_hi)) * app.char_w,
+                right: text_x + x_of(&mut measure, c1.min(seg_hi)),
                 bottom: y + app.line_h,
             };
             fill_rect(fill, target, rect, brushes.match_bg);
@@ -5438,12 +6152,12 @@ fn paint_text_row(
                     // Starts past this segment: a later segment
                     // (or none) owns it.
                 } else {
-                    let x0 = text_x + cell_of(c0.max(row.char_start)) * app.char_w;
+                    let x0 = text_x + x_of(&mut measure, c0.max(row.char_start));
                     let x1 = if se > row.end {
                         layout.editor_right
                     } else {
                         let c1 = col_of_byte(table, enc, row.line_start, se) as u64;
-                        text_x + cell_of(c1.min(row.char_start + seg_chars)) * app.char_w
+                        text_x + x_of(&mut measure, c1.min(row.char_start + seg_chars))
                     };
                     fill_rect(
                         fill,
@@ -5457,6 +6171,55 @@ fn paint_text_row(
                         brushes.selection,
                     );
                 }
+            }
+        }
+    }
+    // Rectangle selection wash (slice R5d): the covered segment
+    // of this row in the selection colour. The intersection is
+    // pure offset maths against the segment — bytes past the
+    // line's content end exist in no segment, so the column
+    // clamp needs no index lookup here.
+    if !paint.in_filter {
+        if let Some(rect) = paint.rect {
+            if row.line_no >= rect.first_line && row.line_no <= rect.last_line {
+                let rs = row.line_start + rect.col_start;
+                let re = row.line_start + rect.col_end;
+                let from = rs.max(row.start);
+                let to = re.min(row.end);
+                if from < to {
+                    let c0 = col_of_byte(table, enc, row.line_start, from) as u64;
+                    let c1 = col_of_byte(table, enc, row.line_start, to) as u64;
+                    fill_rect(
+                        fill,
+                        target,
+                        D2dRectF {
+                            left: text_x + x_of(&mut measure, c0.max(row.char_start)),
+                            top: y,
+                            right: text_x + x_of(&mut measure, c1.min(row.char_start + seg_chars)),
+                            bottom: y + app.line_h,
+                        },
+                        brushes.selection,
+                    );
+                }
+            }
+        }
+        // Extra carets (slice R5d): a thin accent bar at each one
+        // that falls on this row segment.
+        for &off in paint.extra_carets {
+            if off >= row.start && off <= row.end {
+                let c = col_of_byte(table, enc, row.line_start, off) as u64;
+                let x = text_x + x_of(&mut measure, c);
+                fill_rect(
+                    fill,
+                    target,
+                    D2dRectF {
+                        left: x,
+                        top: y,
+                        right: x + 2.0,
+                        bottom: y + app.line_h,
+                    },
+                    brushes.accent,
+                );
             }
         }
     }
@@ -5611,7 +6374,7 @@ fn paint_text_row(
                 || (paint.caret_col == paint.caret_line_chars
                     && row.char_start + seg_chars == paint.caret_line_chars));
         if in_segment {
-            let x = text_x + cell_of(paint.caret_col) * app.char_w;
+            let x = text_x + x_of(&mut measure, paint.caret_col);
             fill_rect(
                 fill,
                 target,
@@ -5757,16 +6520,17 @@ fn paint_grid_rows(
             let fx = field_x(fi);
             let f_abs = row.line_start + fs;
             let f_end = row.line_start + fe;
-            // Find-match wash inside this field.
-            if paint.match_len > 0 {
-                let lo = f_abs.saturating_sub(paint.match_len);
-                let begin = paint.matches.partition_point(|&m| m < lo);
-                for &ms in &paint.matches[begin..] {
+            // Find-match wash inside this field (spans, slice
+            // R5d — the scan starts one span early for a match
+            // straddling the field's start).
+            {
+                let begin = paint.match_spans.partition_point(|&(s, _)| s < f_abs);
+                let scan_from = begin.saturating_sub(1);
+                for &(ms, me) in &paint.match_spans[scan_from..] {
                     if ms >= f_end {
                         break;
                     }
-                    let me = ms + paint.match_len;
-                    if me <= f_abs {
+                    if me <= f_abs || me <= ms {
                         continue;
                     }
                     let c0 = col_of_byte(table, enc, f_abs, ms.max(f_abs));
@@ -5954,14 +6718,39 @@ fn pos_to_offset_in(app: &mut App, x_px: i32, y_px: i32, layout: &Layout, mode: 
                 let row = &disp[idx];
                 (row.line_no, row.char_start, row.text.clone())
             };
-            let cell = ((x - layout.origin_x - layout.gutter_w - TEXT_PAD) / app.char_w.max(1.0))
-                .floor()
-                .max(0.0) as u64;
-            let col = if app.ansi_on || app.ctl_on {
-                let segs = build_segments(&text, char_start, app.ansi_on, app.ctl_on);
-                seg_col_of_cell(&segs, cell)
+            let text_x = layout.origin_x + layout.gutter_w + TEXT_PAD;
+            // Wide-glyph hit-testing (roadmap item 25, slice R5d):
+            // a row whose glyphs are not one-cell ASCII resolves
+            // the click through the row's own DirectWrite layout,
+            // exactly as the painter measures it; anything else
+            // keeps the cell maths (exact for ASCII, and the
+            // segment mode's runs are cell-quantised by design).
+            let measured_col = if !(app.ansi_on || app.ctl_on) && !text.is_ascii() {
+                let layout_ptr = create_line_layout(app, &text);
+                let hit = if layout_ptr.is_null() {
+                    None
+                } else {
+                    layout_char_at(layout_ptr, x - text_x)
+                };
+                if !layout_ptr.is_null() {
+                    // SAFETY: created just above, owned here,
+                    // released exactly once.
+                    unsafe { com_release(layout_ptr) };
+                }
+                hit.map(|units| char_start + char_pos_of_utf16(&text, units))
             } else {
-                char_start + cell
+                None
+            };
+            let col = if let Some(col) = measured_col {
+                col
+            } else {
+                let cell = ((x - text_x) / app.char_w.max(1.0)).floor().max(0.0) as u64;
+                if app.ansi_on || app.ctl_on {
+                    let segs = build_segments(&text, char_start, app.ansi_on, app.ctl_on);
+                    seg_col_of_cell(&segs, cell)
+                } else {
+                    char_start + cell
+                }
             };
             app.editor
                 .offset_of_line_col(line_no, col)
@@ -6475,6 +7264,7 @@ fn cancel_bg_find(app: &mut App) {
     app.find_gen += 1;
     app.bg_active = false;
     app.bg_matches.clear();
+    app.bg_ends.clear();
     app.bg_current = None;
     app.bg_done = false;
     if let Ok(mut guard) = app.find_slot.lock() {
@@ -6533,11 +7323,13 @@ fn start_bg_find(app: &mut App, text: &str) -> bool {
             find_gen,
             doc_gen,
             matches: Vec::new(),
+            ends: Vec::new(),
             done: false,
         });
     }
     app.bg_active = true;
     app.bg_matches.clear();
+    app.bg_ends.clear();
     app.bg_current = None;
     app.bg_done = false;
     app.bg_needle_len = needle.len() as u64;
@@ -6571,6 +7363,86 @@ fn start_bg_find(app: &mut App, text: &str) -> bool {
     true
 }
 
+/// Start the background REGEX find for `text` (slice R5d): the
+/// pattern is compiled once here — a pattern that fails to compile
+/// returns false and the caller runs the synchronous find, which
+/// reports the error — and the worker then streams the engine over
+/// a snapshot of the document, publishing spans in batches so the
+/// count climbs while a huge document is still being walked. The
+/// ends travel with the starts: regex matches vary in length.
+fn start_bg_regex_find(app: &mut App, text: &str) -> bool {
+    let re = match crate::regex::Regex::new(text) {
+        Ok(re) => re,
+        Err(_) => return false,
+    };
+    let snapshot = snapshot_table(app);
+    let total = snapshot.len();
+    app.find_gen += 1;
+    let find_gen = app.find_gen;
+    let doc_gen = app.doc_generation;
+    let slot = app.find_slot.clone();
+    if let Ok(mut guard) = slot.lock() {
+        *guard = Some(FindProgress {
+            find_gen,
+            doc_gen,
+            matches: Vec::new(),
+            ends: Vec::new(),
+            done: false,
+        });
+    }
+    app.bg_active = true;
+    app.bg_matches.clear();
+    app.bg_ends.clear();
+    app.bg_current = None;
+    app.bg_done = false;
+    app.bg_needle_len = 0;
+    std::thread::spawn(move || {
+        let mut iter = re.find_iter(total, |offset, buf| snapshot.read_into(offset, buf));
+        loop {
+            let mut batch: Vec<(u64, u64)> = Vec::with_capacity(8192);
+            let mut exhausted = false;
+            for _ in 0..8192 {
+                match iter.next() {
+                    Some(span) => batch.push(span),
+                    None => {
+                        exhausted = true;
+                        break;
+                    }
+                }
+            }
+            let done = exhausted;
+            if let Ok(mut guard) = slot.lock() {
+                match guard.as_mut() {
+                    Some(progress)
+                        if progress.find_gen == find_gen && progress.doc_gen == doc_gen =>
+                    {
+                        progress.matches.extend(batch.iter().map(|&(s, _)| s));
+                        progress.ends.extend(batch.iter().map(|&(_, e)| e));
+                        progress.done = done;
+                    }
+                    // Superseded or cancelled: stop quietly.
+                    _ => return,
+                }
+            }
+            if done {
+                return;
+            }
+        }
+    });
+    true
+}
+
+/// The end offset of the background find's match at `idx`: from
+/// the span ends for a regex find, start + needle length for a
+/// plain one.
+fn bg_match_end(app: &App, idx: usize) -> u64 {
+    let start = app.bg_matches.get(idx).copied().unwrap_or(0);
+    match app.bg_ends.get(idx) {
+        Some(&end) => end,
+        None => start + app.bg_needle_len,
+    }
+}
+
 /// Select the background find's match at `idx`: the selection is
 /// placed with the editor's ordinary caret moves (anchor at the
 /// match start, caret at its end — the same shape the editor's own
@@ -6579,9 +7451,10 @@ fn select_bg_match(app: &mut App, idx: usize) {
     let Some(&start) = app.bg_matches.get(idx) else {
         return;
     };
+    let end = bg_match_end(app, idx);
     app.bg_current = Some(idx);
     app.editor.move_caret_to(start, false);
-    app.editor.move_caret_to(start + app.bg_needle_len, true);
+    app.editor.move_caret_to(end, true);
 }
 
 /// Find Next / Previous over the matches known so far while a
@@ -6642,13 +7515,42 @@ fn display_matches(app: &App) -> &[u64] {
     }
 }
 
+/// Every displayed match as a byte span, from whichever find owns
+/// the display (slice R5d). Plain finds share one needle length —
+/// taken from the current match, whose length is the needle's —
+/// while regex finds carry per-match ends (the editor's span list,
+/// or the background mirror's ends). Sorted by start, as every
+/// underlying list is.
+fn display_spans(app: &App) -> Vec<(u64, u64)> {
+    if app.bg_active {
+        if !app.bg_ends.is_empty() {
+            return app
+                .bg_matches
+                .iter()
+                .copied()
+                .zip(app.bg_ends.iter().copied())
+                .collect();
+        }
+        return app
+            .bg_matches
+            .iter()
+            .map(|&s| (s, s + app.bg_needle_len))
+            .collect();
+    }
+    if !app.editor.match_spans().is_empty() {
+        return app.editor.match_spans().to_vec();
+    }
+    let len = app.editor.current_match().map(|(s, e)| e - s).unwrap_or(0);
+    app.editor.matches().iter().map(|&s| (s, s + len)).collect()
+}
+
 /// The currently selected match's byte range, from whichever find
 /// owns the display.
 fn display_current_match(app: &App) -> Option<(u64, u64)> {
     if app.bg_active {
         let idx = app.bg_current?;
         let start = *app.bg_matches.get(idx)?;
-        Some((start, start + app.bg_needle_len))
+        Some((start, bg_match_end(app, idx)))
     } else {
         app.editor.current_match()
     }
@@ -6794,6 +7696,12 @@ fn open_document(app: &mut App, path: &Path) {
     // the compare session closes rather than pairing against a
     // document it never diffed.
     close_compare(app);
+    // Multi-caret / rectangle / template state names the old
+    // document's bytes (slice R5d): all collapse on an open.
+    clear_multi(app);
+    app.tpl_open = false;
+    app.tpl_result = None;
+    app.tpl_selected = None;
     let mmap = match MmapFile::open(path) {
         Ok(mmap) => Arc::new(mmap),
         Err(err) => {
@@ -6880,6 +7788,7 @@ fn open_document(app: &mut App, path: &Path) {
     begin_document_tracking(app);
     let path_string = path.to_string_lossy().into_owned();
     app.settings.add_recent(&path_string);
+    publish_jump_list(app);
     save_settings(app);
     refresh_title(app);
     refresh_status(app);
@@ -6935,6 +7844,7 @@ fn fresh_doc_state(app: &mut App) -> DocState {
         id: app.next_doc_id,
         editor,
         find_in_selection: false,
+        find_regex: false,
         find_scope_range: None,
         last_scope_range: None,
         last_find_kind: FindKind::Plain,
@@ -6946,6 +7856,7 @@ fn fresh_doc_state(app: &mut App) -> DocState {
         bg_done: false,
         bg_current: None,
         bg_needle_len: 0,
+        bg_ends: Vec::new(),
         find_sync_once: false,
         bookmarks: crate::bookmarks::BookmarkList::new(),
         doc_stamp: None,
@@ -7074,6 +7985,12 @@ fn after_tab_switch(app: &mut App) {
     // The compare belongs to the window, not the tab (slice
     // R5c): switching tabs closes it.
     close_compare(app);
+    // Multi-caret / rectangle / template state names the old
+    // document's bytes (slice R5d): all collapse on a tab switch.
+    clear_multi(app);
+    app.tpl_open = false;
+    app.tpl_result = None;
+    app.tpl_selected = None;
     let find_show = if app.find_visible { SW_SHOW } else { SW_HIDE };
     for hwnd in app
         .find_controls
@@ -7093,6 +8010,15 @@ fn after_tab_switch(app: &mut App) {
             "\u{2713} In selection"
         } else {
             "In selection"
+        },
+    );
+    // The Regex toggle's label likewise (slice R5d).
+    set_control_text(
+        app.find_regex_check,
+        if app.find_regex {
+            "\u{2713} Regex"
+        } else {
+            "Regex"
         },
     );
     let change_show = if app.change_visible { SW_SHOW } else { SW_HIDE };
@@ -7885,6 +8811,7 @@ fn do_save_as(app: &mut App) -> bool {
             note_saved(app);
             let path_string = path.to_string_lossy().into_owned();
             app.settings.add_recent(&path_string);
+            publish_jump_list(app);
             save_settings(app);
             refresh_title(app);
             refresh_status(app);
@@ -8835,6 +9762,446 @@ fn show_slice_dialog(app: &mut App) -> Option<String> {
         SetFocus(app.hwnd);
     }
     state.result
+}
+
+/// The `data/templates/` folder beside the program (roadmap item
+/// 17, slice R5d): the user's binary-template files live here.
+fn templates_dir() -> PathBuf {
+    crate::settings::data_dir().join("templates")
+}
+
+/// The template files on offer: every `.txt` file in
+/// [`templates_dir`], sorted by path.
+fn template_files() -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(templates_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_txt = path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("txt"))
+                .unwrap_or(false);
+            if is_txt {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Parse an offset typed into a dialog: decimal, or hex with a
+/// `0x` prefix.
+fn parse_offset_text(text: &str) -> Option<u64> {
+    let t = text.trim();
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        t.parse::<u64>().ok()
+    }
+}
+
+const TPLDLG_CLASS: &str = "VeloEditTemplate";
+const ID_TPL_FILES: usize = 5501;
+const ID_TPL_STRUCTS: usize = 5502;
+const ID_TPL_OFFSET: usize = 5503;
+const ID_TPL_APPLY: usize = 5504;
+const ID_TPL_CANCEL: usize = 5505;
+
+// ListBox messages and the selection-change notification
+// (winuser.h), written literally like the other control constants.
+const LB_ADDSTRING: u32 = 0x0180;
+const LB_RESETCONTENT: u32 = 0x0184;
+const LB_SETCURSEL: u32 = 0x018E;
+const LB_GETCURSEL: u32 = 0x0188;
+const LBN_SELCHANGE: usize = 1;
+
+struct TemplateDialogState {
+    app: *mut App,
+    files: Vec<PathBuf>,
+    set: Option<crate::templates::TemplateSet>,
+    file_list: HWND,
+    struct_list: HWND,
+    offset_edit: HWND,
+    error_label: HWND,
+}
+
+const PROP_TPL_OLD: &str = "VeloEdit.TplOldProc";
+const PROP_TPL_DLG: &str = "VeloEdit.TplDlg";
+
+/// Subclass the offset edit so Enter applies and Esc cancels —
+/// the slice dialog's property-based trick.
+fn subclass_tpl_edit(edit: HWND, dlg: HWND) {
+    let name_old = wstr(PROP_TPL_OLD);
+    let name_dlg = wstr(PROP_TPL_DLG);
+    // SAFETY: `edit` is our child window; the old proc is stored
+    // in a window property before the new proc is installed.
+    unsafe {
+        let old = SetWindowLongPtrW(
+            edit,
+            GWLP_WNDPROC,
+            tpl_edit_proc as *const () as usize as isize,
+        );
+        SetPropW(edit, name_old.as_ptr(), old as HANDLE);
+        SetPropW(edit, name_dlg.as_ptr(), dlg as HANDLE);
+    }
+}
+
+unsafe extern "system" fn tpl_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    let name_old = wstr(PROP_TPL_OLD);
+    let name_dlg = wstr(PROP_TPL_DLG);
+    // SAFETY: the props were stored by subclass_tpl_edit before
+    // this proc was installed, and are removed at WM_NCDESTROY.
+    let old = unsafe { GetPropW(hwnd, name_old.as_ptr()) } as isize;
+    let dlg = unsafe { GetPropW(hwnd, name_dlg.as_ptr()) } as HWND;
+    if msg == WM_KEYDOWN {
+        let cmd = match wparam as u32 {
+            0x0D => Some(ID_TPL_APPLY),  // Enter: apply
+            0x1B => Some(ID_TPL_CANCEL), // Esc: cancel
+            _ => None,
+        };
+        if let Some(cmd) = cmd {
+            // SAFETY: `dlg` is the template dialog stored at
+            // subclass time; the command is handled there.
+            unsafe { PostMessageW(dlg, WM_COMMAND, cmd, 0) };
+            return 0;
+        }
+    }
+    if msg == WM_NCDESTROY {
+        // SAFETY: restore the original proc and drop our props.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
+            RemovePropW(hwnd, name_old.as_ptr());
+            RemovePropW(hwnd, name_dlg.as_ptr());
+        }
+    }
+    let proc_fn: WNDPROC = unsafe { std::mem::transmute(old) };
+    // SAFETY: proc_fn is the edit control's original window
+    // procedure, retrieved from our own property above.
+    unsafe { CallWindowProcW(proc_fn, hwnd, msg, wparam, lparam) }
+}
+
+/// Send a string to a listbox (its lifetime only needs to cover
+/// the call — the list copies it).
+fn listbox_add(hwnd: HWND, text: &str) {
+    let wide = wstr(text);
+    // SAFETY: our listbox; the string outlives the call.
+    unsafe { SendMessageW(hwnd, LB_ADDSTRING, 0, wide.as_ptr() as LPARAM) };
+}
+
+fn listbox_clear(hwnd: HWND) {
+    // SAFETY: our listbox.
+    unsafe { SendMessageW(hwnd, LB_RESETCONTENT, 0, 0) };
+}
+
+fn listbox_select(hwnd: HWND, index: usize) {
+    // SAFETY: our listbox.
+    unsafe { SendMessageW(hwnd, LB_SETCURSEL, index, 0) };
+}
+
+fn listbox_current(hwnd: HWND) -> Option<usize> {
+    // SAFETY: our listbox; LB_ERR (-1) means no selection.
+    let sel = unsafe { SendMessageW(hwnd, LB_GETCURSEL, 0, 0) };
+    if sel < 0 {
+        None
+    } else {
+        Some(sel as usize)
+    }
+}
+
+/// Load the template file at `index` in the dialog: parse it, and
+/// either fill the struct list or show the parse error verbatim.
+fn tpl_dialog_load(state: &mut TemplateDialogState, index: usize) {
+    listbox_clear(state.struct_list);
+    state.set = None;
+    let Some(path) = state.files.get(index) else {
+        return;
+    };
+    let parsed = std::fs::read_to_string(path)
+        .map_err(|err| format!("could not read {}: {err}", path.display()))
+        .and_then(|text| {
+            crate::templates::TemplateSet::parse(&text).map_err(|err| format!("{err}"))
+        });
+    match parsed {
+        Ok(set) => {
+            for name in set.struct_names() {
+                listbox_add(state.struct_list, name);
+            }
+            if set.struct_names().next().is_some() {
+                listbox_select(state.struct_list, 0);
+            }
+            state.set = Some(set);
+            set_control_text(state.error_label, "");
+        }
+        Err(message) => {
+            set_control_text(state.error_label, &message);
+        }
+    }
+}
+
+/// Apply the dialog's chosen struct at the chosen offset: the
+/// results land in the docked pane and the dialog closes. An
+/// apply error shows verbatim and the dialog stays open.
+fn tpl_dialog_apply(state: &mut TemplateDialogState, hwnd: HWND) {
+    // SAFETY: the App is alive and exclusively ours on this thread
+    // (modal dialog).
+    let app = unsafe { &mut *state.app };
+    let Some(set) = &state.set else {
+        set_control_text(state.error_label, "Pick a template file first.");
+        return;
+    };
+    let Some(sel) = listbox_current(state.struct_list) else {
+        set_control_text(state.error_label, "Pick a struct first.");
+        return;
+    };
+    let name = set.struct_names().nth(sel).unwrap_or_default().to_string();
+    // SAFETY: our edit control.
+    let offset_text = unsafe { window_text(state.offset_edit) };
+    let Some(offset) = parse_offset_text(&offset_text) else {
+        set_control_text(
+            state.error_label,
+            "The offset is not a number — decimal, or hex like 0x40.",
+        );
+        return;
+    };
+    match crate::op_apply_template(app.editor.table(), set, &name, offset) {
+        Ok(applied) => {
+            let file_label = state
+                .files
+                .get(listbox_current(state.file_list).unwrap_or(0))
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_default();
+            app.tpl_title = format!(
+                "Template: {name} \u{00B7} {file_label} \u{00B7} at 0x{offset:X} \u{00B7} {} fields",
+                applied.fields.len()
+            );
+            app.tpl_result = Some(applied);
+            app.tpl_open = true;
+            app.tpl_first = 0;
+            app.tpl_selected = None;
+            // SAFETY: our dialog window.
+            unsafe { DestroyWindow(hwnd) };
+        }
+        Err(err) => {
+            set_control_text(state.error_label, &format!("{err}"));
+        }
+    }
+}
+
+unsafe extern "system" fn template_dialog_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_CREATE {
+        // SAFETY: lparam is the CREATESTRUCTW from CreateWindowExW,
+        // whose lpCreateParams is the caller's TemplateDialogState.
+        let create = unsafe { &*(lparam as *const CREATESTRUCTW) };
+        let state_ptr = create.lpCreateParams as *mut TemplateDialogState;
+        // SAFETY: storing the state pointer for the dialog's life.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
+        // SAFETY: the state outlives the dialog (caller's frame).
+        let state = unsafe { &mut *state_ptr };
+        // SAFETY: the App is alive and exclusively ours on this thread.
+        let app = unsafe { &*state.app };
+        let scale = app.scale();
+        let px = |dip: f32| (dip * scale).round() as i32;
+        let place = |child: HWND, x: f32, y: f32, w: f32, h: f32| {
+            // SAFETY: reparent and position our fresh child window.
+            unsafe {
+                SetParent(child, hwnd);
+                MoveWindow(child, px(x), px(y), px(w), px(h), 1);
+            }
+        };
+        let hint_text = if state.files.is_empty() {
+            format!(
+                "No template files found.\nCreate the folder {} and copy .txt template files into it \u{2014} the program's examples/templates folder has two to start with.",
+                templates_dir().display()
+            )
+        } else {
+            "Pick a template file and one of its structs, set the offset, then Apply.\nThe fields appear in a list under the editor; double-click one to jump to it."
+                .to_string()
+        };
+        let hint = create_child(app, "Static", &hint_text, WS_CHILD | WS_VISIBLE, 0, 0);
+        place(hint, 12.0, 10.0, 446.0, 34.0);
+        // LBS_NOTIFY (0x1) so selection changes reach WM_COMMAND;
+        // WS_VSCROLL (0x100000) for long lists.
+        let list_style = WS_CHILD | WS_VISIBLE | 0x1 | 0x100000;
+        state.file_list = create_child(
+            app,
+            "ListBox",
+            "",
+            list_style,
+            WS_EX_CLIENTEDGE,
+            ID_TPL_FILES,
+        );
+        place(state.file_list, 12.0, 48.0, 218.0, 150.0);
+        state.struct_list = create_child(
+            app,
+            "ListBox",
+            "",
+            list_style,
+            WS_EX_CLIENTEDGE,
+            ID_TPL_STRUCTS,
+        );
+        place(state.struct_list, 240.0, 48.0, 218.0, 150.0);
+        let offset_label = create_child(
+            app,
+            "Static",
+            "Apply at offset:",
+            WS_CHILD | WS_VISIBLE,
+            0,
+            0,
+        );
+        place(offset_label, 12.0, 206.0, 110.0, 20.0);
+        let edit_style = WS_CHILD | WS_VISIBLE | 0x80; // ES_AUTOHSCROLL
+        state.offset_edit = create_child(
+            app,
+            "Edit",
+            &app.editor.caret().to_string(),
+            edit_style,
+            WS_EX_CLIENTEDGE,
+            ID_TPL_OFFSET,
+        );
+        place(state.offset_edit, 124.0, 204.0, 140.0, 24.0);
+        subclass_tpl_edit(state.offset_edit, hwnd);
+        state.error_label = create_child(app, "Static", "", WS_CHILD | WS_VISIBLE, 0, 0);
+        place(state.error_label, 12.0, 234.0, 446.0, 34.0);
+        let button_style = WS_CHILD | WS_VISIBLE | 0xB; // BS_OWNERDRAW
+        let apply_btn = create_child(app, "Button", "Apply", button_style, 0, ID_TPL_APPLY);
+        let cancel_btn = create_child(app, "Button", "Cancel", button_style, 0, ID_TPL_CANCEL);
+        place(apply_btn, 290.0, 276.0, 80.0, 24.0);
+        place(cancel_btn, 378.0, 276.0, 80.0, 24.0);
+        for path in &state.files {
+            let label = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            listbox_add(state.file_list, &label);
+        }
+        if !state.files.is_empty() {
+            listbox_select(state.file_list, 0);
+            tpl_dialog_load(state, 0);
+        }
+        return 0;
+    }
+    // SAFETY: the state pointer was stored at WM_CREATE.
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut TemplateDialogState;
+    if state_ptr.is_null() {
+        // SAFETY: default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    }
+    // SAFETY: the state outlives the dialog (see WM_CREATE).
+    let state = unsafe { &mut *state_ptr };
+    match msg {
+        WM_COMMAND => {
+            let id = wparam & 0xFFFF;
+            let notify = (wparam >> 16) & 0xFFFF;
+            match id {
+                ID_TPL_FILES if notify == LBN_SELCHANGE => {
+                    if let Some(sel) = listbox_current(state.file_list) {
+                        tpl_dialog_load(state, sel);
+                    }
+                }
+                ID_TPL_APPLY => tpl_dialog_apply(state, hwnd),
+                ID_TPL_CANCEL => {
+                    // SAFETY: our dialog window.
+                    unsafe { DestroyWindow(hwnd) };
+                }
+                _ => {}
+            }
+            0
+        }
+        WM_CLOSE => {
+            // SAFETY: closing is cancelling.
+            unsafe { DestroyWindow(hwnd) };
+            0
+        }
+        WM_DRAWITEM => {
+            // SAFETY: the App is alive (modal dialog, UI thread).
+            let app = unsafe { &*state.app };
+            draw_dialog_button(app, lparam)
+        }
+        // SAFETY: default handling for everything else.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Show the Apply Template dialog (the Slice dialog's modal
+/// pattern). Applying fills the template results pane.
+fn show_template_dialog(app: &mut App) {
+    let mut state = TemplateDialogState {
+        app: app as *mut App,
+        files: template_files(),
+        set: None,
+        file_list: std::ptr::null_mut(),
+        struct_list: std::ptr::null_mut(),
+        offset_edit: std::ptr::null_mut(),
+        error_label: std::ptr::null_mut(),
+    };
+    let class = wstr(TPLDLG_CLASS);
+    let title = wstr("Apply Template");
+    // SAFETY: the template class is registered in run_gui; the
+    // state travels in lpCreateParams and lives in this stack
+    // frame until the dialog is destroyed (the modal loop below).
+    let hwnd = unsafe {
+        CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            app.px(482.0),
+            app.px(348.0),
+            app.hwnd,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            &mut state as *mut TemplateDialogState as *const c_void,
+        )
+    };
+    if hwnd.is_null() {
+        return;
+    }
+    // SAFETY: modal behaviour, exactly like the Slice dialog.
+    unsafe {
+        EnableWindow(app.hwnd, 0);
+        ShowWindow(hwnd, SW_SHOW);
+    }
+    loop {
+        // SAFETY: MSG is a plain C struct; GetMessageW fills it.
+        let mut msg: MSG = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; 0 = WM_QUIT, -1 = error.
+        let result = unsafe { GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) };
+        if result <= 0 {
+            // SAFETY: preserve the quit for the main loop.
+            unsafe { PostQuitMessage(0) };
+            break;
+        }
+        // SAFETY: standard message pumping.
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        // SAFETY: a plain liveness query on our dialog.
+        if unsafe { IsWindow(hwnd) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: restore the main window and give it the focus back.
+    unsafe {
+        EnableWindow(app.hwnd, 1);
+        SetFocus(app.hwnd);
+    }
+    if app.tpl_open {
+        invalidate(app);
+    }
 }
 
 /// File ▸ Extract Ranges… (slice R4c, item 2): ask for a spec,
@@ -10213,15 +11580,34 @@ fn masked_pattern_for(app: &App, text: &str) -> Option<search::MaskedPattern> {
     search::parse_masked_pattern(text).ok()
 }
 
-/// Which kind of find the find-bar state asks for right now.
+/// Which kind of find the find-bar state asks for right now. The
+/// Regex toggle is an explicit user choice, so it wins over the
+/// masked-pattern heuristic (a regex may legitimately contain a
+/// space or a `?`); the scope toggle never combines with regex —
+/// turning Regex on turns the scope off (see the toggle's command).
 fn find_kind_for(app: &App, text: &str) -> FindKind {
-    if masked_pattern_for(app, text).is_some() {
+    if app.find_regex {
+        FindKind::Regex
+    } else if masked_pattern_for(app, text).is_some() {
         FindKind::Masked
     } else if app.find_in_selection {
         FindKind::Scoped
     } else {
         FindKind::Plain
     }
+}
+
+/// Whether the document's codec lets a regex pattern run over its
+/// bytes as-is (slice R5d): UTF-8 and ANSI are byte-compatible with
+/// the pattern text; UTF-16 and the legacy code pages are not, and
+/// regex declines there rather than guessing at a transcoding.
+fn regex_codec_supported(app: &App) -> bool {
+    matches!(
+        app.editor.codec(),
+        crate::encoding::TextCodec::Standard(
+            crate::encoding::TextEncoding::Utf8 | crate::encoding::TextEncoding::Ansi
+        )
+    )
 }
 
 /// Run (or re-run) the find from the find-bar text and update the count
@@ -10248,20 +11634,25 @@ fn find_from_bar(app: &mut App, advance: i32) {
     }
     let kind = find_kind_for(app, &text);
     // A background find owns the display only while the committed
-    // find is the plain whole-document find for this text. Any other
-    // kind — or a one-shot synchronous request from Replace, which
-    // needs the editor's complete match state — cancels it.
+    // find is a whole-document find (plain or regex) for this text.
+    // Any other kind — or a one-shot synchronous request from
+    // Replace, which needs the editor's complete match state —
+    // cancels it.
     let sync_once = std::mem::take(&mut app.find_sync_once);
-    if kind != FindKind::Plain || sync_once {
+    if !matches!(kind, FindKind::Plain | FindKind::Regex) || sync_once {
         cancel_bg_find(app);
     }
-    let rerun = if kind == FindKind::Plain && app.bg_active {
+    let rerun = if matches!(kind, FindKind::Plain | FindKind::Regex) && app.bg_active {
         // The editor's own list stays empty while the background
         // find owns the display; only a text or kind change re-runs.
         text != app.last_find_text || kind != app.last_find_kind
     } else {
         text != app.last_find_text || kind != app.last_find_kind || app.editor.matches().is_empty()
     };
+    // A label the match arms insist on (a regex compile error, the
+    // codec decline): the generic count at the tail must not
+    // overwrite it with "No matches".
+    let mut label_override: Option<String> = None;
     match kind {
         FindKind::Masked => {
             let pattern = masked_pattern_for(app, &text).expect("kind checked above");
@@ -10298,6 +11689,43 @@ fn find_from_bar(app: &mut App, advance: i32) {
                     Err(err) => {
                         set_find_label(app, &format!("{err}"));
                         return;
+                    }
+                }
+            } else if advance > 0 {
+                app.editor.find_next();
+            } else if advance < 0 {
+                app.editor.find_prev();
+            }
+        }
+        FindKind::Regex => {
+            if !regex_codec_supported(app) {
+                // Declined, plainly: the pattern cannot run over
+                // this document's bytes as-is (UTF-16 / code page).
+                // Clear any older find so Next never advances a
+                // stale list under a Regex label.
+                if rerun {
+                    let _ = app.editor.set_find("", SearchOptions::default());
+                }
+                label_override = Some("Regex works in UTF-8 and ANSI files".to_string());
+            } else if app.bg_active && !rerun {
+                if advance != 0 {
+                    bg_advance(app, advance);
+                }
+            } else if rerun {
+                cancel_bg_find(app);
+                if !sync_once
+                    && app.editor.total_len() > BG_FIND_THRESHOLD
+                    && start_bg_regex_find(app, &text)
+                {
+                    if advance != 0 {
+                        bg_advance(app, advance);
+                    }
+                } else {
+                    match app.editor.set_find_regex(&text) {
+                        Ok(_) => {}
+                        Err(err) => {
+                            label_override = Some(format!("{err}"));
+                        }
                     }
                 }
             } else if advance > 0 {
@@ -10344,7 +11772,9 @@ fn find_from_bar(app: &mut App, advance: i32) {
     }
     app.last_find_text = text;
     app.last_find_kind = kind;
-    if kind == FindKind::Plain && app.bg_active {
+    if let Some(text) = label_override {
+        set_find_label(app, &text);
+    } else if matches!(kind, FindKind::Plain | FindKind::Regex) && app.bg_active {
         refresh_bg_find_label(app);
     } else {
         let count = app.editor.matches().len();
@@ -10375,7 +11805,7 @@ fn do_replace(app: &mut App, all: bool) {
     // so instead of replacing the pattern text literally.
     // SAFETY: our edit control.
     let find_text = unsafe { window_text(app.find_edit) };
-    if masked_pattern_for(app, &find_text).is_some() {
+    if !app.find_regex && masked_pattern_for(app, &find_text).is_some() {
         message_box(
             app.hwnd,
             "Masked patterns (like 4A ?? FF) are for finding only — replace does not use them.",
@@ -10394,7 +11824,14 @@ fn do_replace(app: &mut App, all: bool) {
         app.find_sync_once = true;
     }
     find_from_bar(app, 0);
-    let result = if all && app.find_in_selection {
+    let result = if all && app.last_find_kind == FindKind::Regex {
+        // Regex replace-all (roadmap item 9, slice R5d): the
+        // replacement is literal text, and the whole pass is one
+        // undo entry (the editor recomputes the match spans
+        // itself, so this is exact even when the find ran in the
+        // background or the list was cleared by an edit).
+        app.editor.replace_all_regex(&replacement).map(|n| n > 0)
+    } else if all && app.find_in_selection {
         // Scoped replace-all (roadmap item 11): one undo entry, only
         // inside the captured scope. With no scope, find_from_bar
         // has already put the notice in the count label.
@@ -10429,6 +11866,1409 @@ fn do_replace(app: &mut App, all: bool) {
     refresh_title(app);
     refresh_status(app);
     invalidate(app);
+}
+
+// ---------------------------------------------------------------------------
+// Screen-reader support, roadmap-scoped (roadmap item 47, slice
+// R5d): WM_GETOBJECT on the editor canvas returns a hand-rolled
+// IRawElementProviderSimple exposing the caret's line — Name is
+// "<file> — Ln <n>, Col <n>: <the current line's text>". This is
+// deliberately NOT a full TextPattern: no pattern providers are
+// implemented, and the Guide/PARITY say exactly that. The
+// interface is hand-declared like Direct2D's (windows-sys 0.61
+// has no UIA bindings); vtable slots per UIAutomationCore.h:
+// QueryInterface 0, AddRef 1, Release 2, get_ProviderOptions 3,
+// GetPatternProvider 4, GetPropertyValue 5,
+// get_HostRawElementProvider 6. IID_IRawElementProviderSimple:
+// d6dd68d1-86fd-4332-8666-9abedea2d24c. Property IDs (plain
+// values): Name 30005, ClassName 30012, ControlType 30003 (50004
+// = Edit), IsKeyboardFocusable 30009, HasKeyboardFocus 30008,
+// NativeWindowHandle 30020. Compile-verified only.
+// ---------------------------------------------------------------------------
+
+const IID_RAW_ELEMENT_PROVIDER_SIMPLE: Guid = Guid {
+    data1: 0xd6dd_68d1,
+    data2: 0x86fd,
+    data3: 0x4332,
+    data4: [0x86, 0x66, 0x9a, 0xbe, 0xde, 0xa2, 0xd2, 0x4c],
+};
+const IID_IUNKNOWN_UIA: Guid = Guid {
+    data1: 0x0000_0000,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+// The UIA entry points are resolved from uiautomationcore.dll
+// at first use instead of linked: some toolchains ship no
+// import library for it, and resolving at runtime also means a
+// machine without UIA could never break startup over it.
+type UiaReturnFn = unsafe extern "system" fn(HWND, WPARAM, LPARAM, *mut c_void) -> LRESULT;
+type UiaDisconnectFn = unsafe extern "system" fn(*mut c_void) -> i32;
+type UiaHostFn = unsafe extern "system" fn(HWND, *mut *mut c_void) -> i32;
+
+fn uia_proc(name: &str) -> Option<usize> {
+    static LIB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    // SAFETY: LoadLibrary/GetProcAddress on a system DLL; the
+    // handle is kept for the process's life (never freed), so the
+    // resolved addresses stay valid.
+    unsafe {
+        let lib = *LIB.get_or_init(|| {
+            let wide = wstr("uiautomationcore.dll");
+            LoadLibraryW(wide.as_ptr()) as usize
+        });
+        if lib == 0 {
+            return None;
+        }
+        let cname = std::ffi::CString::new(name).ok()?;
+        let proc = GetProcAddress(lib as HINSTANCE, cname.as_ptr() as *const u8);
+        proc.map(|f| f as usize)
+    }
+}
+
+/// UiaReturnRawElementProvider, when UIA is available.
+fn uia_return_provider(
+    hwnd: HWND,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    provider: *mut c_void,
+) -> Option<LRESULT> {
+    let addr = uia_proc("UiaReturnRawElementProvider")?;
+    // SAFETY: the resolved address is the named export of
+    // uiautomationcore.dll, whose signature matches UiaReturnFn.
+    let f: UiaReturnFn = unsafe { std::mem::transmute(addr) };
+    // SAFETY: as above.
+    Some(unsafe { f(hwnd, wparam, lparam, provider) })
+}
+
+/// UiaHostProviderFromHwnd, when UIA is available.
+fn call_uia_host_provider(hwnd: HWND, out: *mut *mut c_void) -> i32 {
+    match uia_proc("UiaHostProviderFromHwnd") {
+        Some(addr) => {
+            // SAFETY: as uia_return_provider.
+            let f: UiaHostFn = unsafe { std::mem::transmute(addr) };
+            // SAFETY: as above.
+            unsafe { f(hwnd, out) }
+        }
+        None => 0x8000_4005u32 as i32, // E_FAIL
+    }
+}
+
+/// UiaDisconnectProvider, when UIA is available.
+fn uia_disconnect(provider: *mut c_void) {
+    if let Some(addr) = uia_proc("UiaDisconnectProvider") {
+        // SAFETY: as uia_return_provider.
+        let f: UiaDisconnectFn = unsafe { std::mem::transmute(addr) };
+        // SAFETY: as above.
+        unsafe { f(provider) };
+    }
+}
+
+#[link(name = "oleaut32")]
+unsafe extern "system" {
+    fn SysAllocStringLen(s: *const u16, len: u32) -> *mut u16;
+}
+
+/// A COM VARIANT, laid out by hand (24 bytes on x64): the value
+/// union begins at offset 8.
+#[repr(C)]
+struct UiaVariant {
+    vt: u16,
+    reserved1: u16,
+    reserved2: u16,
+    reserved3: u16,
+    data: [u64; 2],
+}
+
+impl UiaVariant {
+    fn empty() -> Self {
+        UiaVariant {
+            vt: 0, // VT_EMPTY
+            reserved1: 0,
+            reserved2: 0,
+            reserved3: 0,
+            data: [0, 0],
+        }
+    }
+    fn bstr(text: &str) -> Self {
+        let wide: Vec<u16> = text.encode_utf16().collect();
+        // SAFETY: SysAllocStringLen copies the text into a new
+        // BSTR owned by the caller (UIA frees it).
+        let ptr = unsafe { SysAllocStringLen(wide.as_ptr(), wide.len() as u32) };
+        let mut v = Self::empty();
+        v.vt = 8; // VT_BSTR
+        v.data[0] = ptr as u64;
+        v
+    }
+    fn bool(value: bool) -> Self {
+        let mut v = Self::empty();
+        v.vt = 11; // VT_BOOL
+        v.data[0] = if value { 0xFFFF } else { 0 };
+        v
+    }
+    fn i4(value: i32) -> Self {
+        let mut v = Self::empty();
+        v.vt = 3; // VT_I4
+        v.data[0] = (value as i64) as u64;
+        v
+    }
+}
+
+#[repr(C)]
+struct UiaVtbl {
+    query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+    provider_options: unsafe extern "system" fn(*mut c_void, *mut i32) -> i32,
+    get_pattern_provider: unsafe extern "system" fn(*mut c_void, i32, *mut *mut c_void) -> i32,
+    get_property_value: unsafe extern "system" fn(*mut c_void, i32, *mut UiaVariant) -> i32,
+    host_provider: unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> i32,
+}
+
+#[repr(C)]
+struct UiaProvider {
+    vtbl: *const UiaVtbl,
+    refs: std::sync::atomic::AtomicU32,
+    hwnd: HWND,
+}
+
+fn guid_eq(a: &Guid, b: &Guid) -> bool {
+    a.data1 == b.data1 && a.data2 == b.data2 && a.data3 == b.data3 && a.data4 == b.data4
+}
+
+unsafe extern "system" fn uia_query_interface(
+    this: *mut c_void,
+    iid: *const Guid,
+    out: *mut *mut c_void,
+) -> i32 {
+    // SAFETY: `this` is our provider (or null-checked by the
+    // caller contract); `out` is written on every path.
+    unsafe {
+        if out.is_null() {
+            return 0x8000_4003u32 as i32; // E_POINTER
+        }
+        *out = std::ptr::null_mut();
+        if iid.is_null() {
+            return 0x8000_4003u32 as i32;
+        }
+        let iid = &*iid;
+        if guid_eq(iid, &IID_IUNKNOWN_UIA) || guid_eq(iid, &IID_RAW_ELEMENT_PROVIDER_SIMPLE) {
+            *out = this;
+            uia_add_ref(this);
+            0
+        } else {
+            0x8000_4002u32 as i32 // E_NOINTERFACE
+        }
+    }
+}
+
+unsafe extern "system" fn uia_add_ref(this: *mut c_void) -> u32 {
+    // SAFETY: `this` is our provider while it lives.
+    let provider = unsafe { &*(this as *const UiaProvider) };
+    provider
+        .refs
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1
+}
+
+unsafe extern "system" fn uia_release(this: *mut c_void) -> u32 {
+    // SAFETY: pairs with the AddRef calls; the last release drops
+    // the box.
+    let provider = unsafe { &*(this as *const UiaProvider) };
+    let now = provider
+        .refs
+        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+        - 1;
+    if now == 0 {
+        // SAFETY: the box was created by uia_create_provider.
+        unsafe { drop(Box::from_raw(this as *mut UiaProvider)) };
+    }
+    now
+}
+
+unsafe extern "system" fn uia_provider_options(this: *mut c_void, out: *mut i32) -> i32 {
+    let _ = this;
+    // SAFETY: `out` is the caller's slot.
+    unsafe {
+        if !out.is_null() {
+            *out = 1; // ProviderOptions_ServerSideProvider
+        }
+    }
+    0
+}
+
+unsafe extern "system" fn uia_get_pattern_provider(
+    this: *mut c_void,
+    _pattern: i32,
+    out: *mut *mut c_void,
+) -> i32 {
+    let _ = this;
+    // No patterns are implemented (the scoped item 47 surface):
+    // every pattern request answers "not available".
+    // SAFETY: `out` is the caller's slot.
+    unsafe {
+        if !out.is_null() {
+            *out = std::ptr::null_mut();
+        }
+    }
+    0
+}
+
+unsafe extern "system" fn uia_get_property_value(
+    this: *mut c_void,
+    property: i32,
+    out: *mut UiaVariant,
+) -> i32 {
+    // SAFETY: `this` is our provider; the App is reached through
+    // the window handle, and this callback only ever runs on the
+    // UI thread while the window lives.
+    unsafe {
+        if out.is_null() {
+            return 0x8000_4003u32 as i32; // E_POINTER
+        }
+        let provider = &*(this as *const UiaProvider);
+        let app_ptr = app_ptr(provider.hwnd);
+        if app_ptr.is_null() {
+            *out = UiaVariant::empty();
+            return 0;
+        }
+        let app = &mut *app_ptr;
+        *out = match property {
+            30005 => UiaVariant::bstr(&uia_name(app)),     // Name
+            30012 => UiaVariant::bstr("VeloEditCanvas"),   // ClassName
+            30003 => UiaVariant::i4(50004),                // ControlType: Edit
+            30009 => UiaVariant::bool(true),               // IsKeyboardFocusable
+            30008 => UiaVariant::bool(app.has_focus),      // HasKeyboardFocus
+            30020 => UiaVariant::i4(provider.hwnd as i32), // NativeWindowHandle
+            _ => UiaVariant::empty(),
+        };
+        0
+    }
+}
+
+unsafe extern "system" fn uia_host_provider(this: *mut c_void, out: *mut *mut c_void) -> i32 {
+    // SAFETY: `this` is our provider; the host provider comes
+    // from UIA itself for our window.
+    let provider = unsafe { &*(this as *const UiaProvider) };
+    call_uia_host_provider(provider.hwnd, out)
+}
+
+static UIA_VTBL: UiaVtbl = UiaVtbl {
+    query_interface: uia_query_interface,
+    add_ref: uia_add_ref,
+    release: uia_release,
+    provider_options: uia_provider_options,
+    get_pattern_provider: uia_get_pattern_provider,
+    get_property_value: uia_get_property_value,
+    host_provider: uia_host_provider,
+};
+
+/// Create the window's UIA provider (one reference owned by the
+/// window; UIA AddRefs for its own holds).
+fn uia_create_provider(hwnd: HWND) -> *mut c_void {
+    let provider = Box::new(UiaProvider {
+        vtbl: &UIA_VTBL,
+        refs: std::sync::atomic::AtomicU32::new(1),
+        hwnd,
+    });
+    Box::into_raw(provider) as *mut c_void
+}
+
+/// The provider's Name: "<file> — Ln <n>, Col <n>: <the caret's
+/// line, trimmed, at most ~120 characters>".
+fn uia_name(app: &mut App) -> String {
+    let name = app
+        .editor
+        .path()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "Untitled".to_string());
+    let caret = app.editor.caret();
+    let (line, col) = app.editor.line_col_of(caret);
+    let text = app
+        .editor
+        .line_text(line)
+        .map(|t| {
+            let trimmed = t.trim();
+            let capped: String = trimmed.chars().take(120).collect();
+            if trimmed.chars().count() > 120 {
+                format!("{capped}\u{2026}")
+            } else {
+                capped
+            }
+        })
+        .unwrap_or_default();
+    if text.is_empty() {
+        format!("{name} \u{2014} Ln {}, Col {}", line + 1, col + 1)
+    } else {
+        format!("{name} \u{2014} Ln {}, Col {}: {text}", line + 1, col + 1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Taskbar jump list (roadmap item 40, slice R5d): publish the
+// recent files as a "Recent" category plus a "New Window" task
+// on the taskbar button's right-click menu. The interfaces are
+// hand-declared like Direct2D's — ICustomDestinationList is not
+// in windows-sys 0.61 either. Vtable slots per shobjidl.h:
+// ICustomDestinationList (after IUnknown): SetAppID 3, BeginList
+// 4, AppendCategory 5, AppendKnownCategory 6, AddUserTasks 7,
+// CommitList 8, GetRemovedDestinations 9, DeleteList 10,
+// AbortList 11. IObjectCollection adds AddObject at slot 5 over
+// IObjectArray's GetCount 3 / GetAt 4. IShellLinkW: SetPath 20,
+// SetArguments 11, SetDescription 7 (full table verified against
+// the SDK). GUIDs: CLSID_DestinationList
+// 77f10cf0-3db5-4966-b520-b7c54fd35ed6, IID_ICustomDestinationList
+// 6332debf-87b5-4670-90c0-5e57b408a49e,
+// CLSID_EnumerableObjectCollection
+// 2d3468c1-36a7-43b6-ac24-d3f02fd9607a, IID_IObjectCollection
+// 5632b1a4-e38a-400a-928a-d4cd63230295, IID_IObjectArray
+// 92ca9dcd-5622-4bba-a805-5e9f541bd8c9, CLSID_ShellLink
+// 00021401-0000-0000-c000-000000000046, IID_IShellLinkW
+// 000214f9-0000-0000-c000-000000000046.
+// Compile-verified only. EVERY call is best-effort: any failure
+// abandons the publish silently — a jump list must never break
+// startup or opening a file.
+// ---------------------------------------------------------------------------
+
+const CLSID_DESTINATION_LIST: Guid = Guid {
+    data1: 0x77f1_0cf0,
+    data2: 0x3db5,
+    data3: 0x4966,
+    data4: [0xb5, 0x20, 0xb7, 0xc5, 0x4f, 0xd3, 0x5e, 0xd6],
+};
+const IID_CUSTOM_DESTINATION_LIST: Guid = Guid {
+    data1: 0x6332_debf,
+    data2: 0x87b5,
+    data3: 0x4670,
+    data4: [0x90, 0xc0, 0x5e, 0x57, 0xb4, 0x08, 0xa4, 0x9e],
+};
+const CLSID_ENUMERABLE_OBJECT_COLLECTION: Guid = Guid {
+    data1: 0x2d34_68c1,
+    data2: 0x36a7,
+    data3: 0x43b6,
+    data4: [0xac, 0x24, 0xd3, 0xf0, 0x2f, 0xd9, 0x60, 0x7a],
+};
+const IID_OBJECT_COLLECTION: Guid = Guid {
+    data1: 0x5632_b1a4,
+    data2: 0xe38a,
+    data3: 0x400a,
+    data4: [0x92, 0x8a, 0xd4, 0xcd, 0x63, 0x23, 0x02, 0x95],
+};
+const IID_OBJECT_ARRAY: Guid = Guid {
+    data1: 0x92ca_9dcd,
+    data2: 0x5622,
+    data3: 0x4bba,
+    data4: [0xa8, 0x05, 0x5e, 0x9f, 0x54, 0x1b, 0xd8, 0xc9],
+};
+const CLSID_SHELL_LINK: Guid = Guid {
+    data1: 0x0002_1401,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+const IID_SHELL_LINK_W: Guid = Guid {
+    data1: 0x0002_14f9,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+const SLOT_CDL_BEGIN_LIST: usize = 4;
+const SLOT_CDL_APPEND_CATEGORY: usize = 5;
+const SLOT_CDL_ADD_USER_TASKS: usize = 7;
+const SLOT_CDL_COMMIT_LIST: usize = 8;
+const SLOT_OC_ADD_OBJECT: usize = 5;
+const SLOT_SL_SET_DESCRIPTION: usize = 7;
+const SLOT_SL_SET_ARGUMENTS: usize = 11;
+const SLOT_SL_SET_PATH: usize = 20;
+
+type CdlBeginList =
+    unsafe extern "system" fn(*mut c_void, *mut u32, *const Guid, *mut *mut c_void) -> i32;
+type CdlAppendCategory = unsafe extern "system" fn(*mut c_void, *const u16, *mut c_void) -> i32;
+type CdlPtrCall = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
+type CdlCommitList = unsafe extern "system" fn(*mut c_void) -> i32;
+type OcAddObject = unsafe extern "system" fn(*mut c_void, *mut c_void) -> i32;
+type SlSetText = unsafe extern "system" fn(*mut c_void, *const u16) -> i32;
+
+/// This file's Guid layout as a windows-sys GUID (same fields,
+/// same order — the COM calls take the windows-sys spelling).
+fn sys_guid(g: &Guid) -> windows_sys::core::GUID {
+    windows_sys::core::GUID {
+        data1: g.data1,
+        data2: g.data2,
+        data3: g.data3,
+        data4: g.data4,
+    }
+}
+
+/// Create one shell link: our exe, optional arguments, and the
+/// display description. Null on any failure.
+unsafe fn make_shell_link(exe: &[u16], args: Option<&[u16]>, desc: &[u16]) -> *mut c_void {
+    // SAFETY: every step is checked; on failure whatever was
+    // created is released and null comes back.
+    unsafe {
+        let mut link: *mut c_void = std::ptr::null_mut();
+        let clsid = sys_guid(&CLSID_SHELL_LINK);
+        let iid = sys_guid(&IID_SHELL_LINK_W);
+        let hr = CoCreateInstance(
+            &clsid,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &iid,
+            &mut link,
+        );
+        if hr < 0 || link.is_null() {
+            return std::ptr::null_mut();
+        }
+        let set_path: SlSetText = vfn(link, SLOT_SL_SET_PATH);
+        let set_desc: SlSetText = vfn(link, SLOT_SL_SET_DESCRIPTION);
+        set_path(link, exe.as_ptr());
+        set_desc(link, desc.as_ptr());
+        if let Some(args) = args {
+            let set_args: SlSetText = vfn(link, SLOT_SL_SET_ARGUMENTS);
+            set_args(link, args.as_ptr());
+        }
+        link
+    }
+}
+
+/// Create an empty object collection. Null on any failure.
+unsafe fn make_object_collection() -> *mut c_void {
+    // SAFETY: as make_shell_link.
+    unsafe {
+        let mut coll: *mut c_void = std::ptr::null_mut();
+        let clsid = sys_guid(&CLSID_ENUMERABLE_OBJECT_COLLECTION);
+        let iid = sys_guid(&IID_OBJECT_COLLECTION);
+        let hr = CoCreateInstance(
+            &clsid,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &iid,
+            &mut coll,
+        );
+        if hr < 0 || coll.is_null() {
+            return std::ptr::null_mut();
+        }
+        coll
+    }
+}
+
+/// Publish the jump list from the current recent-files list.
+/// Called at startup and whenever that list changes. Silent on
+/// any failure, by design (see the section header).
+fn publish_jump_list(app: &App) {
+    // SAFETY: the whole publish is best-effort COM plumbing; see
+    // the section header. Every object created is released once.
+    unsafe {
+        // COINIT_APARTMENTTHREADED = 2. S_FALSE (1) still counts
+        // as initialised-by-us for the uninitialise pairing;
+        // RPC_E_CHANGED_MODE (negative) means COM was already up
+        // in another model — proceed without uninitialising.
+        let init = CoInitializeEx(std::ptr::null(), 2);
+        let uninit = init == 0 || init == 1;
+        publish_jump_list_inner(app);
+        if uninit {
+            CoUninitialize();
+        }
+    }
+}
+
+unsafe fn publish_jump_list_inner(app: &App) {
+    // SAFETY: caller established the COM apartment; every step
+    // bails quietly on failure.
+    unsafe {
+        let Ok(exe_path) = std::env::current_exe() else {
+            return;
+        };
+        let exe = wstr(&exe_path.to_string_lossy());
+        let mut list: *mut c_void = std::ptr::null_mut();
+        let clsid = sys_guid(&CLSID_DESTINATION_LIST);
+        let iid = sys_guid(&IID_CUSTOM_DESTINATION_LIST);
+        let hr = CoCreateInstance(
+            &clsid,
+            std::ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &iid,
+            &mut list,
+        );
+        if hr < 0 || list.is_null() {
+            return;
+        }
+        let mut slots: u32 = 0;
+        let mut removed: *mut c_void = std::ptr::null_mut();
+        let begin: CdlBeginList = vfn(list, SLOT_CDL_BEGIN_LIST);
+        let hr = begin(list, &mut slots, &IID_OBJECT_ARRAY, &mut removed);
+        if !removed.is_null() {
+            com_release(removed);
+        }
+        if hr >= 0 {
+            // The Recent category: one link per recent file,
+            // launching our exe with the file as its argument —
+            // activation arrives as an ordinary file argument.
+            if !app.settings.recent.is_empty() {
+                let coll = make_object_collection();
+                if !coll.is_null() {
+                    let add: OcAddObject = vfn(coll, SLOT_OC_ADD_OBJECT);
+                    for path in &app.settings.recent {
+                        let name = std::path::Path::new(path)
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.clone());
+                        let args = wstr(&format!("\"{path}\""));
+                        let desc = wstr(&name);
+                        let link = make_shell_link(&exe, Some(&args), &desc);
+                        if !link.is_null() {
+                            add(coll, link);
+                            com_release(link);
+                        }
+                    }
+                    let append: CdlAppendCategory = vfn(list, SLOT_CDL_APPEND_CATEGORY);
+                    let label = wstr("Recent");
+                    append(list, label.as_ptr(), coll);
+                    com_release(coll);
+                }
+            }
+            // One user task: a fresh window of our own exe.
+            let tasks = make_object_collection();
+            if !tasks.is_null() {
+                let add: OcAddObject = vfn(tasks, SLOT_OC_ADD_OBJECT);
+                let desc = wstr("New Window");
+                let link = make_shell_link(&exe, None, &desc);
+                if !link.is_null() {
+                    add(tasks, link);
+                    com_release(link);
+                }
+                let add_tasks: CdlPtrCall = vfn(list, SLOT_CDL_ADD_USER_TASKS);
+                add_tasks(list, tasks);
+                com_release(tasks);
+            }
+            let commit: CdlCommitList = vfn(list, SLOT_CDL_COMMIT_LIST);
+            commit(list);
+        }
+        com_release(list);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Disassembly panel (slice R5d): a hex-mode-only docked listing
+// decoded from the caret with the src/disasm.rs length-accurate
+// decoder. Recompute is cheap (48 instructions), so it happens
+// on demand: whenever the caret leaves the decoded range or the
+// document changed since the decode (note_edit marks it stale),
+// the next paint re-decodes from the caret — the panel never
+// presents stale instructions as current, and its header names
+// the base offset it decoded from.
+// ---------------------------------------------------------------------------
+
+/// Decode up to DISASM_COUNT instructions from `caret` over a
+/// table snapshot. An undecodable or truncated tail simply ends
+/// the listing; the header still names the base honestly.
+fn decode_disasm_rows(table: &PieceTable, caret: u64) -> Vec<DisasmRow> {
+    let total = table.len();
+    let want = ((DISASM_COUNT * 16) as u64).min(total.saturating_sub(caret));
+    let bytes = table.read(caret, want);
+    let mut rows = Vec::new();
+    let mut pos = 0usize;
+    while rows.len() < DISASM_COUNT && pos < bytes.len() {
+        match crate::disasm::decode_one(&bytes[pos..]) {
+            Ok(ins) => {
+                let shown = ins.length.min(8).min(bytes.len() - pos);
+                let mut byte_text = bytes[pos..pos + shown]
+                    .iter()
+                    .map(|b| format!("{b:02X}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if ins.length > 8 {
+                    byte_text.push_str(" \u{2026}");
+                }
+                rows.push(DisasmRow {
+                    offset: caret + pos as u64,
+                    len: ins.length as u64,
+                    bytes: byte_text,
+                    text: ins.text.clone(),
+                });
+                pos += ins.length;
+            }
+            Err(_) => break,
+        }
+    }
+    rows
+}
+
+/// Whether the panel's rows still cover the caret and were
+/// decoded from the current document.
+fn disasm_rows_current(app: &App) -> bool {
+    let caret = app.editor.caret();
+    let covered_end = app
+        .disasm_rows
+        .last()
+        .map(|r| r.offset + r.len)
+        .unwrap_or(0);
+    !app.disasm_stale
+        && !app.disasm_rows.is_empty()
+        && caret >= app.disasm_base
+        && caret < covered_end
+}
+
+/// Re-decode the panel's rows when they no longer cover the
+/// caret or the document changed under them.
+fn refresh_disasm(app: &mut App) {
+    if !disasm_showing(app) || disasm_rows_current(app) {
+        return;
+    }
+    let caret = app.editor.caret();
+    let rows = decode_disasm_rows(app.editor.table(), caret);
+    app.disasm_base = caret;
+    app.disasm_rows = rows;
+    app.disasm_stale = false;
+}
+
+/// A press in the disassembly panel: a double-click on a row
+/// moves the caret to that instruction's offset; single presses
+/// are inert (the panel follows the caret, not the other way).
+fn disasm_click(app: &mut App, _x: f32, y: f32, double: bool, layout: &Layout) {
+    if !double {
+        return;
+    }
+    refresh_disasm(app);
+    let row = ((y - layout.rows_top - 4.0 - app.line_h) / app.line_h.max(1.0)).floor();
+    if row < 0.0 {
+        return;
+    }
+    if let Some(r) = app.disasm_rows.get(row as usize) {
+        let off = r.offset;
+        app.editor.move_caret_to(off, false);
+        after_caret_move(app);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// External tools (roadmap item 49, slice R5d): the approved
+// replacement for plugins. Tools are declared in data/tools.json
+// (the src/exttools.rs core parses and validates them); the Tools
+// menu runs them. A run never blocks the UI thread: a worker owns
+// the child process and its pipes, and the 200 ms tick applies
+// the outcome. The wait is bounded at 30 seconds; Esc stops a
+// running tool; stdout is capped at 16 MB.
+// ---------------------------------------------------------------------------
+
+const TOOL_TIMEOUT_MS: u32 = 30_000;
+const TOOL_STDOUT_CAP: usize = 16 * 1024 * 1024;
+const TOOL_STDERR_CAP: usize = 64 * 1024;
+
+/// Load the tool set from `data/tools.json`. A missing file is an
+/// empty set and no error; a file that exists but does not parse
+/// is an empty set plus the verbatim problem, which the Tools
+/// menu shows as a greyed item.
+fn load_tool_set() -> (crate::exttools::ToolSet, Option<String>) {
+    let path = crate::settings::data_dir().join("tools.json");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match crate::exttools::ToolSet::from_json(&text) {
+            Ok(set) => (set, None),
+            Err(err) => (crate::exttools::ToolSet::default(), Some(err)),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            (crate::exttools::ToolSet::default(), None)
+        }
+        Err(err) => (
+            crate::exttools::ToolSet::default(),
+            Some(format!("could not read tools.json: {err}")),
+        ),
+    }
+}
+
+/// Rebuild the Tools menu's contents from the loaded set.
+fn rebuild_tools_menu(app: &App) {
+    let menu = app.tools_menu;
+    if menu.is_null() {
+        return;
+    }
+    // SAFETY: menu surgery on our own menu; items are removed by
+    // position from the end backwards so indices stay valid.
+    unsafe {
+        let count = GetMenuItemCount(menu);
+        for i in (0..count).rev() {
+            RemoveMenu(menu, i as u32, MF_BYPOSITION);
+        }
+    }
+    menu_item(menu, CMD_APPLY_TEMPLATE, "Apply Template\u{2026}");
+    menu_sep(menu);
+    if let Some(err) = &app.tools_error {
+        let label = wstr(&format!("(tools.json: {err})"));
+        // SAFETY: our menu; the string outlives the call.
+        unsafe { AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, label.as_ptr()) };
+    } else if app.tools.tools.is_empty() {
+        let label = wstr("(No tools \u{2014} add data/tools.json)");
+        // SAFETY: as above.
+        unsafe { AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, label.as_ptr()) };
+    } else {
+        for (i, tool) in app.tools.tools.iter().take(64).enumerate() {
+            menu_item(menu, CMD_TOOL_BASE + i, &tool.name);
+        }
+    }
+    menu_sep(menu);
+    menu_item(menu, CMD_TOOLS_RELOAD, "Reload Tools");
+}
+
+/// Reload the tool set from disk and rebuild the menu.
+fn reload_tools(app: &mut App) {
+    let (set, error) = load_tool_set();
+    let count = set.tools.len();
+    app.tools = set;
+    app.tools_error = error;
+    rebuild_tools_menu(app);
+    app.status_note = Some(match &app.tools_error {
+        Some(err) => format!("Tools not loaded: {err}"),
+        None => format!("Tools reloaded \u{2014} {count} tool(s)"),
+    });
+    refresh_status(app);
+}
+
+/// The byte range a tool's `range` input feeds: the caret's line
+/// content in text mode, the caret's hex row in hex mode.
+fn tool_range(app: &mut App) -> (u64, u64) {
+    let caret = app.editor.caret();
+    match app.editor.mode() {
+        EditorMode::Text => {
+            let (line, _) = app.editor.line_col_of(caret);
+            app.editor
+                .line_content_range(line)
+                .unwrap_or((caret, caret))
+        }
+        EditorMode::Hex => {
+            let width = app.editor.hex_layout().bytes_per_row.max(1);
+            let start = hexview::row_offset_w(caret / width, width);
+            (start, (start + width).min(app.editor.total_len()))
+        }
+    }
+}
+
+/// Start a run of `tool`. Refusals (a run already in flight, the
+/// filter view up, a file-fed tool with no file) are explained in
+/// the status bar or a message box, never silently dropped.
+fn run_tool(app: &mut App, tool: &crate::exttools::ExternalTool) {
+    if let Some(run) = &app.tool_run {
+        app.status_note = Some(format!(
+            "{} is still running \u{2014} Esc stops it",
+            run.name
+        ));
+        refresh_status(app);
+        return;
+    }
+    if app.filter.is_some() {
+        app.status_note = Some("Tools cannot run while the filter view is up".to_string());
+        refresh_status(app);
+        return;
+    }
+    let caret = app.editor.caret();
+    if tool.input == crate::exttools::ToolInput::File && app.editor.path().is_none() {
+        message_box(
+            app.hwnd,
+            "This tool works on the document's file ({file}), but the document has not been saved yet. Save it first, then run the tool.",
+            "External Tool",
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    }
+    let feed: Option<(PieceTable, u64, u64)> = match tool.input {
+        crate::exttools::ToolInput::Selection => {
+            let range = app.editor.selection_range().unwrap_or((caret, caret));
+            Some((snapshot_table(app), range.0, range.1))
+        }
+        crate::exttools::ToolInput::Range => {
+            let range = tool_range(app);
+            Some((snapshot_table(app), range.0, range.1))
+        }
+        crate::exttools::ToolInput::File | crate::exttools::ToolInput::None => None,
+    };
+    let apply_range = app.editor.selection_range().unwrap_or((caret, caret));
+    let file_arg = app
+        .editor
+        .path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let args = crate::exttools::expand_args(&tool.args, &file_arg, caret);
+    let command_line = crate::exttools::quote_command_line(&tool.command, &args);
+    app.tool_gen += 1;
+    let shared = Arc::new(ToolShared {
+        outcome: Mutex::new(None),
+        process: Mutex::new(None),
+        cancelled: std::sync::atomic::AtomicBool::new(false),
+    });
+    let worker_shared = shared.clone();
+    let mode = tool.output;
+    let name = tool.name.clone();
+    std::thread::spawn(move || {
+        let result = tool_worker(&command_line, feed, &worker_shared);
+        let outcome = ToolOutcome {
+            name: name.clone(),
+            mode,
+            result,
+        };
+        if let Ok(mut slot) = worker_shared.outcome.lock() {
+            *slot = Some(outcome);
+        }
+    });
+    app.tool_run = Some(ToolRun {
+        name: tool.name.clone(),
+        gen: app.tool_gen,
+        doc_gen: app.doc_generation,
+        apply_range,
+        shared,
+    });
+    refresh_status(app);
+    invalidate(app);
+}
+
+/// Stop the running tool (Esc): flag the cancellation and
+/// terminate the child; the worker reports it as cancelled.
+fn cancel_tool_run(app: &mut App) {
+    let Some(run) = &app.tool_run else {
+        return;
+    };
+    run.shared
+        .cancelled
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let handle = run.shared.process.lock().ok().and_then(|slot| *slot);
+    if let Some(handle) = handle {
+        // SAFETY: the handle value was registered by the worker,
+        // which clears the slot before closing the handle; while
+        // it is registered the handle is open.
+        unsafe { TerminateProcess(handle as HANDLE, 1) };
+    }
+    app.status_note = Some(format!("Stopping {}\u{2026}", run.name));
+    refresh_status(app);
+}
+
+/// The tool worker: spawn the child with piped stdin/stdout/
+/// stderr, feed it, drain it, wait with the timeout, and report.
+/// Runs entirely on its own thread.
+fn tool_worker(
+    command_line: &str,
+    feed: Option<(PieceTable, u64, u64)>,
+    shared: &Arc<ToolShared>,
+) -> Result<Vec<u8>, String> {
+    // SAFETY: the whole body is Win32 process plumbing; every
+    // handle created here is closed exactly once on every path,
+    // and the pipe ends the child does not inherit are made
+    // non-inheritable before the spawn.
+    unsafe {
+        let mut sa: SECURITY_ATTRIBUTES = std::mem::zeroed();
+        sa.nLength = std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32;
+        sa.bInheritHandle = 1;
+        let (mut in_read, mut in_write) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let (mut out_read, mut out_write) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let (mut err_read, mut err_write) = (std::ptr::null_mut(), std::ptr::null_mut());
+        if CreatePipe(&mut in_read, &mut in_write, &sa, 0) == 0
+            || CreatePipe(&mut out_read, &mut out_write, &sa, 0) == 0
+            || CreatePipe(&mut err_read, &mut err_write, &sa, 0) == 0
+        {
+            for h in [in_read, in_write, out_read, out_write, err_read, err_write] {
+                if !h.is_null() {
+                    CloseHandle(h);
+                }
+            }
+            return Err(format!(
+                "could not create the tool's pipes: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // The parent's ends must not leak into the child.
+        SetHandleInformation(in_write, 1, 0); // HANDLE_FLAG_INHERIT = 1
+        SetHandleInformation(out_read, 1, 0);
+        SetHandleInformation(err_read, 1, 0);
+        let mut startup: STARTUPINFOW = std::mem::zeroed();
+        startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        startup.dwFlags = 0x100; // STARTF_USESTDHANDLES
+        startup.hStdInput = in_read;
+        startup.hStdOutput = out_write;
+        startup.hStdError = err_write;
+        let mut cmdline: Vec<u16> = command_line.encode_utf16().chain(Some(0)).collect();
+        let mut info: PROCESS_INFORMATION = std::mem::zeroed();
+        let created = CreateProcessW(
+            std::ptr::null(),
+            cmdline.as_mut_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            1,
+            0x0800_0000, // CREATE_NO_WINDOW
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut info,
+        );
+        // The child's ends are its own now, whatever happened.
+        CloseHandle(in_read);
+        CloseHandle(out_write);
+        CloseHandle(err_write);
+        if created == 0 {
+            for h in [in_write, out_read, err_read] {
+                CloseHandle(h);
+            }
+            return Err(format!(
+                "could not start the tool: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        CloseHandle(info.hThread);
+        if let Ok(mut slot) = shared.process.lock() {
+            *slot = Some(info.hProcess as usize);
+        }
+        // The feeder: stream the input range in chunks, then
+        // close stdin so the tool sees its end of input. A child
+        // that exits early breaks the pipe; that write error is
+        // expected and ignored. (Handles travel as usize: raw
+        // handles are not Send.)
+        let in_write_usize = in_write as usize;
+        let feeder = std::thread::spawn(move || {
+            let in_write = in_write_usize as HANDLE;
+            if let Some((table, start, end)) = feed {
+                let mut pos = start;
+                let mut buf = vec![0u8; 64 * 1024];
+                while pos < end {
+                    let want = ((end - pos).min(buf.len() as u64)) as usize;
+                    let got = table.read_into(pos, &mut buf[..want]);
+                    if got == 0 {
+                        break;
+                    }
+                    let mut written = 0u32;
+                    if WriteFile(
+                        in_write,
+                        buf.as_ptr(),
+                        got as u32,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    ) == 0
+                    {
+                        break;
+                    }
+                    pos += got as u64;
+                }
+            }
+            CloseHandle(in_write);
+        });
+        // The stderr drainer: read to the cap, keep draining past
+        // it so the child never blocks on a full pipe.
+        let err_read_usize = err_read as usize;
+        let drainer = std::thread::spawn(move || {
+            let err_read = err_read_usize as HANDLE;
+            let mut kept: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 8192];
+            loop {
+                let mut read = 0u32;
+                if ReadFile(
+                    err_read,
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    &mut read,
+                    std::ptr::null_mut(),
+                ) == 0
+                    || read == 0
+                {
+                    break;
+                }
+                if kept.len() < TOOL_STDERR_CAP {
+                    let take = (read as usize).min(TOOL_STDERR_CAP - kept.len());
+                    kept.extend_from_slice(&buf[..take]);
+                }
+            }
+            CloseHandle(err_read);
+            kept
+        });
+        // Stdout is read here: append to the cap, discard past it.
+        let mut out: Vec<u8> = Vec::new();
+        let mut overflow = false;
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let mut read = 0u32;
+            if ReadFile(
+                out_read,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            ) == 0
+                || read == 0
+            {
+                break;
+            }
+            if out.len() + (read as usize) <= TOOL_STDOUT_CAP {
+                out.extend_from_slice(&buf[..read as usize]);
+            } else {
+                let take = TOOL_STDOUT_CAP - out.len();
+                if take > 0 {
+                    out.extend_from_slice(&buf[..take]);
+                }
+                overflow = true;
+            }
+        }
+        CloseHandle(out_read);
+        // The wait is bounded; a timeout stops the child (its
+        // pipes then close, ending the feeder and drainer too).
+        let waited = WaitForSingleObject(info.hProcess, TOOL_TIMEOUT_MS);
+        let timed_out = waited == 0x102; // WAIT_TIMEOUT
+        if timed_out {
+            TerminateProcess(info.hProcess, 1);
+            WaitForSingleObject(info.hProcess, 5_000);
+        }
+        let mut exit_code = 0u32;
+        GetExitCodeProcess(info.hProcess, &mut exit_code);
+        if let Ok(mut slot) = shared.process.lock() {
+            *slot = None;
+        }
+        CloseHandle(info.hProcess);
+        let _ = feeder.join();
+        let stderr = drainer.join().unwrap_or_default();
+        if shared.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("cancelled".to_string());
+        }
+        if timed_out {
+            return Err(format!(
+                "the tool did not finish within {} seconds and was stopped",
+                TOOL_TIMEOUT_MS / 1000
+            ));
+        }
+        if overflow {
+            return Err(
+                "the tool printed more than 16 MB of output \u{2014} too much to use".to_string(),
+            );
+        }
+        if exit_code != 0 {
+            let err_text = String::from_utf8_lossy(&stderr).trim().to_string();
+            return Err(if err_text.is_empty() {
+                format!("the tool exited with code {exit_code}")
+            } else {
+                format!("the tool exited with code {exit_code}: {err_text}")
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Pick up a finished tool run on the tick and apply its output.
+fn service_tool_run(app: &mut App) {
+    let Some(run) = &app.tool_run else {
+        return;
+    };
+    let outcome = match run.shared.outcome.try_lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => None,
+    };
+    let Some(outcome) = outcome else {
+        return;
+    };
+    if outcome.name != run.name || run.gen != app.tool_gen {
+        app.tool_run = None;
+        return;
+    }
+    let apply_range = run.apply_range;
+    let doc_changed = run.doc_gen != app.doc_generation;
+    let mode = outcome.mode;
+    let name = outcome.name.clone();
+    app.tool_run = None;
+    match outcome.result {
+        Err(message) => {
+            app.status_note = Some(format!("{name}: {message}"));
+            refresh_status(app);
+            invalidate(app);
+        }
+        Ok(bytes) => {
+            let would_edit = matches!(
+                mode,
+                crate::exttools::ToolOutput::ReplaceSelection | crate::exttools::ToolOutput::Insert
+            );
+            if would_edit && doc_changed {
+                // The document moved under the tool: show the
+                // output instead of applying it to stale offsets.
+                app.status_note = Some(format!(
+                    "{name} finished, but the document changed while it ran \u{2014} output shown, not applied"
+                ));
+                show_tool_output(app, &name, &bytes);
+            } else {
+                apply_tool_output(app, &name, mode, apply_range, bytes);
+            }
+            refresh_status(app);
+            invalidate(app);
+        }
+    }
+}
+
+/// Apply a successful tool run's output by its mode.
+fn apply_tool_output(
+    app: &mut App,
+    name: &str,
+    mode: crate::exttools::ToolOutput,
+    apply_range: (u64, u64),
+    bytes: Vec<u8>,
+) {
+    match mode {
+        crate::exttools::ToolOutput::ReplaceSelection | crate::exttools::ToolOutput::Insert => {
+            if app.editor.read_only() {
+                app.status_note = Some(format!(
+                    "{name} finished, but the document is read-only \u{2014} output shown, not applied"
+                ));
+                show_tool_output(app, name, &bytes);
+                return;
+            }
+            let (start, end) = if mode == crate::exttools::ToolOutput::Insert {
+                (apply_range.1, apply_range.1)
+            } else {
+                apply_range
+            };
+            app.editor
+                .move_caret_to(start.min(app.editor.total_len()), false);
+            app.editor
+                .move_caret_to(end.min(app.editor.total_len()), true);
+            match app.editor.insert_bytes(&bytes) {
+                Ok(()) => {
+                    app.status_note = Some(format!(
+                        "{name}: {} bytes {}",
+                        bytes.len(),
+                        if mode == crate::exttools::ToolOutput::Insert {
+                            "inserted"
+                        } else {
+                            "applied"
+                        }
+                    ));
+                    after_edit(app);
+                }
+                Err(err) => {
+                    app.status_note = Some(format!("{name}: {err}"));
+                }
+            }
+        }
+        crate::exttools::ToolOutput::NewFile => {
+            let Some(dest) = file_dialog(app, true, Some("tool-output.bin")) else {
+                app.status_note = Some(format!("{name}: output discarded (no file chosen)"));
+                return;
+            };
+            let table = PieceTable::from_original(bytes);
+            match crate::save::save_atomic(&table, &dest, &crate::save::SaveOptions::default()) {
+                Ok(_) => {
+                    app.status_note = Some(format!("{name}: output written to {}", dest.display()));
+                    open_path_in_new_tab(app, &dest);
+                }
+                Err(err) => {
+                    message_box(
+                        app.hwnd,
+                        &format!("{name}'s output could not be written: {err}"),
+                        "External Tool",
+                        MB_OK | MB_ICONERROR,
+                    );
+                }
+            }
+        }
+        crate::exttools::ToolOutput::Discard => {
+            show_tool_output(app, name, &bytes);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool output dialog (item 49): a read-only view of what a tool
+// printed, for discard-mode tools and for output that could not
+// be applied (the document changed, or it is read-only).
+// ---------------------------------------------------------------------------
+
+const TOOLOUT_CLASS: &str = "VeloEditToolOut";
+const ID_TOOLOUT_TEXT: usize = 5601;
+const ID_TOOLOUT_CLOSE: usize = 5602;
+const ES_MULTILINE: u32 = 0x0004;
+const ES_READONLY: u32 = 0x0800;
+const ES_AUTOVSCROLL: u32 = 0x0040;
+
+struct ToolOutState {
+    app: *mut App,
+    text: String,
+}
+
+/// The tool-output dialog's edit subclass: Esc closes.
+unsafe extern "system" fn toolout_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: props set by the dialog before any message can
+    // arrive; the dialog outlives its controls.
+    let old = unsafe { GetPropW(hwnd, wstr("VeloEdit.ToolOutOld").as_ptr()) } as isize;
+    if msg == WM_KEYDOWN && wparam == 0x1B {
+        // SAFETY: the parent is our dialog.
+        let parent = unsafe { GetParent(hwnd) };
+        // SAFETY: standard window call.
+        unsafe { PostMessageW(parent, WM_CLOSE, 0, 0) };
+        return 0;
+    }
+    if msg == WM_NCDESTROY {
+        // SAFETY: restore the original proc and drop our prop.
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, old);
+            RemovePropW(hwnd, wstr("VeloEdit.ToolOutOld").as_ptr());
+        }
+    }
+    let proc_fn: WNDPROC = unsafe { std::mem::transmute(old) };
+    // SAFETY: proc_fn is the edit control's original window
+    // procedure, retrieved from our own property above.
+    unsafe { CallWindowProcW(proc_fn, hwnd, msg, wparam, lparam) }
+}
+
+/// Show a tool's output read-only (long output is cut for
+/// display only, with a note saying so).
+fn show_tool_output(app: &mut App, name: &str, bytes: &[u8]) {
+    let raw = String::from_utf8_lossy(bytes).into_owned();
+    let mut text: String = raw.chars().take(64_000).collect();
+    if raw.chars().count() > 64_000 {
+        text.push_str("\n\u{2026} (output truncated for display)");
+    }
+    let mut state = ToolOutState {
+        app,
+        text: text.replace('\n', "\r\n"),
+    };
+    let class = wstr(TOOLOUT_CLASS);
+    let title = wstr(&format!("{name} \u{2014} output"));
+    // SAFETY: the standard modal-dialog dance (see show_slice_dialog);
+    // `state` outlives the loop.
+    unsafe {
+        let parent = (*state.app).hwnd;
+        let dlg = CreateWindowExW(
+            0,
+            class.as_ptr(),
+            title.as_ptr(),
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            560,
+            360,
+            parent,
+            std::ptr::null_mut(),
+            GetModuleHandleW(std::ptr::null()),
+            &mut state as *mut ToolOutState as *mut c_void,
+        );
+        if dlg.is_null() {
+            return;
+        }
+        EnableWindow(parent, 0);
+        ShowWindow(dlg, SW_SHOW);
+        SetForegroundWindow(dlg);
+        let mut msg: MSG = std::mem::zeroed();
+        while IsWindow(dlg) != 0 {
+            if GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) <= 0 {
+                PostQuitMessage(0);
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        EnableWindow(parent, 1);
+        SetForegroundWindow(parent);
+    }
+}
+
+/// Window procedure for the tool-output dialog.
+unsafe extern "system" fn tool_out_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: the boilerplate every dialog in this file uses; the
+    // state pointer arrives with WM_CREATE and is stashed in
+    // GWLP_USERDATA.
+    unsafe {
+        if msg == WM_CREATE {
+            let create = lparam as *const CREATESTRUCTW;
+            let state = (*create).lpCreateParams as *mut ToolOutState;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
+            let app = &mut *(*state).app;
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                0,
+                0,
+                app.px(560.0),
+                app.px(360.0),
+                0x2, // SWP_NOMOVE
+            );
+            let place = |ctl: HWND, x: f32, y: f32, w: f32, h: f32| {
+                SetWindowPos(
+                    ctl,
+                    std::ptr::null_mut(),
+                    app.px(x),
+                    app.px(y),
+                    app.px(w),
+                    app.px(h),
+                    SWP_NOZORDER,
+                );
+            };
+            // The output: one read-only multiline edit.
+            let text_box = create_child(
+                app,
+                "EDIT",
+                "",
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_VSCROLL
+                    | ES_MULTILINE
+                    | ES_READONLY
+                    | ES_AUTOVSCROLL
+                    | WS_EX_CLIENTEDGE,
+                0,
+                ID_TOOLOUT_TEXT,
+            );
+            SetWindowLongPtrW(text_box, GWLP_HWNDPARENT, hwnd as isize);
+            place(text_box, 12.0, 12.0, 536.0, 296.0);
+            set_control_text(text_box, &(*state).text.clone());
+            // SAFETY: subclass for Esc-to-close; the old proc is
+            // kept in a prop for the control's whole life.
+            let old = SetWindowLongPtrW(
+                text_box,
+                GWLP_WNDPROC,
+                toolout_edit_proc as *const () as usize as isize,
+            );
+            SetPropW(
+                text_box,
+                wstr("VeloEdit.ToolOutOld").as_ptr(),
+                old as *mut c_void,
+            );
+            let close = create_child(
+                app,
+                "BUTTON",
+                "Close",
+                WS_CHILD | WS_VISIBLE | 0xB, // BS_OWNERDRAW
+                0,
+                ID_TOOLOUT_CLOSE,
+            );
+            SetWindowLongPtrW(close, GWLP_HWNDPARENT, hwnd as isize);
+            place(close, 464.0, 318.0, 84.0, 28.0);
+            SetFocus(text_box);
+            return 0;
+        }
+        let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ToolOutState;
+        if state.is_null() {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+        let app = &mut *(*state).app;
+        match msg {
+            WM_COMMAND => {
+                if wparam & 0xFFFF == ID_TOOLOUT_CLOSE {
+                    DestroyWindow(hwnd);
+                }
+                0
+            }
+            WM_DRAWITEM => draw_dialog_button(app, lparam),
+            WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                let theme = &app.theme;
+                SetBkColor(wparam as _, colorref(theme.panel));
+                SetTextColor(wparam as _, colorref(theme.text));
+                app.panel_brush as LRESULT
+            }
+            WM_CLOSE => {
+                DestroyWindow(hwnd);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -12168,6 +15008,17 @@ fn create_children(app: &mut App) {
         app.find_scope_check,
         "Search and replace only inside the current selection",
     );
+    // The "Regex" toggle (roadmap item 9, slice R5d): same
+    // owner-drawn family, appended after the scope toggle in
+    // find_controls (index 9; layout_children places it by index).
+    app.find_regex_check = create_child(app, "Button", "Regex", button_style, 0, CMD_FIND_REGEX);
+    app.find_controls.push(app.find_regex_check);
+    add_tooltip(
+        tooltip,
+        app.hwnd,
+        app.find_regex_check,
+        "Search with a regular expression (whole document; UTF-8 and ANSI files)",
+    );
     subclass_edit(app.find_edit, app.hwnd);
     subclass_edit(app.replace_edit, app.hwnd);
 
@@ -12415,6 +15266,7 @@ fn build_menus(app: &mut App) {
         );
         menu_sep(view);
         menu_item(view, CMD_INSPECTOR, "Data Inspector");
+        menu_item(view, CMD_DISASM, "Disassembly");
         menu_item(view, CMD_STRINGS, "Strings Pane");
         menu_sep(view);
         // Roadmap slice R4b view features. Follow Tail and Word
@@ -12675,6 +15527,7 @@ fn refresh_menu_checks(app: &App) {
             (CMD_DIM, app.dim_on),
             (CMD_ANSI, app.ansi_on),
             (CMD_CTL_CHARS, app.ctl_on),
+            (CMD_DISASM, app.disasm_on),
         ] {
             CheckMenuItem(
                 app.view_menu,
@@ -13172,7 +16025,33 @@ fn on_command(app: &mut App, id: usize) {
             }
         }
         CMD_CUT => {
-            if let Some(text) = copy_text(&mut app.editor) {
+            // A live rectangle cuts as its extracted text plus
+            // one rect delete (slice R5d).
+            if let Some(rect) = app.rect_sel {
+                let eol = app.editor.line_ending();
+                let text = app.editor.rect_extract_text(
+                    rect.first_line,
+                    rect.last_line,
+                    rect.col_start,
+                    rect.col_end,
+                    eol,
+                );
+                clipboard_set_text(app.hwnd, &text);
+                if app
+                    .editor
+                    .rect_delete(
+                        rect.first_line,
+                        rect.last_line,
+                        rect.col_start,
+                        rect.col_end,
+                    )
+                    .unwrap_or(false)
+                {
+                    app.rect_sel = None;
+                    app.extra_carets.clear();
+                    after_edit(app);
+                }
+            } else if let Some(text) = copy_text(&mut app.editor) {
                 clipboard_set_text(app.hwnd, &text);
                 if app.editor.delete_selection().unwrap_or(false) {
                     after_edit(app);
@@ -13180,7 +16059,19 @@ fn on_command(app: &mut App, id: usize) {
             }
         }
         CMD_COPY => {
-            if let Some(text) = copy_text(&mut app.editor) {
+            if let Some(rect) = app.rect_sel {
+                // Rectangle copy: the extracted columns, joined
+                // with the document's line ending (slice R5d).
+                let eol = app.editor.line_ending();
+                let text = app.editor.rect_extract_text(
+                    rect.first_line,
+                    rect.last_line,
+                    rect.col_start,
+                    rect.col_end,
+                    eol,
+                );
+                clipboard_set_text(app.hwnd, &text);
+            } else if let Some(text) = copy_text(&mut app.editor) {
                 clipboard_set_text(app.hwnd, &text);
             }
         }
@@ -13245,6 +16136,38 @@ fn on_command(app: &mut App, id: usize) {
             }
             find_from_bar(app, 0);
         }
+        CMD_FIND_REGEX => {
+            // The "Regex" toggle (roadmap item 9, slice R5d):
+            // state, ✓ prefix, accent draw state — the scope
+            // toggle's exact pattern. Regex searches the whole
+            // document, so turning it on turns the scope off
+            // rather than letting the two silently combine.
+            app.find_regex = !app.find_regex;
+            if app.find_regex && app.find_in_selection {
+                app.find_in_selection = false;
+                app.find_scope_range = None;
+                app.last_scope_range = None;
+                set_control_text(app.find_scope_check, "In selection");
+                // SAFETY: our find-bar button.
+                unsafe { InvalidateRect(app.find_scope_check, std::ptr::null(), 1) };
+            }
+            set_control_text(
+                app.find_regex_check,
+                if app.find_regex {
+                    "\u{2713} Regex"
+                } else {
+                    "Regex"
+                },
+            );
+            // SAFETY: our find-bar button.
+            unsafe {
+                InvalidateRect(app.find_regex_check, std::ptr::null(), 1);
+                SetFocus(app.find_edit);
+            }
+            find_from_bar(app, 0);
+        }
+        CMD_APPLY_TEMPLATE => show_template_dialog(app),
+        CMD_TOOLS_RELOAD => reload_tools(app),
         CMD_SELECT_ALL => {
             app.editor.select_all();
             after_caret_move(app);
@@ -13363,6 +16286,22 @@ fn on_command(app: &mut App, id: usize) {
             save_settings(app);
             refresh_menu_checks(app);
             sync_hex_layout(app);
+            layout_children(app);
+            invalidate(app);
+        }
+        CMD_DISASM => {
+            // Disassembly panel (slice R5d): hex mode only. The
+            // toggle is session state; in text mode a note says
+            // where it will appear.
+            app.disasm_on = !app.disasm_on;
+            if app.disasm_on {
+                app.disasm_stale = true;
+                if app.editor.mode() == EditorMode::Text {
+                    app.status_note = Some("Disassembly appears in hex mode".to_string());
+                    refresh_status(app);
+                }
+            }
+            refresh_menu_checks(app);
             layout_children(app);
             invalidate(app);
         }
@@ -13687,6 +16626,12 @@ fn on_command(app: &mut App, id: usize) {
                 open_path_from_ui(app, Path::new(&path));
             }
         }
+        _ if (CMD_TOOL_BASE..CMD_TOOL_BASE + 64).contains(&id) => {
+            // One external tool from data/tools.json (item 49).
+            if let Some(tool) = app.tools.tools.get(id - CMD_TOOL_BASE).cloned() {
+                run_tool(app, &tool);
+            }
+        }
         _ => {}
     }
 }
@@ -13884,6 +16829,8 @@ fn dispatch_action(app: &mut App, action: &str) {
         "clear_filter" => on_command(app, CMD_CLEAR_FILTER),
         // Split view and diff navigation (slice R5c).
         "toggle_split" => on_command(app, CMD_SPLIT_VIEW),
+        "caret_up" => add_caret_at_line(app, false),
+        "caret_down" => add_caret_at_line(app, true),
         "diff_next" => on_command(app, CMD_DIFF_NEXT),
         "diff_prev" => on_command(app, CMD_DIFF_PREV),
         // Tabs (roadmap item 39, slice R5b).
@@ -13942,6 +16889,12 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
     // a filter never coexist.
     if vk == 0x1B && app.compare.is_some() {
         close_compare(app);
+        return true;
+    }
+    // Esc stops a running external tool (item 49): its worker
+    // reports the run as cancelled on the next tick.
+    if vk == 0x1B && app.tool_run.is_some() {
+        cancel_tool_run(app);
         return true;
     }
     // The filter view has its own key model: Up/Down walk the row
@@ -14028,6 +16981,14 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
         dispatch_action(app, action);
         return true;
     }
+    // Multi-caret (slice R5d): any navigation key collapses the
+    // extra carets and the rectangle back to the single caret.
+    // (The caret_up/caret_down chords were claimed by the dispatch
+    // above and never reach here.)
+    if matches!(vk, 0x21..=0x28) && (!app.extra_carets.is_empty() || app.rect_sel.is_some()) {
+        clear_multi(app);
+        refresh_status(app);
+    }
     match vk {
         0x25 => app.editor.move_left(shift),  // VK_LEFT
         0x27 => app.editor.move_right(shift), // VK_RIGHT
@@ -14074,7 +17035,11 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
         }
         0x22 => app.editor.move_page_down(page, shift), // VK_NEXT
         0x08 => {
-            // VK_BACK
+            // VK_BACK: at multiple carets, one delete at each
+            // (slice R5d, one undo entry).
+            if multi_delete(app, true) {
+                return true;
+            }
             if edit_blocked_by_freeze(app, true, false) {
                 frozen_note(app);
                 return true;
@@ -14087,7 +17052,11 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
         0x2E => {
             // VK_DELETE: an unbound Delete deletes forward, as
             // always. (A Delete chord bound to an action was
-            // claimed by the dispatch above.)
+            // claimed by the dispatch above.) At multiple carets
+            // it deletes at each (slice R5d).
+            if multi_delete(app, false) {
+                return true;
+            }
             if edit_blocked_by_freeze(app, false, true) {
                 frozen_note(app);
                 return true;
@@ -14098,7 +17067,15 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
             return true;
         }
         0x1B => {
-            // VK_ESCAPE
+            // VK_ESCAPE: extra carets and the rectangle collapse
+            // first (slice R5d); then the find bar / selection as
+            // before.
+            if !app.extra_carets.is_empty() || app.rect_sel.is_some() {
+                clear_multi(app);
+                refresh_status(app);
+                invalidate(app);
+                return true;
+            }
             if app.find_visible {
                 hide_find_bar(app);
             } else {
@@ -14113,7 +17090,304 @@ fn on_keydown(app: &mut App, wparam: WPARAM) -> bool {
     after_caret_move(app);
     true
 }
+// ---------------------------------------------------------------------------
+// Multi-caret and rectangular editing (slice R5d, wiring the
+// R5a undo core): extra carets are plain byte offsets beside the
+// editor's primary caret; every edit at every caret goes through
+// Editor::caret_edit_plan + apply_multi_replace as ONE undo
+// entry. Text mode only — in hex mode the gestures decline with
+// a status note. Plain click, Esc, and any navigation collapse
+// back to the single caret.
+// ---------------------------------------------------------------------------
+
+/// Whether multi-caret or rectangle state is live (text mode,
+/// no filter — the filter view is read-only and has its own keys).
+fn multi_active(app: &App) -> bool {
+    app.editor.mode() == EditorMode::Text
+        && app.filter.is_none()
+        && (!app.extra_carets.is_empty() || app.rect_sel.is_some())
+}
+
+/// Collapse all multi state back to the single primary caret.
+fn clear_multi(app: &mut App) {
+    app.extra_carets.clear();
+    app.rect_sel = None;
+    app.rect_drag = None;
+    app.rect_press = None;
+}
+
+/// Whether a multi edit would touch the frozen block: the
+/// primary caret is checked by the usual helper's line maths;
+/// extras and the rectangle are checked by their lines.
+fn multi_blocked_by_freeze(app: &mut App) -> bool {
+    let freeze = app.settings.freeze_lines as u64;
+    if freeze == 0 {
+        return false;
+    }
+    if let Some(rect) = &app.rect_sel {
+        if rect.first_line < freeze {
+            return true;
+        }
+    }
+    app.extra_carets
+        .iter()
+        .any(|&off| app.editor.line_col_of(off).0 < freeze)
+}
+
+/// Alt+click: add an extra caret at `offset`, or remove the one
+/// already there. Clicking the primary caret does nothing.
+fn toggle_extra_caret(app: &mut App, offset: u64) {
+    if offset == app.editor.caret() {
+        return;
+    }
+    if let Some(pos) = app.extra_carets.iter().position(|&o| o == offset) {
+        app.extra_carets.remove(pos);
+    } else {
+        app.extra_carets.push(offset);
+        app.extra_carets.sort_unstable();
+    }
+    refresh_status(app);
+    invalidate(app);
+}
+
+/// Ctrl+Alt+Up/Down: add a caret on the line above or below the
+/// outermost caret in that direction, at the same byte column
+/// (clamped to the target line's content).
+fn add_caret_at_line(app: &mut App, down: bool) {
+    // Adding a caret switches the selection model from the
+    // rectangle to carets.
+    app.rect_sel = None;
+    if app.editor.mode() == EditorMode::Hex {
+        app.status_note = Some("Multiple carets are text-mode only".to_string());
+        refresh_status(app);
+        return;
+    }
+    if app.filter.is_some() {
+        return;
+    }
+    let ed = &mut app.editor;
+    let mut all: Vec<u64> = app.extra_carets.clone();
+    all.push(ed.caret());
+    let pick = if down {
+        all.iter().max_by_key(|&&off| ed.line_col_of(off).0)
+    } else {
+        all.iter().min_by_key(|&&off| ed.line_col_of(off).0)
+    };
+    let Some(&base) = pick else { return };
+    let (line, _) = ed.line_col_of(base);
+    let byte_col = base - ed.line_start_byte(line).unwrap_or(0);
+    let target_line = if down {
+        if line + 1 >= ed.line_count() {
+            return;
+        }
+        line + 1
+    } else {
+        if line == 0 {
+            return;
+        }
+        line - 1
+    };
+    let Some(start) = ed.line_start_byte(target_line) else {
+        return;
+    };
+    let end = ed
+        .line_content_range(target_line)
+        .map(|(_, e)| e)
+        .unwrap_or(start);
+    let offset = (start + byte_col).min(end);
+    if offset == ed.caret() || app.extra_carets.contains(&offset) {
+        return;
+    }
+    app.extra_carets.push(offset);
+    app.extra_carets.sort_unstable();
+    refresh_status(app);
+    invalidate(app);
+}
+
+/// One character step from `off`, through the editor's own
+/// line/column maths (so every encoding steps whole characters).
+fn char_step(app: &mut App, off: u64, dir: i32) -> u64 {
+    let ed = &mut app.editor;
+    let (line, col) = ed.line_col_of(off);
+    if dir < 0 {
+        if col > 0 {
+            ed.offset_of_line_col(line, col - 1).unwrap_or(off)
+        } else if line > 0 {
+            ed.line_content_range(line - 1)
+                .map(|(_, e)| e)
+                .unwrap_or(off)
+        } else {
+            off
+        }
+    } else {
+        let end = ed.line_content_range(line).map(|(_, e)| e).unwrap_or(off);
+        if off < end {
+            ed.offset_of_line_col(line, col + 1).unwrap_or(end)
+        } else if line + 1 < ed.line_count() {
+            ed.line_start_byte(line + 1).unwrap_or(off)
+        } else {
+            off
+        }
+    }
+}
+
+/// The byte range a rectangle covers on one line (clamped).
+fn rect_line_range(ed: &mut Editor, rect: &RectSel, line: u64) -> Option<(u64, u64)> {
+    let (start, end) = ed.line_content_range(line)?;
+    let len = end - start;
+    Some((
+        start + rect.col_start.min(len),
+        start + rect.col_end.min(len),
+    ))
+}
+
+/// Settle the carets after a multi edit: the primary takes its
+/// planned offset; the extras take theirs, deduplicated and
+/// never on top of the primary.
+fn settle_carets(app: &mut App, news: &[u64]) {
+    let primary_new = news[0];
+    let mut extras: Vec<u64> = news[1..].to_vec();
+    extras.retain(|&o| o != primary_new);
+    extras.sort_unstable();
+    extras.dedup();
+    app.editor.move_caret_to(primary_new, false);
+    app.extra_carets = extras;
+    app.rect_sel = None;
+}
+
+/// Type `text` at every caret (or over the rectangle) as one
+/// undo entry. Returns false when multi state is not active, so
+/// the caller falls back to the ordinary single-caret insert.
+fn multi_type(app: &mut App, text: &str) -> bool {
+    if !multi_active(app) {
+        return false;
+    }
+    if multi_blocked_by_freeze(app) {
+        frozen_note(app);
+        return true;
+    }
+    let bytes = match app.editor.encode_text(text) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    if let Some(rect) = app.rect_sel {
+        // Typing over the rectangle replaces each line's segment
+        // with the typed text — one undo entry through the same
+        // multi path.
+        let mut edits: Vec<crate::undo::RangeEdit> = Vec::new();
+        for line in rect.first_line..=rect.last_line {
+            if let Some((start, end)) = rect_line_range(&mut app.editor, &rect, line) {
+                edits.push(crate::undo::RangeEdit {
+                    offset: start,
+                    delete_len: end - start,
+                    replacement: &bytes,
+                });
+            }
+        }
+        let first_start = edits.first().map(|e| e.offset);
+        match app.editor.apply_multi_replace(&edits) {
+            Ok(true) => {
+                app.rect_sel = None;
+                app.extra_carets.clear();
+                if let Some(start) = first_start {
+                    let at = start + bytes.len() as u64;
+                    app.editor.move_caret_to(at, false);
+                }
+                after_edit(app);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                app.status_note = Some(err.to_string());
+                refresh_status(app);
+            }
+        }
+        return true;
+    }
+    let caret = app.editor.caret();
+    let primary = app.editor.selection_range().unwrap_or((caret, caret));
+    let mut carets: Vec<(u64, u64)> = vec![primary];
+    for &off in &app.extra_carets {
+        carets.push((off, off));
+    }
+    let (edits, news) = Editor::caret_edit_plan(&carets, &bytes);
+    match app.editor.apply_multi_replace(&edits) {
+        Ok(true) => {
+            settle_carets(app, &news);
+            after_edit(app);
+        }
+        Ok(false) => {}
+        Err(err) => {
+            app.status_note = Some(err.to_string());
+            refresh_status(app);
+        }
+    }
+    true
+}
+
+/// Backspace / Delete at every caret (or over the rectangle) as
+/// one undo entry. Same contract as multi_type.
+fn multi_delete(app: &mut App, backspace: bool) -> bool {
+    if !multi_active(app) {
+        return false;
+    }
+    if multi_blocked_by_freeze(app) {
+        frozen_note(app);
+        return true;
+    }
+    if let Some(rect) = app.rect_sel {
+        match app.editor.rect_delete(
+            rect.first_line,
+            rect.last_line,
+            rect.col_start,
+            rect.col_end,
+        ) {
+            Ok(true) => {
+                app.rect_sel = None;
+                app.extra_carets.clear();
+                after_edit(app);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                app.status_note = Some(err.to_string());
+                refresh_status(app);
+            }
+        }
+        return true;
+    }
+    let caret = app.editor.caret();
+    let primary = match app.editor.selection_range() {
+        Some(range) => range,
+        None if backspace => (char_step(app, caret, -1), caret),
+        None => (caret, char_step(app, caret, 1)),
+    };
+    let mut carets: Vec<(u64, u64)> = vec![primary];
+    let extras = app.extra_carets.clone();
+    for &off in &extras {
+        carets.push(if backspace {
+            (char_step(app, off, -1), off)
+        } else {
+            (off, char_step(app, off, 1))
+        });
+    }
+    let (edits, news) = Editor::caret_edit_plan(&carets, b"");
+    match app.editor.apply_multi_replace(&edits) {
+        Ok(true) => {
+            settle_carets(app, &news);
+            after_edit(app);
+        }
+        Ok(false) => {}
+        Err(err) => {
+            app.status_note = Some(err.to_string());
+            refresh_status(app);
+        }
+    }
+    true
+}
+
 fn insert_str(app: &mut App, text: &str) {
+    if multi_type(app, text) {
+        return;
+    }
     if app.editor.insert_text(text).is_ok() {
         after_edit(app);
     }
@@ -14186,7 +17460,12 @@ fn on_char(app: &mut App, wparam: WPARAM) -> bool {
             app.pending_high_surrogate = None;
             match ch {
                 0x0D => {
-                    // Enter
+                    // Enter: at multiple carets, the document's
+                    // line ending goes in at every caret (one
+                    // undo entry, slice R5d).
+                    if multi_type(app, app.editor.line_ending()) {
+                        return true;
+                    }
                     if app.editor.insert_newline().is_ok() {
                         after_edit(app);
                     }
@@ -14248,7 +17527,8 @@ fn strings_click(app: &mut App, x: f32, y: f32, double: bool, layout: &Layout) {
             return;
         }
     }
-    let row = ((y - layout.rows_bottom - STRINGS_HEADER_H) / app.line_h.max(1.0)).floor();
+    let row =
+        ((y - layout.rows_bottom - layout.tpl_h - STRINGS_HEADER_H) / app.line_h.max(1.0)).floor();
     if row < 0.0 {
         return;
     }
@@ -14260,6 +17540,63 @@ fn strings_click(app: &mut App, x: f32, y: f32, double: bool, layout: &Layout) {
         } else {
             invalidate(app);
         }
+    }
+}
+
+/// A click in the template results pane (slice R5d): the header's
+/// close box closes the pane; a row selects, and a double-click
+/// moves the caret to the field and selects its bytes.
+fn tpl_click(app: &mut App, x: f32, y: f32, double: bool, layout: &Layout) {
+    let close = app.tpl_close_rect;
+    if x >= close.0 && x < close.2 && y >= close.1 && y < close.3 {
+        app.tpl_open = false;
+        invalidate(app);
+        return;
+    }
+    let row = ((y - layout.rows_bottom - TPL_HEADER_H) / app.line_h.max(1.0)).floor();
+    if row < 0.0 {
+        return;
+    }
+    let idx = app.tpl_first + row as usize;
+    let Some(result) = &app.tpl_result else {
+        return;
+    };
+    if idx >= result.fields.len() {
+        return;
+    }
+    app.tpl_selected = Some(idx);
+    if double {
+        let field = &result.fields[idx];
+        let (offset, size) = (field.offset, field.size);
+        app.editor.move_caret_to(offset, false);
+        if size > 0 {
+            app.editor.move_caret_to(offset + size, true);
+        }
+        app.caret_on = true;
+        refresh_status(app);
+    }
+    invalidate(app);
+}
+
+/// Wheel over the template results pane scrolls its rows.
+fn tpl_wheel(app: &mut App, wparam: WPARAM) {
+    let delta = ((wparam >> 16) as u16) as i16 as i32;
+    app.wheel_rem += delta;
+    let total = app.tpl_result.as_ref().map(|r| r.fields.len()).unwrap_or(0);
+    let max_first = total.saturating_sub(TPL_ROWS as usize);
+    let mut changed = false;
+    while app.wheel_rem >= 120 {
+        app.tpl_first = app.tpl_first.saturating_sub(3);
+        app.wheel_rem -= 120;
+        changed = true;
+    }
+    while app.wheel_rem <= -120 {
+        app.tpl_first = (app.tpl_first + 3).min(max_first);
+        app.wheel_rem += 120;
+        changed = true;
+    }
+    if changed {
+        invalidate(app);
     }
 }
 
@@ -14299,8 +17636,25 @@ fn on_mouse_down(app: &mut App, lparam: LPARAM, double: bool) {
     // Any press dismisses the tick hover preview.
     app.hover_cand = None;
     hide_hover(app);
-    // Strings pane (R4b): chips and rows live below the rows region.
-    if layout.strings_h > 0.0 && yd >= layout.rows_bottom {
+    // Template results pane (slice R5d): directly below the rows
+    // region, above the strings pane.
+    if layout.tpl_h > 0.0 && yd >= layout.rows_bottom && yd < layout.rows_bottom + layout.tpl_h {
+        tpl_click(app, xd, yd, double, &layout);
+        return;
+    }
+    // Disassembly panel (slice R5d): a double-click on a row moves
+    // the caret to the instruction; other presses there are inert.
+    if disasm_showing(app)
+        && xd >= layout.editor_right
+        && yd >= layout.rows_top
+        && yd < layout.rows_bottom
+    {
+        disasm_click(app, xd, yd, double, &layout);
+        return;
+    }
+    // Strings pane (R4b): chips and rows live below the rows region
+    // (below the template pane too, slice R5d).
+    if layout.strings_h > 0.0 && yd >= layout.rows_bottom + layout.tpl_h {
         strings_click(app, xd, yd, double, &layout);
         return;
     }
@@ -14377,6 +17731,31 @@ fn on_mouse_down(app: &mut App, lparam: LPARAM, double: bool) {
         return;
     }
     let offset = pos_to_offset(app, x, y);
+    // Alt gestures (slice R5d): Alt+click toggles an extra caret;
+    // Alt+drag selects a byte-column rectangle. Text mode only —
+    // in hex mode they decline with a note. (The split view keeps
+    // its own click model; multi state just collapses there.)
+    // SAFETY: plain key-state read (VK_MENU = 0x12).
+    let alt = unsafe { GetKeyState(0x12) } as u16 & 0x8000 != 0;
+    if alt && app.compare.is_none() && !split_active(app) {
+        if app.editor.mode() == EditorMode::Hex {
+            app.status_note = Some("Multiple carets and rectangles are text-mode only".to_string());
+            refresh_status(app);
+            return;
+        }
+        let (line, _) = app.editor.line_col_of(offset);
+        let byte_col = offset - app.editor.line_start_byte(line).unwrap_or(0);
+        app.rect_press = Some((line, byte_col, offset));
+        // SAFETY: capture the mouse for the possible drag;
+        // released on button up.
+        unsafe { SetCapture(app.hwnd) };
+        return;
+    }
+    // A plain press collapses multi state (slice R5d).
+    if !app.extra_carets.is_empty() || app.rect_sel.is_some() {
+        clear_multi(app);
+        refresh_status(app);
+    }
     // Ctrl+click in hex mode follows the pointer at the clicked
     // byte (roadmap item 11 wiring).
     // SAFETY: plain key-state read (VK_CONTROL = 0x11).
@@ -14543,6 +17922,9 @@ unsafe extern "system" fn wnd_proc(
         app.dpi = if dpi == 0 { 96 } else { dpi };
         create_children(app);
         build_menus(app);
+        // The taskbar jump list (roadmap item 40) publishes at
+        // startup and whenever the recent list changes.
+        publish_jump_list(app);
         // The persisted hex layout (roadmap items 13/14) applies
         // from the first paint.
         sync_hex_layout(app);
@@ -14572,6 +17954,14 @@ unsafe extern "system" fn wnd_proc(
         if !ptr.is_null() {
             // SAFETY: as above.
             unsafe {
+                // The UIA provider (item 47) disconnects and the
+                // window's reference is released before the App
+                // goes away.
+                let provider = (*ptr).uia_provider;
+                if !provider.is_null() {
+                    uia_disconnect(provider);
+                    com_release(provider);
+                }
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(ptr));
             }
@@ -14593,6 +17983,28 @@ unsafe extern "system" fn wnd_proc(
     let app = unsafe { &mut *app_ptr };
 
     match msg {
+        WM_GETOBJECT => {
+            // UIA (roadmap item 47, scoped): for the root object
+            // request (lparam = UiaRootObjectId = -25), hand UIA
+            // our raw provider; every other object id gets the
+            // default handling.
+            if lparam == -25 {
+                if app.uia_provider.is_null() {
+                    app.uia_provider = uia_create_provider(hwnd);
+                }
+                if !app.uia_provider.is_null() {
+                    // The provider is ours, kept alive by the
+                    // window until WM_NCDESTROY.
+                    if let Some(result) =
+                        uia_return_provider(hwnd, wparam, lparam, app.uia_provider)
+                    {
+                        return result;
+                    }
+                }
+            }
+            // SAFETY: default handling.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_PAINT => {
             // SAFETY: PAINTSTRUCT is a plain C struct; BeginPaint /
             // EndPaint bracket the one render pass.
@@ -14652,9 +18064,15 @@ unsafe extern "system" fn wnd_proc(
                 app.tab_scroll_x = (app.tab_scroll_x - delta * 40.0).max(0.0);
                 clamp_tab_scroll(app);
                 invalidate(app);
-            } else if layout.strings_h > 0.0
+            } else if layout.tpl_h > 0.0
                 && wparam & 0xFFFF & 0x0008 == 0
                 && app.dip(pt.y) >= layout.rows_bottom
+                && app.dip(pt.y) < layout.rows_bottom + layout.tpl_h
+            {
+                tpl_wheel(app, wparam);
+            } else if layout.strings_h > 0.0
+                && wparam & 0xFFFF & 0x0008 == 0
+                && app.dip(pt.y) >= layout.rows_bottom + layout.tpl_h
                 && !app.strings.results.is_empty()
             {
                 strings_wheel(app, wparam);
@@ -14693,7 +18111,33 @@ unsafe extern "system" fn wnd_proc(
         WM_MOUSEMOVE => {
             let (mx, my) = mouse_xy(lparam);
             let (dx, dy) = (app.dip(mx), app.dip(my));
-            if let Some(grab) = app.divider_drag {
+            if app.rect_press.is_some() || app.rect_drag.is_some() {
+                // Rectangle drag (slice R5d): once the pointer
+                // leaves the pressed line/column the press becomes
+                // a drag; the selection is the normalised pair of
+                // corners in (line, byte column) space.
+                let offset = pos_to_offset(app, mx, my);
+                let (line, _) = app.editor.line_col_of(offset);
+                let byte_col = offset - app.editor.line_start_byte(line).unwrap_or(0);
+                if app.rect_drag.is_none() {
+                    let (pl, pc, _) = app.rect_press.unwrap();
+                    if line != pl || byte_col != pc {
+                        app.rect_drag = Some(((pl, pc), (line, byte_col)));
+                    }
+                }
+                if let Some((_, corner)) = &mut app.rect_drag {
+                    *corner = (line, byte_col);
+                }
+                if let Some(((l1, c1), (l2, c2))) = app.rect_drag {
+                    app.rect_sel = Some(RectSel {
+                        first_line: l1.min(l2),
+                        last_line: l1.max(l2),
+                        col_start: c1.min(c2),
+                        col_end: c1.max(c2),
+                    });
+                }
+                invalidate(app);
+            } else if let Some(grab) = app.divider_drag {
                 // Divider drag (slice R5c): the divider tracks
                 // the pointer; the persisted ratio is clamped to
                 // the usable range, and a fit-to-window hex
@@ -14814,7 +18258,26 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_LBUTTONUP => {
-            if app.divider_drag.take().is_some() {
+            if app.rect_press.is_some() || app.rect_drag.is_some() {
+                // Rectangle gesture ends (slice R5d): a press that
+                // never became a drag toggles an extra caret at
+                // the pressed offset; a drag leaves the rectangle.
+                if app.rect_drag.take().is_none() {
+                    if let Some((_, _, offset)) = app.rect_press.take() {
+                        app.rect_sel = None;
+                        toggle_extra_caret(app, offset);
+                    }
+                } else {
+                    app.rect_press = None;
+                    // The rectangle replaces the extra carets as
+                    // the live selection model.
+                    app.extra_carets.clear();
+                    refresh_status(app);
+                    invalidate(app);
+                }
+                // SAFETY: pairs with the SetCapture at mouse-down.
+                unsafe { ReleaseCapture() };
+            } else if app.divider_drag.take().is_some() {
                 // The divider's resting place persists (slice
                 // R5c), like the window's own geometry.
                 save_settings(app);
@@ -15067,18 +18530,23 @@ unsafe extern "system" fn wnd_proc(
                                 if progress.find_gen == app.find_gen
                                     && progress.doc_gen == app.doc_generation
                                 {
-                                    Some((progress.matches.clone(), progress.done))
+                                    Some((
+                                        progress.matches.clone(),
+                                        progress.ends.clone(),
+                                        progress.done,
+                                    ))
                                 } else {
                                     None
                                 }
                             }),
                             Err(_) => None,
                         };
-                        if let Some((matches, done)) = snapshot {
+                        if let Some((matches, ends, done)) = snapshot {
                             let changed =
                                 matches.len() != app.bg_matches.len() || (done && !app.bg_done);
                             if changed {
                                 app.bg_matches = matches;
+                                app.bg_ends = ends;
                                 app.bg_done = done;
                                 if app.bg_current.is_none() && !app.bg_matches.is_empty() {
                                     let caret = app.editor.caret();
@@ -15112,6 +18580,9 @@ unsafe extern "system" fn wnd_proc(
                     // are epoch-guarded on their own generations).
                     service_strings(app);
                     service_entropy(app);
+                    // External tools (item 49): apply a finished
+                    // run's output.
+                    service_tool_run(app);
                     // Scrollbar tick hover preview (item 24
                     // expansion): a settled candidate shows; a moved
                     // or vanished one hides.
@@ -15280,7 +18751,9 @@ unsafe extern "system" fn wnd_proc(
             let seg_active = (id == CMD_MODE_TEXT && app.editor.mode() == EditorMode::Text)
                 || (id == CMD_MODE_HEX && app.editor.mode() == EditorMode::Hex)
                 || (split_active(app) && (id == CMD_MODE_TEXT || id == CMD_MODE_HEX));
-            let active = seg_active || (id == CMD_FIND_SCOPE && app.find_in_selection);
+            let active = seg_active
+                || (id == CMD_FIND_SCOPE && app.find_in_selection)
+                || (id == CMD_FIND_REGEX && app.find_regex);
             let brush = if seg_active {
                 app.accent_brush
             } else if pressed {
@@ -15615,6 +19088,9 @@ pub fn run_gui(options: &CliOptions) -> i32 {
     let edit_brush = unsafe { CreateSolidBrush(colorref(theme.bg)) };
     let line_brush = unsafe { CreateSolidBrush(colorref(theme.line)) };
     let accent_brush = unsafe { CreateSolidBrush(colorref(theme.accent)) };
+    // The external tools load before the window exists so the
+    // Tools menu is built from the real set (roadmap item 49).
+    let (initial_tools, initial_tools_error) = load_tool_set();
     let mut app = App {
         hwnd: std::ptr::null_mut(),
         editor,
@@ -15642,6 +19118,8 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         find_label: std::ptr::null_mut(),
         replace_label: std::ptr::null_mut(),
         find_scope_check: std::ptr::null_mut(),
+        find_regex_check: std::ptr::null_mut(),
+        find_regex: false,
         find_in_selection: false,
         find_scope_range: None,
         last_scope_range: None,
@@ -15654,6 +19132,7 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         bg_done: false,
         bg_current: None,
         bg_needle_len: 0,
+        bg_ends: Vec::new(),
         find_sync_once: false,
         bookmark_store: crate::bookmarks::BookmarkStore::load_from(
             &crate::bookmarks::bookmarks_path(),
@@ -15763,6 +19242,26 @@ pub fn run_gui(options: &CliOptions) -> i32 {
         compare: None,
         split_div_hover: false,
         divider_drag: None,
+        tpl_open: false,
+        tpl_result: None,
+        tpl_title: String::new(),
+        tpl_first: 0,
+        tpl_selected: None,
+        tpl_close_rect: (0.0, 0.0, 0.0, 0.0),
+        tools: initial_tools,
+        tools_menu: std::ptr::null_mut(),
+        tools_error: initial_tools_error,
+        tool_run: None,
+        tool_gen: 0,
+        disasm_on: false,
+        disasm_base: 0,
+        disasm_rows: Vec::new(),
+        disasm_stale: true,
+        extra_carets: Vec::new(),
+        rect_sel: None,
+        rect_drag: None,
+        rect_press: None,
+        uia_provider: std::ptr::null_mut(),
     };
     // Per-document tracking for the startup document (bookmarks,
     // external-change baseline, recovery fingerprint): the same
@@ -15969,10 +19468,12 @@ fn register_classes(hinstance: HINSTANCE) -> bool {
     }
     // Slice R4c dialogs: Extract Ranges, Compare With, and the
     // bookmark annotation editor — same registration shape.
-    let r4c_dialogs: [(&str, WNDPROC); 3] = [
+    let r4c_dialogs: [(&str, WNDPROC); 5] = [
         (SLICE_CLASS, Some(slice_dialog_proc)),
         (COMPARE_CLASS, Some(compare_dialog_proc)),
         (BMEDIT_CLASS, Some(bookmark_edit_proc)),
+        (TPLDLG_CLASS, Some(template_dialog_proc)),
+        (TOOLOUT_CLASS, Some(tool_out_proc)),
     ];
     for (name, proc_fn) in r4c_dialogs {
         let class_name = wstr(name);
