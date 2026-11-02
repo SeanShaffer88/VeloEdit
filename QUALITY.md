@@ -1821,8 +1821,20 @@ scored from real Windows evidence before any release.
   vertical centring in a 22-DIP strip. They now carry an
   app-sized font (Segoe UI, 13-DIP em) via WM_SETFONT, centre
   vertically (SS_CENTERIMAGE), and the strip is 26 DIPs.
-  Windows runtime **Unverified** until the owner's field run
-  of the test build.
+  The owner's field run of that build verified both fixes
+  (full "Untitled" labels; a clean centred status line) and
+  reported two more, fixed in the same Unreleased batch:
+  (3) a Text→Hex→Text round trip dragged the view to the
+  caret — the end of the file after a paste — because
+  `Editor::set_mode` anchored the incoming top to the caret;
+  it now translates the outgoing top through the byte anchor
+  (host test `mode_switch_keeps_the_view_top_not_the_caret`).
+  (4) In split view the Text/Hex commands only moved focus,
+  leaving no way back to a single view; they now leave the
+  split for the named view at its pane's stored position
+  (`mode_command`), while F6 and pane clicks keep focus
+  duty. PARITY's split row updated to match. Windows runtime
+  of (3) and (4) **Unverified** until the owner's next run.
 
 ## Known gaps (honest list)
 
