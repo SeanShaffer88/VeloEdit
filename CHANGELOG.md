@@ -19,6 +19,19 @@ release asset naming in the specification.
   They now carry an app-sized font, centre vertically, and
   the strip is taller.
 
+- Switching between text and hex mode jumped the view to the
+  caret — after pasting, that is the end of the file, so a
+  text→hex→text round trip "moved the document to the end".
+  Mode switches now translate the view's top through the
+  shared byte anchor and keep the reader's place; the caret
+  itself does not move.
+- In the split view, the Text and Hex commands only moved the
+  keyboard focus between panes, leaving no way back to a
+  single view from them. They now leave the split for the
+  named view, opening exactly where that pane was; focus
+  inside the split still moves by clicking a pane or
+  pressing F6.
+
 ## [1.1.0] — 2026-11-01
 
 ### Added
