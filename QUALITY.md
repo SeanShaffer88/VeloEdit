@@ -1657,6 +1657,24 @@ scored from real Windows evidence before any release.
     structural dialog; the main scrollbar stays the focused
     (split) / left (compare) pane's own, painted at the
     canvas edge / divider as before.
+  - Field correction (same day, owner's screenshot of the
+    R5c test build): the first document rows painted
+    UNDERNEATH the toolbar buttons — `compute_layout`'s
+    canvas top still summed the pre-tab chrome (accent strip
+    + toolbar) after R5b inserted the 28-DIP tab bar above
+    the toolbar, so every canvas row sat one bar too high in
+    ALL views since R5b (paint and hit-testing shared the
+    wrong origin, so editing stayed consistent and the tab
+    field pass did not surface it; the toolbar child windows
+    simply covered the top rows). Root cause was R5b's, not
+    R5c's. Fix: the stack sum now lives in one helper,
+    `chrome_stack_top` (strip + tab bar + toolbar + optional
+    bars), used by `compute_layout`, with a Windows-suite
+    test pinning the sum so CI guards it. Gate re-run after
+    the fix: fmt clean, host tests 426/426, clippy host +
+    gnu clean, MSVC check clean; fixed release build
+    1 374 208 bytes, SHA-256
+    `eef1ae30468533a5ed9fb88c25c52879bbf241520c78282960529f2c93a0e308`.
 
 ## Known gaps (honest list)
 
