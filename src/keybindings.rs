@@ -276,6 +276,11 @@ pub const ACTIONS: &[(&str, Option<&str>)] = &[
     ("toggle_split", Some("Ctrl+\\")),
     ("diff_next", Some("F7")),
     ("diff_prev", Some("Shift+F7")),
+    // Multi-caret (slice R5d): add a caret on the line above or
+    // below at the same byte column. (Alt+click adds one too;
+    // that is a mouse gesture, not a chord.)
+    ("caret_up", Some("Ctrl+Alt+Up")),
+    ("caret_down", Some("Ctrl+Alt+Down")),
 ];
 
 /// Whether `name` is a known rebindable action.

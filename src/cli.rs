@@ -42,6 +42,11 @@ HEADLESS OPERATIONS:
                           is found, 1 when nothing matches. Runs headless;
                           combine with --headless as in:
                           VeloEdit.exe notes.txt --find TODO --headless
+    --regex               With --find: treat the text as a regular
+                          expression and report match spans as
+                          {\"count\":N,\"spans\":[[START,END],...]}.
+                          UTF-8 and ANSI files only (the pattern runs
+                          over the file's bytes as-is).
     --encoding <NAME>     Encoding used to read FILE for --find:
                           utf8 | utf16le | utf16be | ansi
                           (default: detect from the file's first 64 KB,
@@ -159,6 +164,10 @@ pub struct CliOptions {
     pub diff: Option<(PathBuf, PathBuf)>,
     pub output: Option<PathBuf>,
     pub find: Option<String>,
+    /// `--regex`: the `--find` text is a regular expression
+    /// (roadmap item 9, slice R5d). The report then carries match
+    /// spans instead of plain offsets.
+    pub regex: bool,
     pub encoding: Option<TextEncoding>,
     pub save_copy: Option<PathBuf>,
     /// The `extract` subcommand was given (roadmap item 44): stream
@@ -305,6 +314,7 @@ pub fn parse_args(args: &[String]) -> Result<CliOptions, CliError> {
             "--help" => opts.help = true,
             "--version" => opts.version = true,
             "--read-only" => opts.read_only = true,
+            "--regex" => opts.regex = true,
             "--headless" => opts.headless = true,
             "--json" => opts.json = true,
             "--silent" => opts.silent = true,
@@ -671,6 +681,10 @@ fn run_find(opts: &CliOptions) -> i32 {
     if opts.verbose && !opts.silent {
         eprintln!("VeloEdit: searching {} as {}", path.display(), enc.name());
     }
+    let table = PieceTable::from_original(bytes);
+    if opts.regex {
+        return run_find_regex(opts, &table, enc, needle_text);
+    }
     let needle = match encoding::encode_needle(needle_text, enc) {
         Ok(needle) => needle,
         Err(e) => {
@@ -681,7 +695,6 @@ fn run_find(opts: &CliOptions) -> i32 {
             return 2;
         }
     };
-    let table = PieceTable::from_original(bytes);
     let offsets = search::find_all(&table, &needle, &SearchOptions::default());
 
     const MAX_PRINTED_OFFSETS: usize = 1000;
@@ -713,6 +726,62 @@ fn run_find(opts: &CliOptions) -> i32 {
     }
     // The standard scheme: a search that found nothing is a
     // successful run with a "no" answer — exit 1, not an error.
+    if total > 0 {
+        0
+    } else {
+        1
+    }
+}
+
+/// The `--regex` form of headless `--find` (roadmap item 9, slice
+/// R5d): the pattern runs over the file's bytes as-is, so only the
+/// single-byte encodings are accepted — a UTF-16 file would need
+/// the pattern woven into code units, which this tool declines
+/// rather than guesses at. The report carries match spans:
+/// `{"count":N,"spans":[[START,END],...]}` with the same 1000-entry
+/// cap, `--output` handling and exit codes as the plain find.
+fn run_find_regex(opts: &CliOptions, table: &PieceTable, enc: TextEncoding, pattern: &str) -> i32 {
+    if !matches!(enc, TextEncoding::Utf8 | TextEncoding::Ansi) {
+        eprintln!(
+            "VeloEdit: --regex searches the file's bytes as-is and works with UTF-8 or ANSI files; this file is {}",
+            enc.name()
+        );
+        return 2;
+    }
+    let re = match crate::regex::Regex::new(pattern) {
+        Ok(re) => re,
+        Err(e) => {
+            eprintln!("VeloEdit: bad regular expression: {e}");
+            return 2;
+        }
+    };
+    let spans = crate::op_find_regex(table, &re);
+    const MAX_PRINTED_SPANS: usize = 1000;
+    let total = spans.len();
+    let truncated = total > MAX_PRINTED_SPANS;
+    let mut json = String::from("{\"count\":");
+    json.push_str(&total.to_string());
+    json.push_str(",\"spans\":[");
+    for (idx, (start, end)) in spans.iter().take(MAX_PRINTED_SPANS).enumerate() {
+        if idx > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!("[{start},{end}]"));
+    }
+    json.push(']');
+    if truncated {
+        json.push_str(",\"truncated\":true");
+    }
+    json.push('}');
+    if let Some(output) = &opts.output {
+        if let Err(e) = std::fs::write(output, json.clone() + "\n") {
+            eprintln!("VeloEdit: could not write {}: {e}", output.display());
+            return 2;
+        }
+    }
+    if !opts.silent {
+        println!("{json}");
+    }
     if total > 0 {
         0
     } else {
@@ -1592,6 +1661,51 @@ mod tests {
         assert_eq!(opts.encoding, Some(TextEncoding::Utf16Le));
         assert!(parse(&["--encoding", "utf-8", "notes.txt"]).is_err());
         assert!(parse(&["--find"]).is_err());
+    }
+
+    #[test]
+    fn regex_find_run() {
+        let dir =
+            std::env::temp_dir().join(format!("veloedit-regex-find-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("nums.txt");
+        std::fs::write(&file, b"a1 b22 c333\n").unwrap();
+        let path = file.to_string_lossy().into_owned();
+        // The flag parses alongside --find.
+        let opts = parse(&["x.txt", "--find", "[0-9]+", "--regex"]).unwrap();
+        assert!(opts.regex);
+        // Matches: exit 0. No match: exit 1. A pattern that does
+        // not compile and a UTF-16 file are usage errors: exit 2.
+        let args: Vec<String> = vec![
+            path.clone(),
+            "--find".into(),
+            "[0-9]+".into(),
+            "--regex".into(),
+        ];
+        assert_eq!(run(&args), 0);
+        let args: Vec<String> = vec![
+            path.clone(),
+            "--find".into(),
+            "z{2,}".into(),
+            "--regex".into(),
+        ];
+        assert_eq!(run(&args), 1);
+        let args: Vec<String> = vec![
+            path.clone(),
+            "--find".into(),
+            "(unclosed".into(),
+            "--regex".into(),
+        ];
+        assert_eq!(run(&args), 2);
+        let args: Vec<String> = vec![
+            path.clone(),
+            "--find".into(),
+            "[0-9]+".into(),
+            "--regex".into(),
+            "--encoding=utf16le".into(),
+        ];
+        assert_eq!(run(&args), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

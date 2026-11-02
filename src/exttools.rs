@@ -375,6 +375,59 @@ pub fn expand_args(args: &[String], file: &str, offset: u64) -> Vec<String> {
         .collect()
 }
 
+/// Build the single command-line string `CreateProcessW` wants
+/// from a program and its arguments, quoting each piece by the
+/// standard Windows rules (the ones `CommandLineToArgvW` parses
+/// back): a piece with no spaces or quotes passes through; any
+/// other piece is wrapped in double quotes, with backslashes
+/// doubled where they precede a quote or the closing quote, and
+/// embedded quotes backslash-escaped.
+pub fn quote_command_line(program: &str, args: &[String]) -> String {
+    let mut out = quote_arg(program);
+    for arg in args {
+        out.push(' ');
+        out.push_str(&quote_arg(arg));
+    }
+    out
+}
+
+fn quote_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && !arg
+            .chars()
+            .any(|c| c == ' ' || c == '\t' || c == '"' || c == '\n' || c == '\x0B')
+    {
+        return arg.to_string();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                for _ in 0..backslashes * 2 + 1 {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push('"');
+            }
+            _ => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    for _ in 0..backslashes * 2 {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
 /// A minimal JSON reader for the tools shape — deliberately not
 /// a general JSON parser; modelled on the bookmarks reader in
 /// `crate::bookmarks`.
@@ -651,5 +704,34 @@ mod tests {
         );
         assert_eq!(expand_arg("{file}{file}", "a.txt", 0), "a.txta.txt");
         assert_eq!(expand_arg("nothing", "a.txt", 3), "nothing");
+    }
+
+    #[test]
+    fn command_line_quoting_follows_the_windows_rules() {
+        assert_eq!(quote_command_line("sort", &[]), "sort");
+        assert_eq!(
+            quote_command_line("my tool.exe", &["a b".to_string()]),
+            "\"my tool.exe\" \"a b\""
+        );
+        assert_eq!(quote_command_line("cat", &["".to_string()]), "cat \"\"");
+        // Embedded quotes are escaped; a trailing backslash inside
+        // quotes is doubled; an interior one is not.
+        assert_eq!(
+            quote_command_line("x", &["say \"hi\"".to_string()]),
+            "x \"say \\\"hi\\\"\""
+        );
+        assert_eq!(
+            quote_command_line("x", &["C:\\my dir\\".to_string()]),
+            "x \"C:\\my dir\\\\\""
+        );
+        // A trailing backslash alone needs no quotes at all.
+        assert_eq!(
+            quote_command_line("x", &["C:\\dir\\".to_string()]),
+            "x C:\\dir\\"
+        );
+        assert_eq!(
+            quote_command_line("x", &["C:\\dir".to_string()]),
+            "x C:\\dir"
+        );
     }
 }

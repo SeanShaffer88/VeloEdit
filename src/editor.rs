@@ -91,6 +91,11 @@ pub enum EditorError {
     /// A line operation's range expanded past the size limit
     /// (carries the expanded size in bytes).
     RangeTooLarge(u64),
+    /// A multi-range edit was refused by the undo core (validation
+    /// failure on offsets the caller computed — nothing was applied).
+    MultiEdit(String),
+    /// A rectangular edit was refused by the undo core.
+    Rect(String),
 }
 
 impl fmt::Display for EditorError {
@@ -106,6 +111,8 @@ impl fmt::Display for EditorError {
                 "the range covers {n} bytes of text; line operations are limited to {} bytes",
                 MAX_LINE_OP_BYTES
             ),
+            EditorError::MultiEdit(m) => write!(f, "multi-range edit refused: {m}"),
+            EditorError::Rect(m) => write!(f, "rectangular edit refused: {m}"),
         }
     }
 }
@@ -339,6 +346,17 @@ pub struct Editor {
     needle_bytes: Vec<u8>,
     needle_text: String,
     find_options: SearchOptions,
+    /// Match spans parallel to `matches`, populated only by a regex
+    /// find (roadmap item 9, slice R5d): regex matches vary in
+    /// length, so their ends cannot come from a needle length. Plain
+    /// and masked finds leave this empty and derive each match's end
+    /// from the needle length, exactly as before.
+    match_spans: Vec<(u64, u64)>,
+    /// The compiled pattern of the active regex find, kept so Find
+    /// Next / Previous and Replace can re-run it after an edit clears
+    /// the match list (the role `needle_text` plays for a plain find;
+    /// for a regex find `needle_text` holds the pattern source).
+    regex_active: Option<crate::regex::Regex>,
 }
 
 impl Editor {
@@ -389,6 +407,8 @@ impl Editor {
             needle_bytes: Vec::new(),
             needle_text: String::new(),
             find_options: SearchOptions::default(),
+            match_spans: Vec::new(),
+            regex_active: None,
         }
     }
 
@@ -523,8 +543,10 @@ impl Editor {
     /// [`Editor::set_code_page`]).
     fn drop_find_bytes(&mut self) {
         self.matches.clear();
+        self.match_spans.clear();
         self.match_index = None;
         self.needle_bytes.clear();
+        self.regex_active = None;
     }
 
     /// Bytes to skip at the document's start when reading text:
@@ -1522,6 +1544,7 @@ impl Editor {
     fn after_mutation(&mut self, first_touched: u64) {
         self.dirty = true;
         self.matches.clear();
+        self.match_spans.clear();
         self.match_index = None;
         self.index_dirty_from = Some(match self.index_dirty_from {
             Some(d) => d.min(first_touched),
@@ -1779,6 +1802,7 @@ impl Editor {
         self.caret = self.caret.min(self.total_len());
         self.anchor = None;
         self.matches.clear();
+        self.match_spans.clear();
         self.match_index = None;
         // The restored bytes can differ anywhere: the index is stale
         // from the start, and the newline delta is unknown.
@@ -1798,6 +1822,7 @@ impl Editor {
         self.caret = self.caret.min(self.total_len());
         self.anchor = None;
         self.matches.clear();
+        self.match_spans.clear();
         self.match_index = None;
         self.index_dirty_from = Some(0);
         self.nl_delta_known = false;
@@ -1823,18 +1848,86 @@ impl Editor {
         self.needle_bytes = needle;
         self.needle_text = needle_text.to_string();
         self.find_options = options;
+        self.regex_active = None;
+        self.match_spans.clear();
         self.refresh_matches();
         if self.matches.is_empty() {
             self.match_index = None;
             return Ok(0);
         }
+        self.select_first_match_at_or_after_caret();
+        Ok(self.matches.len())
+    }
+
+    /// Select the first match at or after the caret, wrapping to
+    /// the first match — the commit step every find flavour shares.
+    /// The match list must be non-empty.
+    fn select_first_match_at_or_after_caret(&mut self) {
+        debug_assert!(!self.matches.is_empty());
         let idx = self
             .matches
             .iter()
             .position(|&m| m >= self.caret)
             .unwrap_or(0);
         self.select_match(idx);
+    }
+
+    /// Run a regular-expression find over the whole document
+    /// (roadmap item 9, slice R5d) and select the first match at or
+    /// after the caret, wrapping like [`Editor::set_find`]. The
+    /// pattern runs over the document's raw bytes as-is; the shell
+    /// only offers it for UTF-8 / ANSI documents, where the pattern
+    /// text encodes byte-exactly (see docs/PARITY.md). A pattern
+    /// that fails to compile clears the match list, stores nothing
+    /// searchable, and returns the engine's error verbatim.
+    pub fn set_find_regex(&mut self, pattern: &str) -> Result<usize, crate::regex::RegexError> {
+        let re = match crate::regex::Regex::new(pattern) {
+            Ok(re) => re,
+            Err(err) => {
+                self.matches.clear();
+                self.match_spans.clear();
+                self.match_index = None;
+                self.regex_active = None;
+                self.needle_bytes.clear();
+                self.needle_text = pattern.to_string();
+                return Err(err);
+            }
+        };
+        self.needle_text = pattern.to_string();
+        self.needle_bytes.clear();
+        self.regex_active = Some(re);
+        self.refresh_regex_matches();
+        if self.matches.is_empty() {
+            self.match_index = None;
+            return Ok(0);
+        }
+        self.select_first_match_at_or_after_caret();
         Ok(self.matches.len())
+    }
+
+    /// Recompute the match list from the active regex pattern (the
+    /// regex counterpart of `refresh_matches`).
+    fn refresh_regex_matches(&mut self) {
+        let Some(re) = &self.regex_active else {
+            return;
+        };
+        let spans = crate::op_find_regex(&self.table, re);
+        self.matches = spans.iter().map(|&(start, _)| start).collect();
+        self.match_spans = spans;
+    }
+
+    /// Whether the current find state is a regex find (its match
+    /// list carries variable-length spans).
+    pub fn regex_find_active(&self) -> bool {
+        self.regex_active.is_some()
+    }
+
+    /// The current matches as byte spans. Non-empty only for a
+    /// regex find, and then parallel to [`Editor::matches`]; plain
+    /// and masked finds leave it empty (their ends are the match
+    /// start plus the needle length).
+    pub fn match_spans(&self) -> &[(u64, u64)] {
+        &self.match_spans
     }
 
     /// Run a find limited to the byte range `[start, end)` and select
@@ -1857,6 +1950,8 @@ impl Editor {
         self.needle_bytes = needle;
         self.needle_text = needle_text.to_string();
         self.find_options = options;
+        self.regex_active = None;
+        self.match_spans.clear();
         let mut found =
             search::find_in_range(&self.table, &self.needle_bytes, &options, start, end);
         if self.codec_is_utf16() {
@@ -1868,12 +1963,7 @@ impl Editor {
             self.match_index = None;
             return Ok(0);
         }
-        let idx = self
-            .matches
-            .iter()
-            .position(|&m| m >= self.caret)
-            .unwrap_or(0);
-        self.select_match(idx);
+        self.select_first_match_at_or_after_caret();
         Ok(self.matches.len())
     }
 
@@ -1891,17 +1981,14 @@ impl Editor {
         self.needle_bytes = vec![0u8; pattern.len()];
         self.needle_text = String::new();
         self.find_options = SearchOptions::default();
+        self.regex_active = None;
+        self.match_spans.clear();
         self.matches = search::find_masked_all(&self.table, pattern, None);
         if self.matches.is_empty() {
             self.match_index = None;
             return 0;
         }
-        let idx = self
-            .matches
-            .iter()
-            .position(|&m| m >= self.caret)
-            .unwrap_or(0);
-        self.select_match(idx);
+        self.select_first_match_at_or_after_caret();
         self.matches.len()
     }
 
@@ -1918,11 +2005,22 @@ impl Editor {
         self.matches = found;
     }
 
+    /// The end offset of match `idx`: from the span list for a
+    /// regex find (variable lengths), from the needle length for
+    /// every other find flavour.
+    fn match_end(&self, idx: usize) -> u64 {
+        if let Some(&(_, end)) = self.match_spans.get(idx) {
+            end
+        } else {
+            self.matches[idx] + self.needle_bytes.len() as u64
+        }
+    }
+
     fn select_match(&mut self, idx: usize) {
         if let Some(&start) = self.matches.get(idx) {
             self.match_index = Some(idx);
             self.anchor = Some(start);
-            self.caret = start + self.needle_bytes.len() as u64;
+            self.caret = self.match_end(idx);
         }
     }
 
@@ -1930,7 +2028,7 @@ impl Editor {
     pub fn current_match(&self) -> Option<(u64, u64)> {
         let idx = self.match_index?;
         let start = *self.matches.get(idx)?;
-        Some((start, start + self.needle_bytes.len() as u64))
+        Some((start, self.match_end(idx)))
     }
 
     /// All current match offsets (recomputed by [`Editor::set_find`];
@@ -1948,6 +2046,15 @@ impl Editor {
     /// last find when the match list was cleared by an edit.
     pub fn find_next(&mut self) -> Option<(u64, u64)> {
         if self.matches.is_empty() {
+            if self.regex_active.is_some() {
+                self.refresh_regex_matches();
+                if self.matches.is_empty() {
+                    self.match_index = None;
+                    return None;
+                }
+                self.select_first_match_at_or_after_caret();
+                return self.current_match();
+            }
             if self.needle_text.is_empty() {
                 return None;
             }
@@ -1967,6 +2074,15 @@ impl Editor {
     /// Select the previous match, wrapping around the start.
     pub fn find_prev(&mut self) -> Option<(u64, u64)> {
         if self.matches.is_empty() {
+            if self.regex_active.is_some() {
+                self.refresh_regex_matches();
+                if self.matches.is_empty() {
+                    self.match_index = None;
+                    return None;
+                }
+                self.select_first_match_at_or_after_caret();
+                return self.current_match();
+            }
             if self.needle_text.is_empty() {
                 return None;
             }
@@ -2009,10 +2125,267 @@ impl Editor {
         self.anchor = None;
         self.after_mutation(start);
         // Re-run the same find and select the next match from here.
-        let text = self.needle_text.clone();
-        let options = self.find_options;
-        let _ = self.set_find(&text, options);
+        if self.regex_active.is_some() {
+            self.refresh_regex_matches();
+            if self.matches.is_empty() {
+                self.match_index = None;
+            } else {
+                self.select_first_match_at_or_after_caret();
+            }
+        } else {
+            let text = self.needle_text.clone();
+            let options = self.find_options;
+            let _ = self.set_find(&text, options);
+        }
         Ok(true)
+    }
+
+    /// Replace every match of the active regex find with
+    /// `replacement`, taken literally (no group expansion — v1
+    /// scope, see docs/PARITY.md), as ONE undo entry. Returns the
+    /// number replaced; without an active regex find, zero.
+    pub fn replace_all_regex(&mut self, replacement: &str) -> Result<usize, EditorError> {
+        self.require_writable()?;
+        if self.regex_active.is_none() {
+            return Ok(0);
+        }
+        // Recompute against the current bytes: the stored list may
+        // have been cleared by an edit since the find ran.
+        self.refresh_regex_matches();
+        if self.match_spans.is_empty() {
+            return Ok(0);
+        }
+        let bytes = self.encode_text(replacement).map_err(EditorError::Encode)?;
+        let spans = self.match_spans.clone();
+        let repl_newlines = count_newlines(&bytes);
+        let mut removed_newlines: i64 = 0;
+        let mut edits: Vec<crate::undo::RangeEdit> = Vec::with_capacity(spans.len());
+        for &(start, end) in &spans {
+            removed_newlines += count_newlines(&self.table.read(start, end - start));
+            edits.push(crate::undo::RangeEdit {
+                offset: start,
+                delete_len: end - start,
+                replacement: &bytes,
+            });
+        }
+        let first = spans[0].0;
+        let count = spans.len();
+        let applied = self
+            .history
+            .do_multi_replace(&mut self.table, &edits)
+            .map_err(|err| EditorError::MultiEdit(err.to_string()))?;
+        if applied.is_none() {
+            return Ok(0);
+        }
+        if self.nl_delta_known {
+            self.nl_delta += count as i64 * repl_newlines - removed_newlines;
+        }
+        self.caret = self.caret.min(self.total_len());
+        self.anchor = None;
+        self.after_mutation(first);
+        Ok(count)
+    }
+
+    // ---- Multi-caret and rectangular edits (slice R5d) -----------
+
+    /// Plan a multi-caret edit: given every caret's range
+    /// (primary first, then the extras — points or selections, in
+    /// any order) and the bytes to put at each, produce the edit
+    /// list `apply_multi_replace` wants (ascending, disjoint,
+    /// distinct offsets, as the undo core requires) and each input
+    /// caret's new offset, in input order.
+    ///
+    /// Overlaps resolve towards the earlier caret in document
+    /// order (at the same start, a selection beats a point caret):
+    /// a caret whose start falls inside a kept range is dropped
+    /// and lands where the surviving caret lands. A point caret
+    /// exactly at a kept range's end survives (it inserts after
+    /// the range); a duplicate point caret merges into the first.
+    pub fn caret_edit_plan<'a>(
+        carets: &[(u64, u64)],
+        replacement: &'a [u8],
+    ) -> (Vec<crate::undo::RangeEdit<'a>>, Vec<u64>) {
+        // Pass 1: choose the kept carets in document order.
+        let mut order: Vec<usize> = (0..carets.len()).collect();
+        order.sort_by_key(|&i| {
+            let (start, end) = carets[i];
+            // At the same start, the longer range comes first.
+            (start, std::cmp::Reverse(end.max(start) - start))
+        });
+        // kept: (input index, start, end); survivor_of: input index
+        // -> kept position, for dropped carets.
+        let mut kept: Vec<(usize, u64, u64)> = Vec::new();
+        let mut survivor_of: Vec<Option<usize>> = vec![None; carets.len()];
+        for &i in &order {
+            let (start, end) = carets[i];
+            let end = end.max(start);
+            if let Some(&(ki, ks, ke)) = kept.last() {
+                let falls_inside = start < ke;
+                let duplicate_point = start == ke && end == start && ks == ke && ks == start;
+                if falls_inside || duplicate_point {
+                    survivor_of[i] = Some(ki);
+                    continue;
+                }
+            }
+            kept.push((i, start, end));
+        }
+        // Pass 2: shift arithmetic over the kept edits.
+        let mut edits: Vec<crate::undo::RangeEdit<'_>> = Vec::with_capacity(kept.len());
+        let mut new_offsets: Vec<u64> = vec![0; carets.len()];
+        let mut shift: i128 = 0;
+        for &(i, start, end) in &kept {
+            let new_caret = (start as i128 + shift + replacement.len() as i128).max(0) as u64;
+            edits.push(crate::undo::RangeEdit {
+                offset: start,
+                delete_len: end - start,
+                replacement,
+            });
+            new_offsets[i] = new_caret;
+            shift += replacement.len() as i128 - (end - start) as i128;
+        }
+        for (i, survivor) in survivor_of.iter().enumerate() {
+            if let Some(s) = survivor {
+                new_offsets[i] = new_offsets[*s];
+            }
+        }
+        (edits, new_offsets)
+    }
+
+    /// Apply a set of range replacements as ONE undo entry — the
+    /// multi-cursor edit path: the shell computes one edit per
+    /// caret (document order, non-overlapping, as the undo core
+    /// requires) plus the carets' new positions; this wrapper owns
+    /// the bookkeeping every mutation needs. Returns whether
+    /// anything was applied.
+    pub fn apply_multi_replace(
+        &mut self,
+        edits: &[crate::undo::RangeEdit],
+    ) -> Result<bool, EditorError> {
+        self.require_writable()?;
+        if edits.is_empty() {
+            return Ok(false);
+        }
+        // Newline bookkeeping needs the removed bytes before the
+        // edit lands (counts are additive, so concatenation is
+        // exact).
+        let mut removed: Vec<u8> = Vec::new();
+        let mut inserted: Vec<u8> = Vec::new();
+        for edit in edits {
+            removed.extend(self.table.read(edit.offset, edit.delete_len));
+            inserted.extend_from_slice(edit.replacement);
+        }
+        let first = edits.iter().map(|e| e.offset).min().unwrap_or(0);
+        let applied = self
+            .history
+            .do_multi_replace(&mut self.table, edits)
+            .map_err(|err| EditorError::MultiEdit(err.to_string()))?;
+        let Some(_) = applied else {
+            return Ok(false);
+        };
+        self.note_newline_delta(&inserted, &removed);
+        self.caret = self.caret.min(self.total_len());
+        self.anchor = None;
+        self.after_mutation(first);
+        Ok(true)
+    }
+
+    /// Delete the byte-column range `[col_start, col_end)` from
+    /// every line in `[first_line, last_line]` as ONE undo entry
+    /// (the rectangular-delete path). Columns clamp per line, a
+    /// line's terminator is never touched, and shorter lines
+    /// contribute nothing — the semantics of the undo core's
+    /// rectangular ops, computed from the editor's own line map so
+    /// no whole-document line-start array is materialised for a
+    /// visible-range gesture. Returns whether anything changed.
+    pub fn rect_delete(
+        &mut self,
+        first_line: u64,
+        last_line: u64,
+        col_start: u64,
+        col_end: u64,
+    ) -> Result<bool, EditorError> {
+        self.require_writable()?;
+        if col_start > col_end || first_line > last_line {
+            return Err(EditorError::Rect(
+                "column or line range is reversed".to_string(),
+            ));
+        }
+        let mut edits: Vec<crate::undo::RangeEdit> = Vec::new();
+        for line in first_line..=last_line {
+            let Some((start, end)) = self.line_content_range(line) else {
+                continue;
+            };
+            let len = end - start;
+            let cs = col_start.min(len);
+            let ce = col_end.min(len);
+            if ce > cs {
+                edits.push(crate::undo::RangeEdit {
+                    offset: start + cs,
+                    delete_len: ce - cs,
+                    replacement: &[],
+                });
+            }
+        }
+        self.apply_multi_replace(&edits)
+    }
+
+    /// Insert `bytes` at byte column `col` (clamped per line, no
+    /// padding) on every line in `[first_line, last_line]` as ONE
+    /// undo entry — typing over a rectangular selection. Returns
+    /// whether anything was applied.
+    pub fn rect_insert(
+        &mut self,
+        first_line: u64,
+        last_line: u64,
+        col: u64,
+        bytes: &[u8],
+    ) -> Result<bool, EditorError> {
+        self.require_writable()?;
+        if bytes.is_empty() || first_line > last_line {
+            return Ok(false);
+        }
+        let mut edits: Vec<crate::undo::RangeEdit> = Vec::new();
+        for line in first_line..=last_line {
+            let Some((start, end)) = self.line_content_range(line) else {
+                continue;
+            };
+            let at = start + col.min(end - start);
+            edits.push(crate::undo::RangeEdit {
+                offset: at,
+                delete_len: 0,
+                replacement: bytes,
+            });
+        }
+        self.apply_multi_replace(&edits)
+    }
+
+    /// Extract a byte-column rectangle as clipboard text: each
+    /// line's `[col_start, col_end)` slice (clamped per line,
+    /// decoded lossily in the document's codec), joined with
+    /// `eol`. Lines outside the document contribute nothing.
+    pub fn rect_extract_text(
+        &mut self,
+        first_line: u64,
+        last_line: u64,
+        col_start: u64,
+        col_end: u64,
+        eol: &str,
+    ) -> String {
+        let enc = self.codec();
+        let mut parts: Vec<String> = Vec::new();
+        if col_start <= col_end {
+            for line in first_line..=last_line {
+                let Some((start, end)) = self.line_content_range(line) else {
+                    continue;
+                };
+                let len = end - start;
+                let cs = col_start.min(len);
+                let ce = col_end.min(len);
+                let bytes = self.table.read(start + cs, ce - cs);
+                parts.push(decode_lossy_codec(&bytes, enc));
+            }
+        }
+        parts.join(eol)
     }
 
     /// Replace every occurrence of the last find needle with
@@ -2269,6 +2642,7 @@ impl Editor {
     fn finish_save(&mut self, report: SaveReport) -> SaveReport {
         self.dirty = false;
         self.matches.clear();
+        self.match_spans.clear();
         self.match_index = None;
         self.caret = self.caret.min(self.total_len());
         if self.index_dirty_from.is_some() {
@@ -3330,6 +3704,157 @@ mod tests {
         // Past the end is a no-op.
         e.replace_byte_at(99, 0xFF).unwrap();
         assert_eq!(content(&e), vec![0x00, 0x41, b'\n']);
+    }
+
+    // ---- Slice R5d: regex find + multi-caret seams ----------------
+
+    #[test]
+    fn regex_find_uses_engine_spans() {
+        let mut e = ed(b"foo 123 bar 45 baz 678\n");
+        let n = e.set_find_regex("[0-9]+").unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(e.matches(), &[4, 12, 19]);
+        assert_eq!(e.match_spans(), &[(4, 7), (12, 14), (19, 22)]);
+        // The first match at/after the caret (0) is selected, with
+        // its variable length.
+        assert_eq!(e.current_match(), Some((4, 7)));
+        assert_eq!(e.selection_range(), Some((4, 7)));
+        // Next/previous walk the spans.
+        assert_eq!(e.find_next(), Some((12, 14)));
+        assert_eq!(e.find_next(), Some((19, 22)));
+        assert_eq!(e.find_next(), Some((4, 7))); // wraps
+        assert_eq!(e.find_prev(), Some((19, 22)));
+    }
+
+    #[test]
+    fn regex_find_bad_pattern_searches_nothing() {
+        let mut e = ed(b"some text\n");
+        let err = e.set_find_regex("(unclosed").unwrap_err();
+        assert!(!err.to_string().is_empty());
+        assert!(e.matches().is_empty());
+        assert!(e.match_spans().is_empty());
+        assert_eq!(e.current_match(), None);
+        assert!(!e.regex_find_active());
+        // And a plain find afterwards is unaffected.
+        assert_eq!(e.set_find("text", SearchOptions::default()).unwrap(), 1);
+        assert!(!e.regex_find_active());
+        assert!(e.match_spans().is_empty());
+    }
+
+    #[test]
+    fn regex_replace_all_is_literal_and_one_undo() {
+        let mut e = ed(b"a1 b22 c333\n");
+        e.set_find_regex("[0-9]+").unwrap();
+        // The replacement is literal: no $1 group expansion.
+        let n = e.replace_all_regex("[$1]").unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(content(&e), b"a[$1] b[$1] c[$1]\n".to_vec());
+        // One undo takes the whole replacement back.
+        assert!(e.undo());
+        assert_eq!(content(&e), b"a1 b22 c333\n".to_vec());
+        assert!(!e.can_undo());
+    }
+
+    #[test]
+    fn regex_replace_current_selects_next_match() {
+        let mut e = ed(b"x1 y2 z3\n");
+        e.set_find_regex("[0-9]").unwrap();
+        assert_eq!(e.current_match(), Some((1, 2)));
+        assert!(e.replace_current("N").unwrap());
+        assert_eq!(content(&e), b"xN y2 z3\n".to_vec());
+        assert_eq!(e.current_match(), Some((4, 5)));
+    }
+
+    #[test]
+    fn multi_replace_applies_all_carets_as_one_undo() {
+        let mut e = ed(b"aa\nbb\ncc\n");
+        let edits = [
+            crate::undo::RangeEdit {
+                offset: 1,
+                delete_len: 0,
+                replacement: b"!",
+            },
+            crate::undo::RangeEdit {
+                offset: 4,
+                delete_len: 0,
+                replacement: b"!",
+            },
+            crate::undo::RangeEdit {
+                offset: 7,
+                delete_len: 0,
+                replacement: b"!",
+            },
+        ];
+        assert!(e.apply_multi_replace(&edits).unwrap());
+        assert_eq!(content(&e), b"a!a\nb!b\nc!c\n".to_vec());
+        assert!(e.undo());
+        assert_eq!(content(&e), b"aa\nbb\ncc\n".to_vec());
+        assert!(!e.can_undo());
+    }
+
+    #[test]
+    fn caret_edit_plan_covers_points_ranges_and_overlaps() {
+        // Three point carets, replacement longer than nothing:
+        // each new caret sits after its inserted bytes, shifted by
+        // the carets before it.
+        let (edits, news) = Editor::caret_edit_plan(&[(1, 1), (4, 4), (7, 7)], b"!!");
+        assert_eq!(edits.len(), 3);
+        assert_eq!(news, vec![3, 8, 13]);
+        // A selection plus a point inside it: the point drops and
+        // lands where the selection's caret lands.
+        let (edits, news) = Editor::caret_edit_plan(&[(2, 6), (4, 4), (10, 10)], b"x");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].offset, 2);
+        assert_eq!(edits[0].delete_len, 4);
+        assert_eq!(news, vec![3, 3, 8]);
+        // A point exactly at a selection's end survives.
+        let (edits, news) = Editor::caret_edit_plan(&[(2, 6), (6, 6)], b"");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(news, vec![2, 2]);
+        // Duplicate point carets merge.
+        let (edits, news) = Editor::caret_edit_plan(&[(5, 5), (5, 5)], b"z");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(news, vec![6, 6]);
+        // A selection starting where a point caret sits: the
+        // selection wins (it sorts first at the same start).
+        let (edits, news) = Editor::caret_edit_plan(&[(3, 3), (3, 8)], b"q");
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].delete_len, 5);
+        assert_eq!(news, vec![4, 4]);
+        // Deleting (empty replacement) shifts later carets back.
+        let (edits, news) = Editor::caret_edit_plan(&[(0, 3), (10, 12)], b"");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(news, vec![0, 7]);
+        // Applying a plan end to end: type at three carets as one
+        // undo entry.
+        let mut e = ed(b"aa\nbb\ncc\n");
+        let (edits, news) = Editor::caret_edit_plan(&[(0, 0), (3, 3), (6, 6)], b">");
+        assert!(e.apply_multi_replace(&edits).unwrap());
+        assert_eq!(content(&e), b">aa\n>bb\n>cc\n".to_vec());
+        assert_eq!(news, vec![1, 5, 9]);
+        assert!(e.undo());
+        assert_eq!(content(&e), b"aa\nbb\ncc\n".to_vec());
+    }
+
+    #[test]
+    fn rect_delete_insert_and_extract() {
+        let mut e = ed(b"abcd\nxy\nabcdef\n");
+        e.seed_line_index();
+        // Extract columns 1..3 across all three lines (line 2 is
+        // short: clamps to its one byte).
+        assert_eq!(e.rect_extract_text(0, 2, 1, 3, "\n"), "bc\ny\nbc");
+        assert_eq!(e.rect_extract_text(0, 2, 1, 3, "\r\n"), "bc\r\ny\r\nbc");
+        // Delete the same rectangle as one undo entry.
+        assert!(e.rect_delete(0, 2, 1, 3).unwrap());
+        assert_eq!(content(&e), b"ad\nx\nadef\n".to_vec());
+        assert!(e.undo());
+        assert_eq!(content(&e), b"abcd\nxy\nabcdef\n".to_vec());
+        // Insert at column 2 on every line as one undo entry.
+        assert!(e.rect_insert(0, 2, 2, b"Z").unwrap());
+        assert_eq!(content(&e), b"abZcd\nxyZ\nabZcdef\n".to_vec());
+        assert!(e.undo());
+        assert_eq!(content(&e), b"abcd\nxy\nabcdef\n".to_vec());
+        assert!(!e.can_undo());
     }
 
     #[test]

@@ -1205,6 +1205,66 @@ DOS_HEADER {
     }
 
     #[test]
+    fn shipped_example_templates_parse_and_apply() {
+        // The examples under examples/templates/ are user-facing:
+        // they must parse, and their layouts must match the public
+        // format specifications they describe.
+        let pe = TemplateSet::parse(include_str!("../examples/templates/pe.txt")).unwrap();
+        assert_eq!(pe.static_size("IMAGE_DOS_HEADER"), Some(64));
+        assert_eq!(pe.static_size("IMAGE_FILE_HEADER"), Some(20));
+        assert_eq!(pe.static_size("PE_SIGNATURE"), Some(24));
+        let mut exe = vec![0u8; 64 + 24];
+        exe[0] = b'M';
+        exe[1] = b'Z';
+        exe[0x3C..0x40].copy_from_slice(&64u32.to_le_bytes());
+        exe[64..68].copy_from_slice(b"PE\0\0");
+        exe[68..70].copy_from_slice(&0x8664u16.to_le_bytes());
+        exe[70..72].copy_from_slice(&7u16.to_le_bytes());
+        let dos = pe.apply_bytes("IMAGE_DOS_HEADER", 0, &exe).unwrap();
+        assert!(dos.complete);
+        assert_eq!(
+            dos.field("IMAGE_DOS_HEADER.pe_header_offset")
+                .unwrap()
+                .value,
+            Some(FieldValue::UInt(64))
+        );
+        let sig = pe.apply_bytes("PE_SIGNATURE", 64, &exe).unwrap();
+        assert!(sig.complete);
+        assert_eq!(
+            sig.field("PE_SIGNATURE.file_header.machine").unwrap().value,
+            Some(FieldValue::UInt(0x8664))
+        );
+        assert_eq!(
+            sig.field("PE_SIGNATURE.file_header.section_count")
+                .unwrap()
+                .value,
+            Some(FieldValue::UInt(7))
+        );
+
+        let png = TemplateSet::parse(include_str!("../examples/templates/png.txt")).unwrap();
+        assert_eq!(png.static_size("PNG_FILE"), Some(8 + 8 + 13 + 4));
+        let mut img = vec![0u8; 8 + 25];
+        img[..8].copy_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        img[8..12].copy_from_slice(&13u32.to_be_bytes());
+        img[12..16].copy_from_slice(b"IHDR");
+        img[16..20].copy_from_slice(&1920u32.to_be_bytes());
+        img[20..24].copy_from_slice(&1080u32.to_be_bytes());
+        img[24] = 8; // bit depth
+        img[25] = 2; // color type: truecolor
+        let file = png.apply_bytes("PNG_FILE", 0, &img).unwrap();
+        assert!(file.complete);
+        assert_eq!(
+            file.field("PNG_FILE.ihdr.width").unwrap().value,
+            Some(FieldValue::UInt(1920))
+        );
+        assert_eq!(
+            file.field("PNG_FILE.ihdr.height").unwrap().value,
+            Some(FieldValue::UInt(1080))
+        );
+        assert_eq!(file.field("PNG_FILE.ihdr.bit_depth").unwrap().offset, 24);
+    }
+
+    #[test]
     fn unknown_struct_at_apply_is_an_error() {
         let set = TemplateSet::parse("A { u8 x; }").unwrap();
         assert_eq!(
