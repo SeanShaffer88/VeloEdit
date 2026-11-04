@@ -24,7 +24,7 @@
     wix extension add WixToolset.UI.wixext/4.0.6
     (the extension version must match the tool's major version,
     or the build fails with WIX0144)
-    wix build installer\Package.wxs -ext WixToolset.UI.wixext
+    wix build installer\Package.wxs -arch x64 -ext WixToolset.UI.wixext
         -o VeloEdit-v<VERSION>-x64-Setup.msi
 
   File sources are written with the sys.SOURCEFILEDIR preprocessor
@@ -40,7 +40,7 @@
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="VeloEdit"
            Manufacturer="Sean Shaffer"
-           Version="1.1.2"
+           Version="1.1.3"
            Scope="perUser"
            UpgradeCode="A38C6BC4-F086-4855-A7E6-8706BCA8F987">
     <MajorUpgrade DowngradeErrorMessage="A newer version of VeloEdit is already installed." />
@@ -68,12 +68,12 @@
     </StandardDirectory>
 
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
-      <Component Id="MainExecutable" Guid="*">
+      <Component Id="MainExecutable" Bitness="always64" Guid="F29561D1-37D1-48D8-9608-F52962453DD5">
         <File Id="VeloEditExe"
               Source="$(sys.SOURCEFILEDIR)..\target\x86_64-pc-windows-msvc\release\VeloEdit.exe"
               KeyPath="yes" />
       </Component>
-      <Component Id="LicenseFile" Guid="*">
+      <Component Id="LicenseFile" Bitness="always32" Guid="4D33AA23-0163-5E65-ACED-AA7E4950F992">
         <File Id="LicenseTxt"
               Source="$(sys.SOURCEFILEDIR)..\LICENSE"
               KeyPath="yes" />
@@ -86,12 +86,12 @@
          EXPLICIT guid (never change it): a folder-only component's key
          path is its directory, and WiX rejects auto-generated guids for
          those (WIX0230). -->
-    <Component Id="DataFolderComponent" Directory="DataFolder" Guid="AE66BEE6-02EC-41BF-8B6D-B783DEA4F0ED">
+    <Component Id="DataFolderComponent" Bitness="always32" Directory="DataFolder" Guid="AE66BEE6-02EC-41BF-8B6D-B783DEA4F0ED">
       <CreateFolder />
       <RemoveFolder Id="RemoveDataFolder" On="uninstall" />
     </Component>
 
-    <Component Id="ApplicationShortcut" Directory="AppShortcutFolder" Guid="*">
+    <Component Id="ApplicationShortcut" Bitness="always32" Directory="AppShortcutFolder" Guid="440D8B00-27D8-5683-B437-AEF026A0E5C9">
       <Shortcut Id="StartMenuShortcut"
                 Name="VeloEdit"
                 Description="Binary and large-file editor"

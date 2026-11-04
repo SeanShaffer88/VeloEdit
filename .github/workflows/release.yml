@@ -22,7 +22,7 @@ on:
       tag:
         description: "Existing tag to build the release from"
         required: true
-        default: "v1.1.2"
+        default: "v1.1.3"
 
 permissions:
   contents: write
@@ -84,7 +84,9 @@ jobs:
       # ---- Gate first: nothing is packaged unless the whole gate passes.
       - name: Release contract checks (offline mocks)
         shell: pwsh
-        run: ./tests/Test-ReleasePreparation.ps1
+        run: |
+          ./tests/Test-ReleasePreparation.ps1
+          ./tests/Test-MsiContract.ps1
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -130,6 +132,7 @@ jobs:
           $version = '${{ steps.tag.outputs.version }}'
           if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
             choco install nsis -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "NSIS installation failed: $LASTEXITCODE" }
           }
           # The choco install lands in "Program Files (x86)\NSIS", which is
           # not on this process's PATH - resolve the exe explicitly.
@@ -152,14 +155,20 @@ jobs:
         run: |
           $version = '${{ steps.tag.outputs.version }}'
           dotnet tool install --global wix --version "4.0.6"
+          if ($LASTEXITCODE -ne 0) { throw "WiX installation failed: $LASTEXITCODE" }
           $env:PATH = "$env:PATH;$env:USERPROFILE\.dotnet\tools"
           # The extension version must match the tool's major version:
           # an unpinned "wix extension add" fetches the latest extension
           # (v7), which a WiX v4 tool cannot load (WIX0144).
           wix extension add WixToolset.UI.wixext/4.0.6
           if ($LASTEXITCODE -ne 0) { throw "wix extension add failed with exit code $LASTEXITCODE" }
-          wix build installer\Package.wxs -ext WixToolset.UI.wixext -o "dist\VeloEdit-v$version-x64-Setup.msi"
+          wix build installer\Package.wxs -arch x64 -ext WixToolset.UI.wixext -o "dist\VeloEdit-v$version-x64-Setup.msi"
           if ($LASTEXITCODE -ne 0) { throw "wix build failed with exit code $LASTEXITCODE" }
+
+      - name: Validate the MSI metadata and payload
+        shell: pwsh
+        run: |
+          ./scripts/Test-MsiArtifact.ps1 -MsiPath 'dist/VeloEdit-v${{ steps.tag.outputs.version }}-x64-Setup.msi' -ExecutablePath target/x86_64-pc-windows-msvc/release/VeloEdit.exe -LicensePath LICENSE -ExpectedVersion '${{ steps.tag.outputs.version }}' -OutputDirectory dist/msi-audit
 
       - name: Generate SHA256SUMS.txt
         shell: pwsh
@@ -207,13 +216,7 @@ jobs:
             "dist\VeloEdit-v$version-x64-Portable.zip",
             "dist\SHA256SUMS.txt"
           )
-          # The release may already exist (the tag was created by publishing
-          # the release in the web UI): then just (re)upload the assets.
           gh release create '${{ steps.tag.outputs.tag }}' $assets --verify-tag --target '${{ steps.source.outputs.sha }}' `
             --title "VeloEdit v$version" `
             --notes-file release-notes.md
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "Release already exists - uploading assets instead."
-            gh release upload '${{ steps.tag.outputs.tag }}' $assets --clobber
-            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit code $LASTEXITCODE" }
-          }
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed: $LASTEXITCODE" }
