@@ -15,9 +15,10 @@ tenth of a second while using less than 35 MB of memory. It is one portable
 program file for Windows 11: no installer needed, no internet, no accounts,
 nothing sent anywhere.
 
-**Current status: 1.1.2 preparation; not published.** The latest published
-release is 1.1.1 (2026-11-01). This candidate includes the save staging
-collision and cleanup fix. Everything in the
+**Current status: 1.1.3 preparation; not published.** Release 1.1.2 was
+published; its historical changelog heading still records Unreleased. This
+candidate corrects MSI architecture metadata. Installer lifecycle checks
+remain unperformed. Everything in the
 1.0.0 release (2026-10-31) plus the full feature roadmap: tabs, split
 view, side-by-side compare, regular-expression find, more encodings,
 log-viewing tools, binary templates, external tools, multi-caret

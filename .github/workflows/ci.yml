@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   host-gate:
     name: Host gate (fmt, clippy, test)
@@ -29,3 +32,36 @@ jobs:
         run: cargo test
       - name: Build release
         run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Installer contract fixtures
+        shell: pwsh
+        run: |
+          ./tests/Test-ReleasePreparation.ps1
+          ./tests/Test-MsiContract.ps1
+      - name: Build and validate candidate MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet tool install --global wix --version 4.0.6
+          if ($LASTEXITCODE -ne 0) { throw "WiX installation failed: $LASTEXITCODE" }
+          $env:PATH = "$env:PATH;$env:USERPROFILE\.dotnet\tools"
+          wix extension add WixToolset.UI.wixext/4.0.6
+          if ($LASTEXITCODE -ne 0) { throw "WiX extension failed: $LASTEXITCODE" }
+          New-Item -ItemType Directory candidate | Out-Null
+          wix build installer\Package.wxs -arch x64 -ext WixToolset.UI.wixext -o candidate/VeloEdit-v1.1.3-x64-Setup.msi
+          if ($LASTEXITCODE -ne 0) { throw "WiX build failed: $LASTEXITCODE" }
+          ./scripts/Test-MsiArtifact.ps1 -MsiPath candidate/VeloEdit-v1.1.3-x64-Setup.msi -ExecutablePath target/x86_64-pc-windows-msvc/release/VeloEdit.exe -LicensePath LICENSE -ExpectedVersion 1.1.3 -OutputDirectory candidate/msi-audit
+          Copy-Item target/x86_64-pc-windows-msvc/release/VeloEdit.exe candidate/VeloEdit.exe
+          $paths = @('candidate/VeloEdit-v1.1.3-x64-Setup.msi','candidate/VeloEdit.exe','candidate/msi-audit/audit.json')
+          $lines = foreach ($path in $paths) { "$((Get-FileHash -LiteralPath $path).Hash.ToLowerInvariant())  $($path.Substring(10))" }
+          $lines | Set-Content candidate/SHA256SUMS.txt
+      - name: Upload validated candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: VeloEdit-v1.1.3-x64-candidate
+          if-no-files-found: error
+          path: |
+            candidate/*.msi
+            candidate/*.exe
+            candidate/SHA256SUMS.txt
+            candidate/msi-audit/audit.json
+            candidate/msi-audit/audit.sha256

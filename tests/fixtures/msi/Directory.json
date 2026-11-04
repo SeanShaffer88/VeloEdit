@@ -1,0 +1,37 @@
+[
+  [
+    "DataFolder",
+    "INSTALLFOLDER",
+    "data"
+  ],
+  [
+    "INSTALLFOLDER",
+    "ProgramsFolder",
+    "VeloEdit"
+  ],
+  [
+    "ProgramsFolder",
+    "LocalAppDataFolder",
+    "Programs"
+  ],
+  [
+    "LocalAppDataFolder",
+    "TARGETDIR",
+    "LocalApp"
+  ],
+  [
+    "AppShortcutFolder",
+    "ProgramMenuFolder",
+    "VeloEdit"
+  ],
+  [
+    "ProgramMenuFolder",
+    "TARGETDIR",
+    "PMenu"
+  ],
+  [
+    "TARGETDIR",
+    "",
+    "SourceDir"
+  ]
+]

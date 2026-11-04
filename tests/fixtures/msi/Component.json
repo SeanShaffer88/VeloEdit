@@ -1,0 +1,34 @@
+[
+  [
+    "MainExecutable",
+    "{954CB1DE-1C44-5B81-A925-A12F946A4412}",
+    "INSTALLFOLDER",
+    "0",
+    "",
+    "VeloEditExe"
+  ],
+  [
+    "LicenseFile",
+    "{4D33AA23-0163-5E65-ACED-AA7E4950F992}",
+    "INSTALLFOLDER",
+    "0",
+    "",
+    "LicenseTxt"
+  ],
+  [
+    "DataFolderComponent",
+    "{AE66BEE6-02EC-41BF-8B6D-B783DEA4F0ED}",
+    "DataFolder",
+    "0",
+    "",
+    ""
+  ],
+  [
+    "ApplicationShortcut",
+    "{440D8B00-27D8-5683-B437-AEF026A0E5C9}",
+    "AppShortcutFolder",
+    "4",
+    "",
+    "regQ6..1u3tcNo7R1IVNXy532DIyaQ"
+  ]
+]

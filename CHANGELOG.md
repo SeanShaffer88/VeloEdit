@@ -3,6 +3,15 @@
 All notable changes to VeloEdit are recorded here. Versions follow the
 release asset naming in the specification.
 
+## [1.1.3] — Unreleased
+
+### Fixed
+
+- Build the MSI explicitly for x64 and mark its executable component as
+  64-bit, preserving the published neutral component identities.
+- Gate candidate and release MSI artifacts on static metadata and payload
+  validation. Installer lifecycle validation remains unperformed.
+
 ## [1.1.2] — Unreleased
 
 ### Fixed
