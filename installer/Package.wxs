@@ -40,7 +40,7 @@
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="VeloEdit"
            Manufacturer="Sean Shaffer"
-           Version="1.1.1"
+           Version="1.1.2"
            Scope="perUser"
            UpgradeCode="A38C6BC4-F086-4855-A7E6-8706BCA8F987">
     <MajorUpgrade DowngradeErrorMessage="A newer version of VeloEdit is already installed." />
