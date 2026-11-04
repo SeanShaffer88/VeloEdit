@@ -2,12 +2,14 @@
 //!
 //! Saving never writes to the target file in place. The document is
 //! streamed to a staging file in the target's own directory
-//! (`<filename>.tmp_velo_<pid>`), the staging file is flushed to disk,
+//! (exclusively reserved `<filename>.tmp_velo_<pid>[_<attempt>]`),
+//! the staging file is flushed to disk,
 //! and only then is it swapped over the target in one atomic step
 //! (`ReplaceFileW` on Windows; `rename` elsewhere, which is an atomic
 //! replace on POSIX). A crash or failure at any point before the swap
 //! leaves the original file byte-identical; the staging file is removed
-//! on every failure path.
+//! on failure where cleanup succeeds. Closing before the path-based swap
+//! does not prevent concurrent directory-entry replacement after reservation.
 //!
 //! Streaming: the writer consumes [`PieceTable::iter_slices`] and writes
 //! in chunks of at most [`SaveOptions::max_chunk`] bytes (4 MB by
@@ -44,8 +46,8 @@
 // the non-Windows code in this file contains no unsafe at all.
 #![allow(unsafe_code)]
 
-use std::fs::File;
-use std::io::{self, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::encoding::TextEncoding;
@@ -459,7 +461,7 @@ pub fn split_file(src: &Path, part_size: u64, out_dir: &Path) -> io::Result<Vec<
     Ok(paths)
 }
 
-/// Build the staging path for `target` (SPEC.md section 5.1 step 1):
+/// Build the first staging candidate for `target` (SPEC.md section 5.1 step 1):
 /// same directory, name `<filename>.tmp_velo_<pid>` where `<filename>`
 /// is the target's full file name (extension included).
 pub fn staging_path_for(target: &Path) -> PathBuf {
@@ -471,6 +473,66 @@ pub fn staging_path_for(target: &Path) -> PathBuf {
     match target.parent() {
         Some(parent) => parent.join(staging_name),
         None => PathBuf::from(staging_name),
+    }
+}
+
+const STAGING_ATTEMPTS: usize = 128;
+
+struct StagingFile {
+    path: PathBuf,
+    file: Option<File>,
+    committed: bool,
+}
+
+impl StagingFile {
+    fn reserve(target: &Path) -> Result<Self, SaveError> {
+        let first = staging_path_for(target);
+        for attempt in 0..STAGING_ATTEMPTS {
+            let path = if attempt == 0 {
+                first.clone()
+            } else {
+                let mut name = first.as_os_str().to_os_string();
+                name.push(format!("_{attempt}"));
+                PathBuf::from(name)
+            };
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                        committed: false,
+                    })
+                }
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(SaveError::new(SaveStep::Staging, err)),
+            }
+        }
+        Err(SaveError::new(
+            SaveStep::Staging,
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "staging candidates are occupied",
+            ),
+        ))
+    }
+
+    fn swap(&mut self, target: &Path) -> Result<(), SaveError> {
+        // Close before path-based replacement. Exclusive creation protects
+        // reservation, not concurrent directory-entry replacement afterwards.
+        drop(self.file.take());
+        swap_files(target, &self.path)?;
+        self.committed = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagingFile {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        if !self.committed {
+            // Best effort, with the same directory-entry race boundary as swap.
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -655,14 +717,21 @@ impl SaveTransform {
     }
 }
 
-/// Stream the whole document into the staging file at `staging` in
+/// Stream the whole document into the reserved staging file in
 /// chunks of at most `opts.max_chunk` bytes, applying the save
-/// transforms `opts` asks for, flush it to disk, and close it.
+/// transforms `opts` asks for, and flush it to disk. Reset partial clone
+/// output while retaining the exclusively reserved handle.
 /// Returns the number of bytes written (the transformed length when
 /// a transform is active).
-fn write_staging(table: &PieceTable, staging: &Path, opts: &SaveOptions) -> Result<u64, SaveError> {
+fn write_staging(
+    table: &PieceTable,
+    file: &mut File,
+    opts: &SaveOptions,
+) -> Result<u64, SaveError> {
     debug_assert!(opts.max_chunk > 0);
-    let mut file = File::create(staging).map_err(|e| SaveError::new(SaveStep::Staging, e))?;
+    file.set_len(0)
+        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+        .map_err(|e| SaveError::new(SaveStep::Write, e))?;
     let mut written: u64 = 0;
     if opts.eol == EolChoice::Keep && opts.bom == BomChoice::Keep {
         // The original pass-through path, byte for byte: a
@@ -695,10 +764,7 @@ fn write_staging(table: &PieceTable, staging: &Path, opts: &SaveOptions) -> Resu
             written += out.len() as u64;
         }
     }
-    flush_file(&file).map_err(|e| SaveError::new(SaveStep::Flush, e))?;
-    // Close before the swap (the File drops here): ReplaceFileW cannot
-    // replace from a file that is still open for writing.
-    drop(file);
+    flush_file(file).map_err(|e| SaveError::new(SaveStep::Flush, e))?;
     Ok(written)
 }
 
@@ -714,18 +780,18 @@ fn write_staging(table: &PieceTable, staging: &Path, opts: &SaveOptions) -> Resu
 /// written from the patch bytes. The result then finishes through
 /// the exact same flush + atomic swap as a normal save.
 ///
-/// Contract: ANY failure returns `None` and removes the staging
-/// file, and the caller falls back to the normal streamed
+/// Contract: ANY failure returns `None` retaining the reserved file,
+/// and the caller resets it before falling back to the normal streamed
 /// [`write_staging`] — no error is ever surfaced from this path.
 /// Windows only; the non-Windows form always returns `None`.
 #[cfg(not(windows))]
-fn write_staging_clone(_table: &PieceTable, _staging: &Path, _source: &Path) -> Option<u64> {
+fn write_staging_clone(_table: &PieceTable, _staging: &mut File, _source: &Path) -> Option<u64> {
     None
 }
 
 /// Windows form of [`write_staging_clone`].
 #[cfg(windows)]
-fn write_staging_clone(table: &PieceTable, staging: &Path, source: &Path) -> Option<u64> {
+fn write_staging_clone(table: &PieceTable, staging_file: &mut File, source: &Path) -> Option<u64> {
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
@@ -756,12 +822,9 @@ fn write_staging_clone(table: &PieceTable, staging: &Path, source: &Path) -> Opt
     .ok()?;
     drop(source_file);
 
-    let mut staging_file = File::create(staging).ok()?;
     // Pre-size the staging file to the result length: extent
     // cloning fills ranges of an existing file.
     if staging_file.set_len(patch.result_len).is_err() {
-        drop(staging_file);
-        let _ = std::fs::remove_file(staging);
         return None;
     }
 
@@ -788,8 +851,6 @@ fn write_staging_clone(table: &PieceTable, staging: &Path, source: &Path) -> Opt
         )
     };
     if source_handle == INVALID_HANDLE_VALUE {
-        drop(staging_file);
-        let _ = std::fs::remove_file(staging);
         return None;
     }
 
@@ -871,18 +932,16 @@ fn write_staging_clone(table: &PieceTable, staging: &Path, source: &Path) -> Opt
             result_pos += tail;
         }
     }
-    if built && (result_pos != patch.result_len || flush_file(&staging_file).is_err()) {
+    if built && (result_pos != patch.result_len || flush_file(staging_file).is_err()) {
         built = false;
     }
 
     // SAFETY: `source_handle` was opened by us above and is closed
     // exactly once, here, on every path past its creation.
     unsafe { CloseHandle(source_handle) };
-    drop(staging_file);
     if built {
         Some(patch.result_len)
     } else {
-        let _ = std::fs::remove_file(staging);
         None
     }
 }
@@ -1005,24 +1064,14 @@ pub fn save_atomic(
     // Roadmap item 5: refuse early when the disk plainly cannot hold
     // the staging file, instead of failing halfway through the write.
     check_free_space(target, table.len())?;
-    let staging = staging_path_for(target);
-    let outcome = write_staging(table, &staging, opts)
-        .and_then(|written| swap_files(target, &staging).map(|()| written));
-    match outcome {
-        Ok(written) => Ok(SaveReport {
-            bytes_written: written,
-            staging_removed: !staging.exists(),
-            // save_atomic always streams (the block-clone fast path
-            // lives on the in-place save_to_with_options route).
-            fast_clone_used: false,
-        }),
-        Err(err) => {
-            // Best-effort cleanup: never leave a staging file behind on
-            // failure. The original target has not been touched.
-            let _ = std::fs::remove_file(&staging);
-            Err(err)
-        }
-    }
+    let mut staging = StagingFile::reserve(target)?;
+    let written = write_staging(table, staging.file.as_mut().unwrap(), opts)?;
+    staging.swap(target)?;
+    Ok(SaveReport {
+        bytes_written: written,
+        staging_removed: !staging.path.exists(),
+        fast_clone_used: false,
+    })
 }
 
 impl PieceTable {
@@ -1078,7 +1127,7 @@ impl PieceTable {
         // Roadmap item 5: the same early disk-space refusal as
         // save_atomic, before the staging file is created.
         check_free_space(target, self.len())?;
-        let staging = staging_path_for(target);
+        let mut staging = StagingFile::reserve(target)?;
 
         // Block-clone fast save (slice R4c, item 4): when asked
         // for, and only with both transforms Keep (the clone
@@ -1088,20 +1137,22 @@ impl PieceTable {
         // at; memory/length-only backings have nothing to clone.
         // Any failure quietly falls through to the streamed write.
         let mut fast_clone_used = false;
-        let clone_written =
-            if opts.fast_clone && opts.eol == EolChoice::Keep && opts.bom == BomChoice::Keep {
-                // Peek at the backing's path without disturbing it:
-                // detach and immediately put the same buffer back.
-                let detached = self.detach_original();
-                let source = detached.mapped_path().map(|path| path.to_path_buf());
-                self.replace_original(detached);
-                match source {
-                    Some(source) => write_staging_clone(self, &staging, &source),
-                    None => None,
-                }
-            } else {
-                None
-            };
+        let clone_written = if opts.fast_clone
+            && opts.eol == EolChoice::Keep
+            && opts.bom == BomChoice::Keep
+        {
+            // Peek at the backing's path without disturbing it:
+            // detach and immediately put the same buffer back.
+            let detached = self.detach_original();
+            let source = detached.mapped_path().map(|path| path.to_path_buf());
+            self.replace_original(detached);
+            match source {
+                Some(source) => write_staging_clone(self, staging.file.as_mut().unwrap(), &source),
+                None => None,
+            }
+        } else {
+            None
+        };
 
         // Steps 1–3: staging file, streaming writes, hardware flush. Our
         // own backing is still attached here: streaming reads from it.
@@ -1110,13 +1161,7 @@ impl PieceTable {
                 fast_clone_used = true;
                 written
             }
-            None => match write_staging(self, &staging, opts) {
-                Ok(written) => written,
-                Err(err) => {
-                    let _ = std::fs::remove_file(&staging);
-                    return Err(err);
-                }
-            },
+            None => write_staging(self, staging.file.as_mut().unwrap(), opts)?,
         };
 
         // Step 4: close our own handlers/mappings to the target before
@@ -1136,8 +1181,7 @@ impl PieceTable {
         };
 
         // Step 5: the atomic swap.
-        if let Err(err) = swap_files(target, &staging) {
-            let _ = std::fs::remove_file(&staging);
+        if let Err(err) = staging.swap(target) {
             // The target is untouched: restore the original backing so
             // the table reads exactly what it read before the save.
             match held {
@@ -1165,7 +1209,7 @@ impl PieceTable {
                 history.clear();
                 Ok(SaveReport {
                     bytes_written: written,
-                    staging_removed: !staging.exists(),
+                    staging_removed: !staging.path.exists(),
                     fast_clone_used,
                 })
             }
@@ -1239,6 +1283,164 @@ mod tests {
         assert_eq!(table.read(0, 99), b"hello new world!");
         assert!(table.piece_count() > 1);
         table
+    }
+
+    #[test]
+    fn occupied_candidate_and_alias_preserve_foreign_bytes() {
+        let dir = temp_dir("occupied");
+        let target = dir.join("saved");
+        let sentinel = dir.join("sentinel");
+        std::fs::write(&sentinel, b"foreign").unwrap();
+        let first = staging_path_for(&target);
+        std::fs::hard_link(&sentinel, &first).unwrap();
+        let table = edited_table();
+        save_atomic(&table, &target, &SaveOptions::default()).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello new world!");
+        assert_eq!(std::fs::read(&first).unwrap(), b"foreign");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"foreign");
+        let mut table = edited_table();
+        table.save_to(&target, &mut UndoStack::new()).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello new world!");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"foreign");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
+        drop(table);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exhausted_candidates_are_never_cleaned_up() {
+        let dir = temp_dir("exhausted");
+        let target = dir.join("saved");
+        let mut reservations = Vec::new();
+        for _ in 0..STAGING_ATTEMPTS {
+            let mut reservation = StagingFile::reserve(&target).unwrap();
+            reservation
+                .file
+                .as_mut()
+                .unwrap()
+                .write_all(b"sentinel")
+                .unwrap();
+            reservations.push(reservation);
+        }
+        let err = save_atomic(&edited_table(), &target, &SaveOptions::default()).unwrap_err();
+        assert_eq!(err.step, SaveStep::Staging);
+        assert_eq!(err.source.kind(), io::ErrorKind::AlreadyExists);
+        for reservation in &reservations {
+            assert_eq!(std::fs::read(&reservation.path).unwrap(), b"sentinel");
+        }
+        drop(reservations);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn concurrent_reservations_are_distinct_and_owned() {
+        let dir = temp_dir("concurrent");
+        let target = dir.join("saved");
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let target = target.clone();
+                std::thread::spawn(move || StagingFile::reserve(&target).unwrap())
+            })
+            .collect();
+        let reservations: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        let paths: std::collections::HashSet<_> = reservations.iter().map(|r| &r.path).collect();
+        assert_eq!(paths.len(), 8);
+        drop(reservations);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn partial_clone_decline_resets_reserved_file_for_streaming() {
+        let dir = temp_dir("partial-clone");
+        let target = dir.join("saved");
+        let mut staging = StagingFile::reserve(&target).unwrap();
+        let file = staging.file.as_mut().unwrap();
+        file.write_all(&[b'x'; 4096]).unwrap();
+        // A real clone attempt declines because its source is absent, after
+        // partial output was placed in the reservation.
+        assert_eq!(
+            write_staging_clone(&edited_table(), file, &dir.join("missing")),
+            None
+        );
+        let written = write_staging(&edited_table(), file, &SaveOptions::default()).unwrap();
+        assert_eq!(written, 16);
+        staging.swap(&target).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello new world!");
+        drop(staging);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn swap_failure_cleans_reservation_and_preserves_occupied_candidate() {
+        let dir = temp_dir("occupied-swap-failure");
+        let target = dir.join("saved");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("original"), b"original").unwrap();
+        let first = staging_path_for(&target);
+        std::fs::write(&first, b"foreign").unwrap();
+        let err = save_atomic(&edited_table(), &target, &SaveOptions::default()).unwrap_err();
+        assert_eq!(err.step, SaveStep::Swap);
+        assert_eq!(std::fs::read(target.join("original")).unwrap(), b"original");
+        assert_eq!(std::fs::read(&first).unwrap(), b"foreign");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_failure_cleans_only_reserved_path() {
+        let dir = temp_dir("write-failure");
+        let target = dir.join("saved");
+        let first = staging_path_for(&target);
+        std::fs::write(&first, b"foreign").unwrap();
+        let mut staging = StagingFile::reserve(&target).unwrap();
+        let owned = staging.path.clone();
+        // Substitute a read-only handle to the same owned file to provoke
+        // a real write/reset failure without platform-specific disk faults.
+        drop(staging.file.take());
+        staging.file = Some(File::open(&owned).unwrap());
+        let err = write_staging(
+            &edited_table(),
+            staging.file.as_mut().unwrap(),
+            &SaveOptions::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.step, SaveStep::Write);
+        drop(staging);
+        assert!(!owned.exists());
+        assert_eq!(std::fs::read(&first).unwrap(), b"foreign");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Requires a block-clone capable volume; run explicitly and report unsupported failures"]
+    fn mapped_clone_success_fixture() {
+        let dir = temp_dir("clone-success");
+        let target = dir.join("saved");
+        let bytes = vec![b'a'; 1024 * 1024];
+        std::fs::write(&target, &bytes).unwrap();
+        let backing = reopen_original(&target).unwrap();
+        let mut table = PieceTable::from_original_buffer(backing);
+        let report = table
+            .save_to_with_options(
+                &target,
+                &mut UndoStack::new(),
+                &SaveOptions {
+                    fast_clone: true,
+                    ..SaveOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            report.fast_clone_used,
+            "volume did not complete block cloning"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
+        drop(table);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     // (f) The staging filename follows the section 5.1 pattern.
