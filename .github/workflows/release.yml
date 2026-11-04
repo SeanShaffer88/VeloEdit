@@ -22,7 +22,7 @@ on:
       tag:
         description: "Existing tag to build the release from"
         required: true
-        default: "v1.0.1"
+        default: "v1.1.2"
 
 permissions:
   contents: write
@@ -35,17 +35,56 @@ jobs:
       - name: Resolve the release tag
         id: tag
         shell: pwsh
+        env:
+          RELEASE_INPUT_TAG: ${{ inputs.tag }}
         run: |
-          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME } else { '${{ inputs.tag }}' }
-          if ($tag -notmatch '^v\d+\.\d+\.\d+$') { throw "Tag must look like v1.0.0, got: $tag" }
+          $tag = if ($env:GITHUB_REF -like 'refs/tags/*') { $env:GITHUB_REF_NAME } else { $env:RELEASE_INPUT_TAG }
+          if ($tag -cnotmatch '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z') { throw "Tag must look like v1.0.0, got: $tag" }
           "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "version=$($tag.Substring(1))" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ steps.tag.outputs.tag }}
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+
+      - name: Verify existing tag and source versions
+        id: source
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_VERSION: ${{ steps.tag.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $head -cnotmatch '^[0-9a-f]{40}$') { throw 'Invalid checkout SHA' }
+          $tagRef = "refs/tags/$env:RELEASE_TAG"
+          $refs = @(git ls-remote origin $tagRef "$tagRef^{}")
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot verify remote tag' }
+          $direct = $null
+          $peeled = $null
+          foreach ($line in $refs) {
+            if ($line -cmatch "^([0-9a-f]{40})\s+$([regex]::Escape($tagRef))$") { $direct = $Matches[1] }
+            elseif ($line -cmatch "^([0-9a-f]{40})\s+$([regex]::Escape($tagRef))\^\{\}$") { $peeled = $Matches[1] }
+            else { throw 'Malformed remote tag response' }
+          }
+          if (-not $direct) { throw 'Release requires an existing remote tag' }
+          $commit = if ($peeled) { $peeled } else { $direct }
+          if ($commit -cne $head) { throw 'Remote tag does not match checkout HEAD' }
+          $cargo = Get-Content Cargo.toml -Raw
+          $lock = Get-Content Cargo.lock -Raw
+          $nsis = Get-Content installer/VeloEdit.nsi -Raw
+          $wix = Get-Content installer/Package.wxs -Raw
+          $version = [regex]::Escape($env:RELEASE_VERSION)
+          if ($cargo -cnotmatch "(?m)^version = `"$version`"\r?$") { throw 'Cargo version mismatch' }
+          if ($lock -cnotmatch "(?s)name = `"veloedit`"\r?\nversion = `"$version`"") { throw 'Cargo lock version mismatch' }
+          if ($nsis -cnotmatch "(?m)^!define VERSION `"$version`"\r?$") { throw 'NSIS version mismatch' }
+          if ($wix -cnotmatch "Version=`"$version`"") { throw 'WiX version mismatch' }
+          "sha=$head" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       # ---- Gate first: nothing is packaged unless the whole gate passes.
+      - name: Release contract checks (offline mocks)
+        shell: pwsh
+        run: ./tests/Test-ReleasePreparation.ps1
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Clippy
@@ -170,7 +209,7 @@ jobs:
           )
           # The release may already exist (the tag was created by publishing
           # the release in the web UI): then just (re)upload the assets.
-          gh release create '${{ steps.tag.outputs.tag }}' $assets `
+          gh release create '${{ steps.tag.outputs.tag }}' $assets --verify-tag --target '${{ steps.source.outputs.sha }}' `
             --title "VeloEdit v$version" `
             --notes-file release-notes.md
           if ($LASTEXITCODE -ne 0) {

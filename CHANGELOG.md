@@ -3,6 +3,14 @@
 All notable changes to VeloEdit are recorded here. Versions follow the
 release asset naming in the specification.
 
+## [1.1.2] — Unreleased
+
+### Fixed
+
+- Reserve save staging files exclusively, retry name collisions without
+  overwriting existing files, and clean up only the staging file owned by
+  the save operation on failure.
+
 ## [1.1.1] — 2026-11-01
 
 ### Fixed

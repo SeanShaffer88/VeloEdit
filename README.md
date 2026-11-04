@@ -15,7 +15,9 @@ tenth of a second while using less than 35 MB of memory. It is one portable
 program file for Windows 11: no installer needed, no internet, no accounts,
 nothing sent anywhere.
 
-**Current status: 1.1.1, released 2026-11-01.** Everything in the
+**Current status: 1.1.2 preparation; not published.** The latest published
+release is 1.1.1 (2026-11-01). This candidate includes the save staging
+collision and cleanup fix. Everything in the
 1.0.0 release (2026-10-31) plus the full feature roadmap: tabs, split
 view, side-by-side compare, regular-expression find, more encodings,
 log-viewing tools, binary templates, external tools, multi-caret
@@ -591,7 +593,7 @@ Real captures from a run of the editor on Windows 11, showing a
 
 ![The editor in hex mode: offset column, hex bytes, ASCII column](docs/screenshots/editor-hex-mode.png)
 
-Still to capture: fresh captures of the current (1.1.1) window with
+Still to capture: fresh captures of the 1.1.1 window with
 its tab bar, the find bar with matches highlighted, the split view, a
 light theme, and the installer. The two captures above predate the
 tab bar added in 1.1.0.
